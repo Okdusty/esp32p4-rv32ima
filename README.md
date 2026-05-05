@@ -40,3 +40,5 @@ It uses one 32MB PSRAM chip as the system memory. On startup, it initializes the
 
 - still couldnt get command input working... uart wont work for input, only output.
 
+
+for issues, disccord: epiczhul
