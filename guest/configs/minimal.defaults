@@ -1,0 +1,3 @@
+# Build only the RV32 core, UART and base MMIO devices.
+CONFIG_RV32_ST7703_DISPLAY=n
+CONFIG_RV32_WIFI_BRIDGE=n

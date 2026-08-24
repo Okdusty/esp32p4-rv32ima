@@ -1,0 +1,250 @@
+diff --git a/include/kernel.mk b/include/kernel.mk
+index 5ccc21c..1d5bc8e 100644
+--- a/include/kernel.mk
++++ b/include/kernel.mk
+@@ -92,7 +92,7 @@ else ifneq (,$(findstring $(ARCH) , mipsel mips64 mips64el ))
+   LINUX_KARCH := mips
+ else ifneq (,$(findstring $(ARCH) , powerpc64 ))
+   LINUX_KARCH := powerpc
+-else ifneq (,$(findstring $(ARCH) , riscv64 ))
++else ifneq (,$(findstring $(ARCH) , riscv32 riscv64 ))
+   LINUX_KARCH := riscv
+ else ifneq (,$(findstring $(ARCH) , sh2 sh3 sh4 ))
+   LINUX_KARCH := sh
+diff --git a/include/target.mk b/include/target.mk
+index fdfda81..bc3a0c0 100644
+--- a/include/target.mk
++++ b/include/target.mk
+@@ -271,6 +271,10 @@ ifeq ($(DUMP),1)
+     CPU_TYPE ?= generic
+     CPU_CFLAGS_generic:=-mabi=lp64d -march=rv64gc
+   endif
++  ifeq ($(ARCH),riscv32)
++    CPU_TYPE ?= rv32ima
++    CPU_CFLAGS_rv32ima:=-mabi=ilp32 -march=rv32ima
++  endif
+   ifeq ($(ARCH),loongarch64)
+     CPU_TYPE ?= generic
+     CPU_CFLAGS := -O2 -pipe
+diff --git a/package/Makefile b/package/Makefile
+index 73c8968..00055b3 100644
+--- a/package/Makefile
++++ b/package/Makefile
+@@ -11,7 +11,14 @@ include $(INCLUDE_DIR)/feeds.mk
+ include $(INCLUDE_DIR)/rootfs.mk
+ 
+ -include $(TMP_DIR)/.packagedeps
++ifneq ($(BOARD),esp32p4rv32)
+ package-y += kernel/linux
++else
++# This target consumes the already-built Linux image supplied by the ESP-IDF
++# emulator project. fstools is userspace-only here, so do not make its APK
++# packaging wait for a second OpenWrt kernel build.
++$(curdir)/system/fstools/compile := $(filter-out $(curdir)/kernel/linux/compile,$($(curdir)/system/fstools/compile))
++endif
+ $(curdir)/autoremove:=1
+ $(curdir)/builddirs:=$(sort $(package-) $(package-y) $(package-m))
+ $(curdir)/builddirs-default:=. $(sort $(package-y) $(package-m))
+@@ -96,6 +103,7 @@ $(curdir)/install: $(TMP_DIR)/.build $(curdir)/merge $(curdir)/merge-index
+ 	- find $(STAGING_DIR_ROOT) -type d | $(XARGS) chmod 0755
+ 	rm -rf $(TARGET_DIR) $(TARGET_DIR_ORIG)
+ 	mkdir -p $(TARGET_DIR)/tmp
++	chmod 1777 $(TARGET_DIR)/tmp
+ ifneq ($(CONFIG_USE_APK),)
+ 	$(file >$(TMP_DIR)/apk_install_list,\
+ 	    $(foreach pkg,$(shell cat $(PACKAGE_INSTALL_FILES) 2>/dev/null),$(pkg)$(call GetABISuffix,$(pkg))))
+@@ -105,7 +113,7 @@ ifneq ($(CONFIG_USE_APK),)
+ 		$$(cat $(TMP_DIR)/apk_install_list) \
+ 			"base-files=$(shell cat $(STAGING_DIR)/base-files.version)" \
+ 			"libc=$(shell cat $(STAGING_DIR)/libc.version)" \
+-			"kernel=$(shell cat $(STAGING_DIR)/kernel.version)"
++			$(if $(filter esp32p4rv32,$(BOARD)),,"kernel=$(shell cat $(STAGING_DIR)/kernel.version)")
+ 
+ 	rm -rf $(TARGET_DIR)/run
+ else
+@@ -124,6 +132,22 @@ endif
+ 	$(CP) $(TARGET_DIR) $(TARGET_DIR_ORIG)
+ 
+ 	$(call prepare_rootfs,$(TARGET_DIR),$(TOPDIR)/files)
++ifeq ($(BOARD),esp32p4rv32)
++	# Installed packages already live in the initramfs.  Embedding their APKs a
++	# second time makes Linux copy another ~2.3 MiB during every boot.  Retain a
++	# signed, installable demo feed so apk remains directly testable on-device.
++	rm -rf $(TARGET_DIR)/usr/share/apk/esp32p4rv32
++	mkdir -p $(TARGET_DIR)/usr/share/apk/esp32p4rv32
++	cp -fpL $(PACKAGE_DIR_ALL)/esp32p4-demo-*.apk \
++		$(TARGET_DIR)/usr/share/apk/esp32p4rv32/
++	$(STAGING_DIR_HOST)/bin/apk mkndx \
++		--root $(TOPDIR) \
++		--keys-dir $(TOPDIR) \
++		--allow-untrusted \
++		$(if $(CONFIG_SIGNED_PACKAGES),--sign $(BUILD_KEY_APK_SEC),) \
++		--output $(TARGET_DIR)/usr/share/apk/esp32p4rv32/packages.adb \
++		$(TARGET_DIR)/usr/share/apk/esp32p4rv32/*.apk
++endif
+ 
+ $(curdir)/index: FORCE
+ 	@echo Generating package index...
+diff --git a/package/libs/ncurses/Makefile b/package/libs/ncurses/Makefile
+index b6b9a4e..cf03c08 100644
+--- a/package/libs/ncurses/Makefile
++++ b/package/libs/ncurses/Makefile
+@@ -90,7 +90,10 @@ HOST_CONFIGURE_ARGS += \
+ 	--without-manpages \
+ 	--without-profile \
+ 	--without-tests \
+-	--without-curses-h
++	--without-curses-h \
++	--disable-home-terminfo \
++	--with-terminfo-dirs=$(STAGING_DIR_HOSTPKG)/share/terminfo \
++	--with-default-terminfo-dir=$(STAGING_DIR_HOSTPKG)/share/terminfo
+ 
+ 
+ ifeq ($(HOST_OS),FreeBSD)
+diff --git a/package/libs/openssl/patches/110-openwrt_targets.patch b/package/libs/openssl/patches/110-openwrt_targets.patch
+index 3cc349f..348e4fd 100644
+--- a/package/libs/openssl/patches/110-openwrt_targets.patch
++++ b/package/libs/openssl/patches/110-openwrt_targets.patch
+@@ -9,7 +9,7 @@ Signed-off-by: Eneas U de Queiroz <cote2004-github@yahoo.com>
+ 
+ --- /dev/null
+ +++ b/Configurations/25-openwrt.conf
+-@@ -0,0 +1,55 @@
++@@ -0,0 +1,58 @@
+ +## Openwrt "CONFIG_ARCH" matching targets.
+ +
+ +# The targets need to end in '-openwrt' for the AFALG patch to work
+@@ -56,6 +56,9 @@ Signed-off-by: Eneas U de Queiroz <cote2004-github@yahoo.com>
+ +        inherit_from    => [ "linux-generic64" ],
+ +        perlasm_scheme   => "linux64",
+ +    },
+++    "linux-riscv32-openwrt" => {
+++        inherit_from    => [ "linux32-riscv32" ],
+++    },
+ +    "linux-x86_64-openwrt" => {
+ +        inherit_from    => [ "linux-x86_64" ],
+ +    },
+diff --git a/package/network/services/dropbear/Makefile b/package/network/services/dropbear/Makefile
+index 0ada2ed..90689f3 100644
+--- a/package/network/services/dropbear/Makefile
++++ b/package/network/services/dropbear/Makefile
+@@ -24,6 +24,9 @@ PKG_CPE_ID:=cpe:/a:dropbear_ssh_project:dropbear_ssh
+ PKG_BUILD_PARALLEL:=1
+ PKG_ASLR_PIE_REGULAR:=1
+ PKG_BUILD_FLAGS:=no-mips16 gc-sections lto
++ifeq ($(ARCH),riscv32)
++PKG_BUILD_FLAGS:=no-mips16 gc-sections no-lto
++endif
+ PKG_FIXUP:=autoreconf
+ PKG_FLAGS:=nonshared
+ 
+diff --git a/package/network/services/dropbear/files/dropbear.init b/package/network/services/dropbear/files/dropbear.init
+index d5eb44b..80cc57a 100755
+--- a/package/network/services/dropbear/files/dropbear.init
++++ b/package/network/services/dropbear/files/dropbear.init
+@@ -79,7 +79,9 @@ hk_config()
+ # $1 - host key file name
+ hk_config__keyfile() { hk_config keyfile "$1" ; }
+ 
+-ktype_all='ed25519 ecdsa rsa'
++# Key generation is exceptionally expensive under the RV32 interpreter.
++# Ed25519 is supported by modern OpenSSH clients and is sufficient here.
++ktype_all='ed25519'
+ 
+ hk_generate_as_needed()
+ {
+diff --git a/package/system/apk/Makefile b/package/system/apk/Makefile
+index df65bc0..139e73b 100644
+--- a/package/system/apk/Makefile
++++ b/package/system/apk/Makefile
+@@ -52,7 +52,6 @@ MESON_HOST_VARS+=VERSION=$(PKG_VERSION)
+ MESON_VARS+=VERSION=$(PKG_VERSION)
+ 
+ MESON_COMMON_ARGS = \
+-	-Db_lto=true \
+ 	-Ddocs=disabled \
+ 	-Dhelp=enabled \
+ 	-Dlua_version=5.1 \
+@@ -63,10 +62,12 @@ MESON_COMMON_ARGS = \
+ 	-Dtests=disabled
+ 
+ MESON_HOST_ARGS += \
++	-Db_lto=true \
+ 	$(MESON_COMMON_ARGS) \
+ 	-Dcrypto_backend=openssl
+ 
+ MESON_ARGS += \
++	-Db_lto=$(if $(filter riscv32,$(ARCH)),false,true) \
+ 	$(MESON_COMMON_ARGS) \
+ 	-Dcrypto_backend=$(BUILD_VARIANT) \
+ 	-Dminimal=true
+diff --git a/package/system/mtd/Makefile b/package/system/mtd/Makefile
+index d83e359..3a66847 100644
+--- a/package/system/mtd/Makefile
++++ b/package/system/mtd/Makefile
+@@ -19,6 +19,9 @@ PKG_LICENSE_FILES:=
+ 
+ PKG_FLAGS:=nonshared
+ PKG_BUILD_FLAGS:=lto
++ifeq ($(ARCH),riscv32)
++  PKG_BUILD_FLAGS:=no-lto
++endif
+ 
+ include $(INCLUDE_DIR)/package.mk
+ 
+diff --git a/package/utils/busybox/Config-defaults.in b/package/utils/busybox/Config-defaults.in
+index 820c498..eaf64f8 100644
+--- a/package/utils/busybox/Config-defaults.in
++++ b/package/utils/busybox/Config-defaults.in
+@@ -1630,6 +1630,7 @@ config BUSYBOX_DEFAULT_XXD
+ 	default n
+ config BUSYBOX_DEFAULT_HWCLOCK
+ 	bool
++	default n if TARGET_esp32p4rv32
+ 	default y
+ config BUSYBOX_DEFAULT_FEATURE_HWCLOCK_ADJTIME_FHS
+ 	bool
+diff --git a/rules.mk b/rules.mk
+index 0e9c178..5c8d144 100644
+--- a/rules.mk
++++ b/rules.mk
+@@ -203,6 +203,12 @@ TARGET_CFLAGS:=$(TARGET_OPTIMIZATION)$(if $(CONFIG_DEBUG), -g3) $(call qstrip,$(
+ TARGET_CXXFLAGS = $(TARGET_CFLAGS)
+ TARGET_ASFLAGS_DEFAULT = $(TARGET_CFLAGS)
+ TARGET_ASFLAGS = $(TARGET_ASFLAGS_DEFAULT)
++ifeq ($(ARCH),riscv32)
++  # GCC's default RV32 multilib is ilp32d.  Packages which link without
++  # passing CFLAGS would otherwise request the hard-float musl loader even
++  # though every object was compiled for the RV32IMA ilp32 target.
++  TARGET_LDFLAGS += $(filter -mabi=% -march=%,$(TARGET_CFLAGS))
++endif
+ ifneq ($(CONFIG_EXTERNAL_TOOLCHAIN),)
+ LIBGCC_S_PATH=$(realpath $(wildcard $(call qstrip,$(CONFIG_LIBGCC_ROOT_DIR))/$(call qstrip,$(CONFIG_LIBGCC_FILE_SPEC))))
+ LIBGCC_S=$(if $(LIBGCC_S_PATH),-L$(dir $(LIBGCC_S_PATH)) -lgcc_s)
+diff --git a/target/Config.in b/target/Config.in
+index 82c88d0..2fcec96 100644
+--- a/target/Config.in
++++ b/target/Config.in
+@@ -197,6 +197,9 @@ config powerpc64
+ 	select ARCH_64BIT
+ 	bool
+ 
++config riscv32
++	bool
++
+ config riscv64
+ 	select ARCH_64BIT
+ 	bool
+@@ -241,6 +244,7 @@ config ARCH
+ 	default "mips64el"  if mips64el
+ 	default "powerpc"   if powerpc
+ 	default "powerpc64" if powerpc64
++	default "riscv32"   if riscv32
+ 	default "riscv64"   if riscv64
+ 	default "sh3"       if sh3
+ 	default "sh3eb"     if sh3eb
+@@ -248,4 +252,3 @@ config ARCH
+ 	default "sh4eb"     if sh4eb
+ 	default "sparc"     if sparc
+ 	default "x86_64"    if x86_64
+-

@@ -1,0 +1,3 @@
+# Onboard ST7703 display, without the ESP32-C6 Wi-Fi bridge.
+CONFIG_RV32_ST7703_DISPLAY=y
+CONFIG_RV32_WIFI_BRIDGE=n
