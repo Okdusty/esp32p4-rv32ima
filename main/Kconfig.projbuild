@@ -1,0 +1,36 @@
+menu "RV32 Linux hardware bridges"
+
+config RV32_ST7703_DISPLAY
+	bool "Enable Waveshare 720x720 ST7703 display bridge"
+	default y
+	help
+	  Initialize the onboard MIPI-DSI ST7703 panel and expose its RGB565
+	  framebuffer to the RV32 guest as a simple-framebuffer device.
+
+endmenu
+
+menu "RV32 Linux wireless bridge"
+
+config RV32_WIFI_BRIDGE
+	bool "Enable ESP32-C6 SDIO Wi-Fi bridge"
+	default y
+	help
+	  Connect the onboard ESP32-C6 over four-bit SDIO and expose its
+	  station Ethernet frames to the RV32 Linux guest through virtio-net.
+
+config RV32_WIFI_SSID
+	string "Wi-Fi station SSID"
+	depends on RV32_WIFI_BRIDGE
+	default ""
+	help
+	  Leave empty to bring up the C6 and eth0 without associating.  This
+	  value is passed only to the C6 control plane; Linux owns DHCP and IP.
+
+config RV32_WIFI_PASSWORD
+	string "Wi-Fi station password"
+	depends on RV32_WIFI_BRIDGE
+	default ""
+	help
+	  WPA/WPA2/WPA3 passphrase used by the C6 station interface.
+
+endmenu

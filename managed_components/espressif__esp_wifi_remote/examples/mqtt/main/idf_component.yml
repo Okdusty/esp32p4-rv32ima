@@ -1,0 +1,9 @@
+dependencies:
+  esp_wifi_remote:
+    version: '*'
+  espressif/mqtt:
+    rules:
+    - if: idf_version >=6.0
+      version: ^1.0.0
+  wifi_remote_over_eppp:
+    version: '*'

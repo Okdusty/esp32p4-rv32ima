@@ -1,0 +1,4 @@
+[mapping:rv32_display]
+archive: libmain.a
+entries:
+    display_bridge (noflash)

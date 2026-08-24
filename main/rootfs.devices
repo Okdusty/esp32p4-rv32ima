@@ -1,0 +1,2 @@
+# Device nodes required before /init mounts devtmpfs.
+nod /dev/console 0600 0 0 c 5 1

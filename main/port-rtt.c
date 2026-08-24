@@ -14,6 +14,7 @@
 #include "drv_pin.h"
 #include "termios.h"
 
+#include "port.h"
 #include "psram.h"
 
 extern struct MiniRV32IMAState core;
@@ -73,6 +74,30 @@ int ReadKBByte(void)
 		return rxchar;
 	else
 		return -1;
+}
+
+int HostInputInit(void)
+{
+	return 0;
+}
+
+int HostConsoleInit(void)
+{
+	return 0;
+}
+
+int HostConsoleWrite(const void *buffer, size_t length)
+{
+	return write(1, buffer, length);
+}
+
+int HostDmaCacheSync(uint32_t guest_physical_address, size_t length,
+		     enum host_dma_sync_op operation)
+{
+	(void)guest_physical_address;
+	(void)length;
+	(void)operation;
+	return 0;
 }
 
 int IsKBHit(void)
@@ -239,7 +264,7 @@ int load_images(int ram_size, int *kern_len)
 	if (kern_len)
 		*kern_len = flen;
 
-	addr = 0;
+	addr = KERNEL_LOAD_OFFSET;
 	flashaddr = kernel_start;
 	printf("loading kernel Image (%d bytes) from flash:%lx into psram:%lx\n", flen, (uint32_t)flashaddr, addr);
 	while (flen >= 64) {
