@@ -1,0 +1,40 @@
+#!/bin/sh
+
+# This is an immutable single-board initramfs.  Avoid OpenWrt's discovery,
+# overlay and failsafe machinery; those paths are very expensive when every
+# RV32 instruction is interpreted and there is no persistent block device.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+export TERM=linux
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /tmp/run /tmp/lock /tmp/log /etc/dropbear
+mount -t devpts devpts /dev/pts -o mode=620,ptmxmode=666
+ln -sf pts/ptmx /dev/ptmx
+
+# This changes the tmpfs ceiling only; it does not allocate 16 MiB eagerly.
+mount -o remount,size=16M /
+printf '%s\n' esp32p4-openwrt > /proc/sys/kernel/hostname
+ip link set lo up
+
+if ip link show eth0 >/dev/null 2>&1; then
+	ip link set eth0 up
+	ip address replace 172.25.115.28/24 dev eth0
+	ip route replace default via 172.25.115.163 dev eth0
+	printf '%s\n' 'nameserver 1.1.1.1' > /etc/resolv.conf
+	ping -c 1 -W 1 172.25.115.163 >/dev/null 2>&1 || true
+fi
+
+# A pre-generated key may be supplied to build-openwrt-rootfs.sh.  Falling
+# back to runtime generation keeps clean builds self-contained.
+if [ ! -s /etc/dropbear/dropbear_ed25519_host_key ]; then
+	dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key \
+		>/dev/null 2>&1
+fi
+/usr/sbin/dropbear -E -p 22 \
+	-r /etc/dropbear/dropbear_ed25519_host_key
+
+printf '\nOpenWrt RV32 on ESP32-P4 (apk + Dropbear)\n\n'
+exec /usr/sbin/console-mux
