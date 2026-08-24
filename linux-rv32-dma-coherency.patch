@@ -1,0 +1,19 @@
+--- a/arch/riscv/include/asm/pgtable-32.h
++++ b/arch/riscv/include/asm/pgtable-32.h
+@@ -24,8 +24,13 @@
+  */
+ #define _PAGE_PFN_MASK  GENMASK(31, 10)
+ 
+-#define _PAGE_NOCACHE		0
+-#define _PAGE_IO		0
+-#define _PAGE_MTMASK		0
++/*
++ * The ESP32-P4 mini-rv32ima host interprets RSW bit 9 as an uncached
++ * mapping marker.  Real RV32 hardware ignores RSW, while the emulator uses
++ * it to keep dma_alloc_coherent() buffers coherent with native USB DMA.
++ */
++#define _PAGE_NOCACHE		(1 << 9)
++#define _PAGE_IO		(1 << 9)
++#define _PAGE_MTMASK		(1 << 9)
+ 
+ /* Set of bits to preserve across pte_modify() */
