@@ -5,236 +5,596 @@
  */
 
 #include <string.h>
+#include <stdbool.h>
+#include <inttypes.h>
 #include <unistd.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_attr.h"
 #include "esp_flash.h"
-#include "esp_timer.h"
+#include "esp_cache.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "esp_partition.h"
-#include "hal/usb_serial_jtag_ll.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "bootloader_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/task.h"
+#include "hal/uart_ll.h"
+#include "dwc2_passthrough.h"
+#include "port.h"
 #include "psram.h"
 
-uint64_t GetTimeMicroseconds()
+#define FLASH_COPY_CHUNK_SIZE (64u * 1024u)
+#define FDT_BEGIN_NODE 1u
+#define FDT_END_NODE   2u
+#define FDT_PROP       3u
+#define FDT_NOP        4u
+#define FDT_END        9u
+#define LINUX_RNG_SEED_SIZE 64u
+#define HOST_UART_TX_QUEUE_SIZE (32u * 1024u)
+#define HOST_UART_TX_CHUNK_SIZE 256u
+#define HOST_UART_TX_STACK_SIZE 3072u
+#define HOST_UART_TX_PRIORITY   9u
+
+static StaticStreamBuffer_t host_uart_tx_stream_control;
+static uint8_t host_uart_tx_stream_storage[HOST_UART_TX_QUEUE_SIZE];
+static StreamBufferHandle_t host_uart_tx_stream;
+static uint32_t host_uart_tx_dropped;
+
+static uint32_t read_be32(const uint8_t *value);
+
+uint64_t GetTimeMicroseconds() { return esp_timer_get_time(); }
+
+static bool seed_linux_rng(uint8_t *dtb, size_t dtb_size)
 {
-	return esp_timer_get_time();
+  uint32_t struct_offset;
+  uint32_t strings_offset;
+  uint32_t struct_size;
+  uint32_t strings_size;
+  size_t cursor;
+  size_t struct_end;
+
+  if (dtb_size < 40 || read_be32(dtb) != 0xd00dfeedu)
+    return false;
+
+  struct_offset = read_be32(dtb + 8);
+  strings_offset = read_be32(dtb + 12);
+  strings_size = read_be32(dtb + 32);
+  struct_size = read_be32(dtb + 36);
+  if (struct_offset > dtb_size || struct_size > dtb_size - struct_offset ||
+      strings_offset > dtb_size || strings_size > dtb_size - strings_offset)
+    return false;
+
+  cursor = struct_offset;
+  struct_end = struct_offset + struct_size;
+  while (cursor + sizeof(uint32_t) <= struct_end) {
+    uint32_t token = read_be32(dtb + cursor);
+
+    cursor += sizeof(uint32_t);
+    if (token == FDT_BEGIN_NODE) {
+      const void *terminator = memchr(dtb + cursor, '\0', struct_end - cursor);
+
+      if (terminator == NULL)
+        return false;
+      cursor = ((const uint8_t *)terminator - dtb + 1u + 3u) & ~3u;
+    } else if (token == FDT_PROP) {
+      uint32_t length;
+      uint32_t name_offset;
+      const char *name;
+      const void *name_end;
+
+      if (cursor + 8u > struct_end)
+        return false;
+      length = read_be32(dtb + cursor);
+      name_offset = read_be32(dtb + cursor + 4u);
+      cursor += 8u;
+      if (length > struct_end - cursor || name_offset >= strings_size)
+        return false;
+
+      name = (const char *)(dtb + strings_offset + name_offset);
+      name_end = memchr(name, '\0', strings_size - name_offset);
+      if (name_end == NULL)
+        return false;
+
+      if (strcmp(name, "rng-seed") == 0) {
+        if (length != LINUX_RNG_SEED_SIZE)
+          return false;
+
+        bootloader_random_enable();
+        esp_fill_random(dtb + cursor, length);
+        bootloader_random_disable();
+        printf("Seeded Linux CRNG with %" PRIu32
+               " bytes of fresh P4 hardware entropy\n", length);
+        return true;
+      }
+      cursor = (cursor + length + 3u) & ~3u;
+    } else if (token == FDT_END_NODE || token == FDT_NOP) {
+      continue;
+    } else if (token == FDT_END) {
+      break;
+    } else {
+      return false;
+    }
+  }
+
+  return false;
 }
 
-int ReadKBByte(void)
-{
-	uint8_t rxchar;
-	int rread;
-
-	rread = usb_serial_jtag_ll_read_rxfifo(&rxchar, 1);
-
-	if (rread > 0)
-		return rxchar;
-	else
-		return -1;
+int HostInputInit(void) {
+  return dwc2_passthrough_init();
 }
 
-int IsKBHit(void)
+static void host_uart_hw_write(const uint8_t *buffer, size_t length)
 {
-	return usb_serial_jtag_ll_rxfifo_data_available();
+  uart_dev_t *console_uart = UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM);
+
+  while (length != 0u) {
+    uint32_t available = uart_ll_get_txfifo_len(console_uart);
+
+    if (available == 0u) {
+      vTaskDelay(1);
+      continue;
+    }
+    if (available > length)
+      available = length;
+    uart_ll_write_txfifo(console_uart, buffer, available);
+    buffer += available;
+    length -= available;
+  }
 }
 
+static void host_uart_report_drops(void)
+{
+  uint32_t dropped = __atomic_exchange_n(&host_uart_tx_dropped, 0u,
+                                          __ATOMIC_RELAXED);
+
+  if (dropped != 0u) {
+    char message[64];
+    int length = snprintf(message, sizeof(message),
+                          "\r\n[UART TX queue dropped %" PRIu32
+                          " bytes]\r\n", dropped);
+
+    if (length > 0)
+      host_uart_hw_write((const uint8_t *)message, (size_t)length);
+  }
+}
+
+static void host_uart_tx_task(void *argument)
+{
+  uint8_t buffer[HOST_UART_TX_CHUNK_SIZE];
+
+  (void)argument;
+  for (;;) {
+    size_t length = xStreamBufferReceive(host_uart_tx_stream, buffer,
+                                         sizeof(buffer), portMAX_DELAY);
+
+    if (length != 0u)
+      host_uart_hw_write(buffer, length);
+    if (xStreamBufferBytesAvailable(host_uart_tx_stream) == 0u)
+      host_uart_report_drops();
+  }
+}
+
+int HostConsoleInit(void)
+{
+  BaseType_t uart_core = CONFIG_FREERTOS_NUMBER_OF_CORES > 1 ? 1 : 0;
+
+  host_uart_tx_stream = xStreamBufferCreateStatic(
+      sizeof(host_uart_tx_stream_storage), 1u,
+      host_uart_tx_stream_storage, &host_uart_tx_stream_control);
+  if (host_uart_tx_stream == NULL)
+    return -1;
+
+  if (xTaskCreatePinnedToCore(host_uart_tx_task, "uart_tx",
+                              HOST_UART_TX_STACK_SIZE, NULL,
+                              HOST_UART_TX_PRIORITY, NULL,
+                              uart_core) != pdPASS) {
+    host_uart_tx_stream = NULL;
+    return -1;
+  }
+
+  return 0;
+}
+
+int HostConsoleWrite(const void *buffer, size_t length) {
+  size_t queued;
+
+  if (host_uart_tx_stream == NULL)
+    return fwrite(buffer, 1, length, stdout);
+
+  queued = xStreamBufferSend(host_uart_tx_stream, buffer, length, 0);
+  if (queued != length)
+    __atomic_fetch_add(&host_uart_tx_dropped, length - queued,
+                       __ATOMIC_RELAXED);
+  return (int)queued;
+}
+
+int ReadKBByte(void) {
+  uint8_t value;
+  uart_dev_t *console_uart = UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM);
+
+  if (uart_ll_get_rxfifo_len(console_uart) == 0)
+    return -1;
+
+  uart_ll_read_rxfifo(console_uart, &value, 1);
+  return value;
+}
+
+int IsKBHit(void) {
+  uart_dev_t *console_uart = UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM);
+
+  return uart_ll_get_rxfifo_len(console_uart) != 0;
+}
+
+static uint8_t *psram_allocation = NULL;
 static uint8_t *psram_base = NULL;
 static size_t psram_size = 0;
 
-int psram_init(void)
-{
-	size_t available_psram;
-	size_t alloc_size;
+int psram_init(void) {
+  /*
+   * ESP32-P4 PSRAM is external-DMA capable, but IDF deliberately does not
+   * attach MALLOC_CAP_DMA to PSRAM heap regions.  Requiring both flags in a
+   * plain heap query therefore reports zero bytes.  Reserve the SPIRAM region
+   * here and validate the identity-mapped DMA aperture explicitly below.
+   */
+  const uint32_t guest_heap_caps = MALLOC_CAP_SPIRAM;
+  size_t available_psram;
+  size_t largest_psram;
+  size_t alloc_size;
 
-	available_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  available_psram = heap_caps_get_free_size(guest_heap_caps);
+  largest_psram = heap_caps_get_largest_free_block(guest_heap_caps);
 
-	if (available_psram == 0) {
-		printf("ERROR: No PSRAM available!\n");
-		printf("Check menuconfig: Component config -> ESP PSRAM\n");
-		return -1;
-	}
+  if (available_psram == 0) {
+    printf("ERROR: No PSRAM available!\n");
+    printf("Check menuconfig: Component config -> ESP PSRAM\n");
+    return -1;
+  }
 
-	printf("Available PSRAM: %zu bytes (%.2f MB)\n",
-		   available_psram, available_psram / (1024.0 * 1024.0));
+  printf("Available PSRAM: %zu bytes (%.2f MB)\n", available_psram,
+         available_psram / (1024.0 * 1024.0));
+  printf("Largest PSRAM block: %zu bytes (%.2f MB)\n", largest_psram,
+         largest_psram / (1024.0 * 1024.0));
 
-	alloc_size = (available_psram * 9) / 10;
+  alloc_size = GUEST_RAM_SIZE;
 
-	printf("Attempting to allocate %zu bytes (%.2f MB)...\n",
-		   alloc_size, alloc_size / (1024.0 * 1024.0));
+  if (largest_psram < alloc_size) {
+    printf("ERROR: Guest RAM requires %zu contiguous PSRAM bytes, but the "
+           "largest block is %zu bytes\n",
+           alloc_size, largest_psram);
+    return -1;
+  }
 
-	psram_base = (uint8_t *)heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM);
+  printf("Attempting to allocate %zu bytes (%.2f MB)...\n", alloc_size,
+         alloc_size / (1024.0 * 1024.0));
 
-	if (psram_base == NULL) {
-		printf("ERROR: Failed to allocate PSRAM!\n");
-		return -1;
-	}
+  psram_allocation = (uint8_t *)heap_caps_malloc(
+      alloc_size, guest_heap_caps);
 
-	psram_size = alloc_size;
-	printf("SUCCESS: PSRAM allocated at %p, size: %zu bytes (%.2f MB)\n",
-		   psram_base, psram_size, psram_size / (1024.0 * 1024.0));
+  if (psram_allocation == NULL) {
+    printf("ERROR: Failed to allocate PSRAM!\n");
+    return -1;
+  }
 
-	printf("Initializing PSRAM to zero...\n");
-	memset(psram_base, 0, psram_size);
-	printf("PSRAM initialized successfully!\n");
+  uintptr_t allocation_start = (uintptr_t)psram_allocation;
+  uintptr_t allocation_end = allocation_start + alloc_size;
 
-	return 0;
+  if (allocation_start > GUEST_DMA_BASE ||
+      allocation_end < GUEST_PHYS_END) {
+    printf("ERROR: PSRAM allocation [%p, %p) does not contain the "
+           "identity-mapped guest DMA range [0x%08x, 0x%08x)\n",
+           psram_allocation, (void *)allocation_end,
+           GUEST_DMA_BASE, GUEST_PHYS_END);
+    heap_caps_free(psram_allocation);
+    psram_allocation = NULL;
+    return -1;
+  }
+
+  if (!esp_ptr_dma_ext_capable((void *)(uintptr_t)GUEST_DMA_BASE) ||
+      !esp_ptr_dma_ext_capable((void *)(uintptr_t)(GUEST_PHYS_END - 1u))) {
+    printf("ERROR: Guest DMA range is not accessible to external DMA\n");
+    heap_caps_free(psram_allocation);
+    psram_allocation = NULL;
+    return -1;
+  }
+
+  /* Guest physical addresses are real ESP32-P4 PSRAM bus addresses. */
+  psram_base = (uint8_t *)(uintptr_t)GUEST_PHYS_BASE;
+  psram_size = alloc_size;
+  printf("SUCCESS: PSRAM allocated at %p, size: %zu bytes (%.2f MB)\n",
+         psram_allocation, psram_size, psram_size / (1024.0 * 1024.0));
+  printf("Identity-mapped Linux DMA RAM: 0x%08x-0x%08x\n",
+         GUEST_DMA_BASE, GUEST_PHYS_END - 1u);
+
+  /*
+   * Do not clear all 30 MiB here.  The Image's effective area is cleared by
+   * load_images() (including BSS), the DTB is overwritten, and Linux zeros
+   * pages before exposing them to userspace.  Avoiding this redundant pass
+   * also leaves more memory bandwidth for LCD initialization.
+   */
+  printf("PSRAM guest aperture reserved successfully!\n");
+
+  return 0;
 }
 
-int psram_read(uint32_t addr, void *buf, int len)
-{
-	if (psram_base == NULL) {
-		printf("ERROR: psram_read called before psram_init!\n");
-		return -1;
-	}
+int psram_read(uint32_t addr, void *buf, int len) {
+  if (psram_base == NULL) {
+    printf("ERROR: psram_read called before psram_init!\n");
+    return -1;
+  }
 
-	if (addr + len > psram_size) {
-		printf("ERROR: psram_read out of bounds: addr=0x%lx, len=%d, size=%zu\n",
-			   (unsigned long)addr, len, psram_size);
-		return -1;
-	}
+  if (len < 0 || addr < KERNEL_LOAD_OFFSET || addr > psram_size ||
+      (size_t)len > psram_size - addr) {
+    printf("ERROR: psram_read out of bounds: addr=0x%lx, len=%d, size=%zu\n",
+           (unsigned long)addr, len, psram_size);
+    return -1;
+  }
 
-	memcpy(buf, psram_base + addr, len);
-	return len;
+  memcpy(buf, psram_base + addr, len);
+  return len;
 }
 
-int psram_write(uint32_t addr, void *buf, int len)
-{
-	if (psram_base == NULL) {
-		printf("ERROR: psram_write called before psram_init!\n");
-		return -1;
-	}
+int psram_write(uint32_t addr, void *buf, int len) {
+  if (psram_base == NULL) {
+    printf("ERROR: psram_write called before psram_init!\n");
+    return -1;
+  }
 
-	if (addr + len > psram_size) {
-		printf("ERROR: psram_write out of bounds: addr=0x%lx, len=%d, size=%zu\n",
-			   (unsigned long)addr, len, psram_size);
-		return -1;
-	}
+  if (len < 0 || addr < KERNEL_LOAD_OFFSET || addr > psram_size ||
+      (size_t)len > psram_size - addr) {
+    printf("ERROR: psram_write out of bounds: addr=0x%lx, len=%d, size=%zu\n",
+           (unsigned long)addr, len, psram_size);
+    return -1;
+  }
 
-	memcpy(psram_base + addr, buf, len);
-	return len;
+  memcpy(psram_base + addr, buf, len);
+  return len;
 }
 
-void *psram_get_base(void)
-{
-	return psram_base;
+void *psram_get_base(void) { return psram_base; }
+
+size_t psram_get_size(void) { return psram_size; }
+
+int HostDmaCacheSync(uint32_t guest_physical_address, size_t length,
+                     enum host_dma_sync_op operation) {
+  int flags = ESP_CACHE_MSYNC_FLAG_TYPE_DATA;
+
+  if (length == 0 || guest_physical_address < GUEST_DMA_BASE ||
+      guest_physical_address > GUEST_PHYS_END ||
+      length > GUEST_PHYS_END - guest_physical_address)
+    return -1;
+
+  switch (operation) {
+  case HOST_DMA_SYNC_CLEAN:
+    flags |= ESP_CACHE_MSYNC_FLAG_DIR_C2M;
+    break;
+  case HOST_DMA_SYNC_INVALIDATE:
+    flags |= ESP_CACHE_MSYNC_FLAG_DIR_M2C;
+    break;
+  case HOST_DMA_SYNC_FLUSH:
+    flags |= ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+             ESP_CACHE_MSYNC_FLAG_INVALIDATE;
+    break;
+  default:
+    return -1;
+  }
+
+  return esp_cache_msync((void *)(uintptr_t)guest_physical_address,
+                         length, flags) == ESP_OK ? 0 : -1;
 }
 
-size_t psram_get_size(void)
-{
-	return psram_size;
+bool verify_kernel_header(void) {
+  static uint8_t header[64];
+
+  printf("\n=== Verifying Kernel Header ===\n");
+  if (psram_read(KERNEL_LOAD_OFFSET, header, sizeof(header)) < 0)
+    return false;
+
+  printf("First 64 bytes of loaded kernel:\n");
+  for (int i = 0; i < 64; i++) {
+    printf("%02x ", header[i]);
+    if ((i + 1) % 16 == 0)
+      printf("\n");
+  }
+  printf("\n");
+
+  uint32_t first_instr = *(uint32_t *)header;
+  printf("First instruction: 0x%08lx\n", (unsigned long)first_instr);
+  return (!memcmp(&header[0x30], "RISCV", 5));
 }
 
-void verify_kernel_header(void)
-{
-	uint8_t header[64];
-
-	printf("\n=== Verifying Kernel Header ===\n");
-	psram_read(0, header, 64);
-
-	printf("First 64 bytes of loaded kernel:\n");
-	for (int i = 0; i < 64; i++) {
-		printf("%02x ", header[i]);
-		if ((i + 1) % 16 == 0) printf("\n");
-	}
-	printf("\n");
-
-	// Check RISC-V magic
-	if (header[0x30] == 'R' && header[0x31] == 'I' &&
-		header[0x32] == 'S' && header[0x33] == 'C' &&
-		header[0x34] == 'V') {
-		printf("✓ RISCV magic found at offset 0x30\n");
-		} else {
-			printf("✗ RISCV magic NOT found! Expected at 0x30\n");
-		}
-
-		uint32_t first_instr = *(uint32_t*)header;
-	printf("First instruction: 0x%08lx\n", (unsigned long)first_instr);
-	printf("Expected: 0x05c0006f (j 0x5c)\n\n");
+static uint32_t read_be32(const uint8_t *value) {
+  return ((uint32_t)value[0] << 24) | ((uint32_t)value[1] << 16) |
+         ((uint32_t)value[2] << 8) | value[3];
 }
 
-int load_images(int ram_size, int *kern_len)
-{
-	const esp_partition_t *kernel_partition;
-	esp_err_t err;
-	uint32_t addr;
-	char dmabuf[64];
-	size_t partition_size;
+int load_images(int ram_size, int *kern_len) {
+  const esp_partition_t *kernel_partition;
+  const esp_partition_t *dtb_partition;
+  esp_err_t err;
+  uint32_t addr;
+  size_t partition_size;
+  size_t kernel_payload_size = KERNEL_FLASH_SIZE;
 
-	printf("\n=== Loading Kernel from Flash ===\n");
+  printf("\n=== Loading Kernel from Flash ===\n");
 
-	kernel_partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
-												ESP_PARTITION_SUBTYPE_ANY,
-											 "kernel");
-	if (kernel_partition == NULL) {
-		printf("ERROR: 'kernel' partition not found!\n");
-		printf("Make sure partition table has 'kernel' partition\n");
-		return -1;
-	}
+  kernel_partition = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "kernel");
+  if (kernel_partition == NULL) {
+    printf("ERROR: 'kernel' partition not found!\n");
+    printf("Make sure partition table has 'kernel' partition\n");
+    return -1;
+  }
 
-	partition_size = kernel_partition->size;
-	printf("Found kernel partition:\n");
-	printf("  Label: %s\n", kernel_partition->label);
-	printf("  Address: 0x%lx\n", (unsigned long)kernel_partition->address);
-	printf("  Size: %zu bytes (%.2f MB)\n", partition_size,
-		   partition_size / (1024.0 * 1024.0));
+  partition_size = kernel_partition->size;
 
-	if (partition_size > ram_size) {
-		printf("WARNING: Partition size (%zu) > RAM size (%d)\n",
-			   partition_size, ram_size);
-		printf("Will only load first %d bytes\n", ram_size);
-		partition_size = ram_size;
-	}
+  uint64_t text_offset = 0;
+  uint64_t image_size = 0;
 
-	if (partition_size > psram_get_size()) {
-		printf("WARNING: Partition size (%zu) > PSRAM size (%zu)\n",
-			   partition_size, psram_get_size());
-		partition_size = psram_get_size();
-	}
+  err = esp_partition_read(kernel_partition, 8,
+                           &text_offset, sizeof(text_offset));
+  if (err != ESP_OK)
+    return -1;
 
-	if (kern_len)
-		*kern_len = partition_size;
+  err = esp_partition_read(kernel_partition, 16,
+                           &image_size, sizeof(image_size));
+  if (err != ESP_OK)
+    return -1;
 
-	printf("\nLoading kernel from flash to PSRAM...\n");
-	printf("This will take a moment...\n");
+  printf("Kernel text offset: 0x%llx\n",
+         (unsigned long long)text_offset);
+  printf("Kernel image size:   %llu bytes\n",
+         (unsigned long long)image_size);
+  printf("Kernel flash payload: %zu bytes\n", kernel_payload_size);
 
-	addr = 0;
-	size_t remaining = partition_size;
+  if (text_offset != KERNEL_LOAD_OFFSET) {
+    printf("ERROR: Expected a 32-bit S-mode Image with text offset "
+           "0x%08x\n", KERNEL_LOAD_OFFSET);
+    return -1;
+  }
 
-	while (remaining >= 64) {
-		err = esp_partition_read(kernel_partition, addr, dmabuf, 64);
-		if (err != ESP_OK) {
-			printf("\nERROR: Failed to read from flash at offset %lu: %s\n",
-				   (unsigned long)addr, esp_err_to_name(err));
-			return -1;
-		}
+  if (image_size == 0 || image_size > UINT32_MAX ||
+      (uint64_t)KERNEL_LOAD_OFFSET + image_size > DTB_LOAD_OFFSET) {
+    printf("ERROR: Kernel overlaps DTB area\n");
+    return -1;
+  }
 
-		psram_write(addr, dmabuf, 64);
-		addr += 64;
-		remaining -= 64;
+  if (kernel_payload_size > kernel_partition->size ||
+      kernel_payload_size > image_size) {
+    printf("ERROR: Kernel payload size is inconsistent with its partition or "
+           "Image header\n");
+    return -1;
+  }
 
-		if ((addr % (64 * 1024)) == 0) {
-			printf(".");
-			fflush(stdout);
-		}
-	}
+  partition_size = kernel_payload_size;
 
-	if (remaining > 0) {
-		err = esp_partition_read(kernel_partition, addr, dmabuf, remaining);
-		if (err != ESP_OK) {
-			printf("\nERROR: Failed to read remaining bytes: %s\n",
-				   esp_err_to_name(err));
-			return -1;
-		}
-		psram_write(addr, dmabuf, remaining);
-	}
+  printf("Found kernel partition:\n");
+  printf("  Label: %s\n", kernel_partition->label);
+  printf("  Address: 0x%lx\n", (unsigned long)kernel_partition->address);
+  printf("  Size: %zu bytes (%.2f MB)\n", partition_size,
+         partition_size / (1024.0 * 1024.0));
 
-	printf("\n✓ Kernel loaded successfully from flash!\n");
-	printf("Total loaded: %zu bytes (%.2f MB)\n",
-		   partition_size, partition_size / (1024.0 * 1024.0));
+  if ((uint64_t)KERNEL_LOAD_OFFSET + image_size > (size_t)ram_size) {
+    printf("ERROR: Kernel does not fit in guest RAM\n");
+    return -1;
+  }
 
-	verify_kernel_header();
+  if ((uint64_t)KERNEL_LOAD_OFFSET + image_size > psram_get_size()) {
+    printf("ERROR: Kernel does not fit in allocated PSRAM\n");
+    return -1;
+  }
 
-	return 0;
+  if (kern_len)
+    *kern_len = (int)image_size;
+
+  /* Clear the complete effective Image area, including BSS, on every boot. */
+  memset(psram_base + KERNEL_LOAD_OFFSET, 0, (size_t)image_size);
+
+  printf("\nLoading kernel from flash to PSRAM...\n");
+  printf("This will take a moment...\n");
+
+  addr = 0;
+  size_t remaining = partition_size;
+
+  while (remaining > 0) {
+      size_t chunk = remaining < FLASH_COPY_CHUNK_SIZE
+                       ? remaining
+                       : FLASH_COPY_CHUNK_SIZE;
+
+      err = esp_partition_read(kernel_partition, addr,
+                               psram_base + KERNEL_LOAD_OFFSET + addr,
+                               chunk);
+      if (err != ESP_OK) {
+          return -1;
+      }
+
+      addr += chunk;
+      remaining -= chunk;
+  }
+
+  printf("\nKernel loaded successfully from flash!\n");
+  printf("Total loaded: %zu bytes (%.2f MB)\n", partition_size,
+         partition_size / (1024.0 * 1024.0));
+
+  printf("\n=== Loading DTB from Flash ===\n");
+
+  dtb_partition = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA,
+      ESP_PARTITION_SUBTYPE_ANY,
+      "dtb");
+
+  if (dtb_partition == NULL) {
+    printf("ERROR: 'dtb' partition not found!\n");
+    return -1;
+  }
+
+  uint8_t dtb_header[8];
+  err = esp_partition_read(dtb_partition, 0, dtb_header,
+                           sizeof(dtb_header));
+  if (err != ESP_OK) {
+    printf("ERROR: Failed reading DTB header: %s\n", esp_err_to_name(err));
+    return -1;
+  }
+
+  if (read_be32(dtb_header) != 0xd00dfeedu) {
+    printf("ERROR: Invalid DTB magic; flash a compiled DTB to the 'dtb' "
+           "partition\n");
+    return -1;
+  }
+
+  size_t dtb_size = read_be32(&dtb_header[4]);
+  if (dtb_size < 40 || dtb_size > dtb_partition->size) {
+    printf("ERROR: Invalid DTB size: %zu bytes\n", dtb_size);
+    return -1;
+  }
+
+  printf("DTB size: %zu bytes\n", dtb_size);
+
+  if ((uint64_t)DTB_LOAD_OFFSET + dtb_size > (size_t)ram_size) {
+    printf("ERROR: DTB does not fit in guest RAM\n");
+    return -1;
+  }
+
+  if ((uint64_t)DTB_LOAD_OFFSET + dtb_size > psram_get_size()) {
+    printf("ERROR: DTB does not fit in allocated PSRAM\n");
+    return -1;
+  }
+
+  addr = 0;
+  remaining = dtb_size;
+
+  while (remaining > 0) {
+    size_t chunk = remaining < FLASH_COPY_CHUNK_SIZE
+                    ? remaining
+                    : FLASH_COPY_CHUNK_SIZE;
+
+    err = esp_partition_read(
+        dtb_partition, addr, psram_base + DTB_LOAD_OFFSET + addr, chunk);
+
+    if (err != ESP_OK) {
+      printf("ERROR: Failed reading DTB: %s\n",
+            esp_err_to_name(err));
+      return -1;
+    }
+
+    addr += chunk;
+    remaining -= chunk;
+  }
+
+  if (!seed_linux_rng(psram_base + DTB_LOAD_OFFSET, dtb_size)) {
+    printf("ERROR: DTB has no valid 64-byte /chosen/rng-seed property\n");
+    return -1;
+  }
+
+  printf("DTB loaded at guest address 0x%08x\n",
+        GUEST_PHYS_BASE + DTB_LOAD_OFFSET);
+
+
+  printf("%s\n",
+          verify_kernel_header()
+              ? "Verified RISCV magic header"
+              : "Couldn't find RISCV magic header!");
+
+  return 0;
 }

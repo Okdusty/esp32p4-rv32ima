@@ -2,3 +2,6 @@
 archive: libmain.a
 entries:
     uc-rv32ima (noflash)
+    cache (noflash)
+    dwc2_passthrough (noflash)
+    port-esp (noflash)

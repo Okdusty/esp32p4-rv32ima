@@ -6,13 +6,50 @@
 	compatible = "riscv-minimal-nommu";
 	model = "riscv-minimal-nommu,qemu";
 
-	chosen {
-		bootargs = "console=ttyS0 earlycon=uart8250,mmio,0x10000000,16550a";
+	aliases {
+		serial0 = &uart0;
 	};
 
-	memory@80000000 {
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Replaced with fresh ESP32-P4 hardware entropy before Linux starts. */
+		rng-seed = [
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+		];
+#if RV32_ST7703_DISPLAY
+		bootargs = "console=tty0 console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
+#else
+		bootargs = "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
+#endif
+		stdout-path = "serial0:115200n8";
+
+#if RV32_ST7703_DISPLAY
+		framebuffer0: framebuffer@11800000 {
+			compatible = "simple-framebuffer";
+			reg = <0x00 0x11800000 0x00 0x000fd200>;
+			width = <720>;
+			height = <720>;
+			stride = <1440>;
+			format = "r5g6b5";
+			status = "okay";
+		};
+#endif
+	};
+
+	memory@48000000 {
 		device_type = "memory";
-		reg = <0x00 0x80000000 0x00 0x800000>;
+		reg = <0x00 0x48000000 0x00 0x01e00000>;
+	};
+
+	usb_clk: usb-clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <48000000>;
 	};
 
 	cpus {
@@ -26,10 +63,12 @@
 			reg = <0x00>;
 			status = "okay";
 			compatible = "riscv";
-			riscv,isa = "rv32ima";
-			mmu-type = "riscv,none";
+			riscv,isa = "rv32ima_zicbom_zicsr_zifencei";
+			riscv,isa-extensions = "i", "m", "a", "zicbom", "zicsr", "zifencei";
+			riscv,cbom-block-size = <64>;
+			mmu-type = "riscv,sv32";
 
-			interrupt-controller {
+			cpu_intc: interrupt-controller {
 				#interrupt-cells = <0x01>;
 				interrupt-controller;
 				compatible = "riscv,cpu-intc";
@@ -54,10 +93,48 @@
 		compatible = "simple-bus";
 		ranges;
 
-		uart@10000000 {
+		plic: interrupt-controller@c000000 {
+			compatible = "sifive,plic-1.0.0", "riscv,plic0";
+			reg = <0x00 0x0c000000 0x00 0x00400000>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+#if RV32_WIFI_BRIDGE
+			riscv,ndev = <3>;
+#else
+			riscv,ndev = <2>;
+#endif
+			interrupts-extended = <&cpu_intc 9>;
+		};
+
+#if RV32_WIFI_BRIDGE
+		virtio_net: virtio@12000000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x12000000 0x00 0x00000200>;
+			interrupt-parent = <&plic>;
+			interrupts = <3>;
+		};
+#endif
+
+		usb@50000000 {
+			compatible = "snps,dwc2";
+			reg = <0x00 0x50000000 0x00 0x00040000>;
+			interrupt-parent = <&plic>;
+			interrupts = <2>;
+			clocks = <&usb_clk>;
+			clock-names = "otg";
+			dr_mode = "host";
+			maximum-speed = "high-speed";
+			disable-over-current;
+			hnp-disable;
+			srp-disable;
+		};
+
+		uart0: uart@10000000 {
   		 	clock-frequency = <0x1000000>;
 		    reg = <0x00 0x10000000 0x00 0x100>;
 		    compatible = "ns16550a";
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
 		};
 
 		poweroff {
@@ -81,7 +158,7 @@
 		};
 
 		clint@11000000 {
-			interrupts-extended = <0x02 0x03 0x02 0x07>;
+			interrupts-extended = <&cpu_intc 3 &cpu_intc 7>;
 			reg = <0x00 0x11000000 0x00 0x10000>;
 			compatible = "sifive,clint0", "riscv,clint0";
 		};

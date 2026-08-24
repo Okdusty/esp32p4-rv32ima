@@ -9,6 +9,9 @@
 #include <sys/time.h>
 #include <sys/ioctl.h>
 
+#include "port.h"
+#include "psram.h"
+
 extern struct MiniRV32IMAState core;
 extern void DumpState(struct MiniRV32IMAState *core);
 extern void app_main(void);
@@ -33,17 +36,19 @@ static void CtrlC(int sig)
 	exit(0);
 }
 
-// Override keyboard, so we can capture all keyboard input for the VM.
 static void CaptureKeyboardInput(void)
 {
-	struct termios term;
+    struct termios term;
 
-	// Hook exit, because we want to re-enable keyboard.
-	signal(SIGINT, CtrlC);
+    signal(SIGINT, CtrlC);
 
-	tcgetattr(0, &term);
-	term.c_lflag &= ~(ICANON | ECHO); // Disable echo as well
-	tcsetattr(0, TCSANOW, &term);
+    tcgetattr(STDIN_FILENO, &term);
+
+    term.c_lflag &= ~(ICANON | ECHO);
+    term.c_cc[VMIN] = 0;
+    term.c_cc[VTIME] = 0;
+
+    tcsetattr(STDIN_FILENO, TCSANOW, &term);
 }
 
 uint64_t GetTimeMicroseconds()
@@ -55,34 +60,46 @@ uint64_t GetTimeMicroseconds()
 
 int ReadKBByte(void)
 {
-	char rxchar;
-	int rread;
+    unsigned char rxchar;
 
-	if (is_eofd)
-		return 0xffffffff;
+    if (read(STDIN_FILENO, &rxchar, 1) == 1)
+        return rxchar;
 
-	rread = read(0, &rxchar, 1);
+    return -1;
+}
 
-	if (rread > 0) // Tricky: getchar can't be used with arrow keys.
-		return rxchar;
-	else
-		return -1;
+int HostInputInit(void)
+{
+	return 0;
+}
+
+int HostConsoleInit(void)
+{
+	return 0;
+}
+
+int HostConsoleWrite(const void *buffer, size_t length)
+{
+	return write(STDOUT_FILENO, buffer, length);
+}
+
+int HostDmaCacheSync(uint32_t guest_physical_address, size_t length,
+		     enum host_dma_sync_op operation)
+{
+	(void)guest_physical_address;
+	(void)length;
+	(void)operation;
+	return 0;
 }
 
 int IsKBHit(void)
 {
-	int byteswaiting;
+    int byteswaiting = 0;
 
-	if (is_eofd)
-		return -1;
+    if (ioctl(STDIN_FILENO, FIONREAD, &byteswaiting) < 0)
+        return 0;
 
-	ioctl(0, FIONREAD, &byteswaiting);
-	// Is end-of-file for
-	if (!byteswaiting && write(0, 0, 0 ) != 0) {
-		is_eofd = 1;
-		return -1;
-	}
-	return !!byteswaiting;
+    return byteswaiting > 0;
 }
 
 int psram_init(void)
@@ -120,6 +137,7 @@ int load_images(int ram_size, int *kern_len)
 	if (kern_len)
 		*kern_len = flen;
 
+	lseek(ramfd, KERNEL_LOAD_OFFSET, SEEK_SET);
 	write(ramfd, kernel_start, flen);
 
 	return 0;

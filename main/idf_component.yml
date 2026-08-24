@@ -1,0 +1,4 @@
+dependencies:
+  espressif/esp_hosted: "~2.12.12"
+  espressif/esp_wifi_remote: "^1.6.4"
+  waveshare/esp_lcd_st7703: "^2.0.0"
