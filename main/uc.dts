@@ -14,7 +14,6 @@
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
-		/* Replaced with fresh ESP32-P4 hardware entropy before Linux starts. */
 		rng-seed = [
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
@@ -22,20 +21,26 @@
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 		];
 #if RV32_ST7703_DISPLAY
-		bootargs = "console=tty0 console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
+		bootargs = "console=tty0 console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
 #else
-		bootargs = "console=ttyS0,115200 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
+		bootargs = "console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
 #endif
-		stdout-path = "serial0:115200n8";
+		stdout-path = "serial0:921600n8";
 
-#if RV32_ST7703_DISPLAY
+	#if RV32_ST7703_DISPLAY
 		framebuffer0: framebuffer@11800000 {
-			compatible = "simple-framebuffer";
-			reg = <0x00 0x11800000 0x00 0x000fd200>;
+			/* The second compatible keeps unmodified kernel Images usable. */
+			compatible = "mini-rv32ima,pvfb", "simple-framebuffer";
+			/* Scanout followed by generic staging and command apertures. */
+			reg = <0x00 0x11800000 0x00 0x0011e000>;
 			width = <720>;
 			height = <720>;
 			stride = <1440>;
 			format = "r5g6b5";
+			mini-rv32ima,staging-offset = <0x000fd200>;
+			mini-rv32ima,staging-size = <0x00020000>;
+			mini-rv32ima,fence-offset = <0x0011d20c>;
+			mini-rv32ima,accel-offset = <0x0011d210>;
 			status = "okay";
 		};
 #endif
@@ -131,6 +136,7 @@
 
 		uart0: uart@10000000 {
   		 	clock-frequency = <0x1000000>;
+			current-speed = <921600>;
 		    reg = <0x00 0x10000000 0x00 0x100>;
 		    compatible = "ns16550a";
 			interrupt-parent = <&plic>;

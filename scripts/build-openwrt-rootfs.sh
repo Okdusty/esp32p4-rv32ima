@@ -62,6 +62,7 @@ cross_prefix=${cross_gcc%gcc}
 printf '%s\n' "$cross_prefix" >"$output_root/openwrt-cross-prefix"
 
 mkdir -p "$openwrt_dir/files/usr/sbin"
+mkdir -p "$openwrt_dir/files/usr/bin"
 # OpenWrt's compiler is a relocatable wrapper.  Outside package.mk it needs
 # STAGING_DIR explicitly, and GCC's generic RISC-V default may otherwise emit
 # a double-float object which cannot link against this RV32IMA/ILP32 musl.
@@ -70,8 +71,18 @@ env STAGING_DIR="$openwrt_dir/staging_dir" \
 	-fno-caller-saves -fno-plt -fhonour-copts \
 	-Wformat -Werror=format-security -fstack-protector-strong \
 	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
+	-I"$repo_root/main" \
 	"$repo_root/guest/console-mux.c" \
 	-o "$openwrt_dir/files/usr/sbin/console-mux"
+
+env STAGING_DIR="$openwrt_dir/staging_dir" \
+	"$cross_gcc" -Os -pipe -mabi=ilp32 -march=rv32ima \
+	-fno-caller-saves -fno-plt -fhonour-copts \
+	-Wformat -Werror=format-security -fstack-protector-strong \
+	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
+	-I"$repo_root/main" \
+	"$repo_root/guest/fbstream.c" \
+	-o "$openwrt_dir/files/usr/bin/fbstream"
 
 # Populate the download cache in parallel, then verify it serially so a
 # transient per-package error cannot hide in OpenWrt's aggregate target.

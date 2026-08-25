@@ -1,0 +1,16 @@
+#!/bin/sh
+
+port=${1:-5000}
+width=${2:-256}
+height=${3:-144}
+
+restore_console()
+{
+	setterm --cursor on > /dev/tty0 2>/dev/null || true
+}
+
+trap restore_console EXIT HUP INT TERM
+setterm --cursor off > /dev/tty0 2>/dev/null || true
+printf 'Waiting for %sx%s RGB565 video on TCP port %s...\n' \
+	"$width" "$height" "$port"
+nc -l -p "$port" | fbstream "$width" "$height"

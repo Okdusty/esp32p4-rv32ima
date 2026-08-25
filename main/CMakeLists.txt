@@ -10,9 +10,13 @@ set(RV32_SOURCES
 
 set(RV32_LINKER_FRAGMENTS "link.lf")
 
-if(CONFIG_RV32_ST7703_DISPLAY)
+if(CONFIG_RV32_DISPLAY_ACCEL)
 	list(APPEND RV32_SOURCES "display_bridge.c")
 	list(APPEND RV32_LINKER_FRAGMENTS "link-display.lf")
+endif()
+
+if(CONFIG_RV32_ST7703_DISPLAY)
+	list(APPEND RV32_SOURCES "display_backend_st7703.c")
 endif()
 
 if(CONFIG_RV32_WIFI_BRIDGE)
@@ -23,6 +27,7 @@ idf_component_register(SRCS ${RV32_SOURCES}
 		       LDFRAGMENTS ${RV32_LINKER_FRAGMENTS}
 		       INCLUDE_DIRS "."
 		       PRIV_REQUIRES esp_lcd esp_driver_gpio esp_driver_ledc
+		                     esp_driver_ppa
 		                     esp_hw_support esp_mm esp_timer
 		                     bootloader_support
 		                     esp_partition spi_flash heap esp_hal_usb

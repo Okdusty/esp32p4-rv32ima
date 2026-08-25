@@ -1,0 +1,31 @@
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -1759,7 +1759,23 @@ config FB_BROADSHEET
+ 	  controller. The release name for this device was Epson S1D13521
+ 	  and could also have been called by other names when coupled with
+ 	  a bridge adapter.
+ 
++config FB_RV32_PV
++	tristate "mini-rv32ima paravirtual framebuffer acceleration"
++	depends on FB && OF
++	select APERTURE_HELPERS
++	select FB_IOMEM_HELPERS
++	select FB_CFB_FILLRECT
++	select FB_CFB_COPYAREA
++	select FB_CFB_IMAGEBLIT
++	select FB_TILEBLITTING
++	help
++	  Standard fbdev frontend for the optional mini-rv32ima display
++	  command mailbox. Direct framebuffer read, write and mmap stay
++	  available; fill, copy and monochrome image operations are offloaded.
++	  If the mailbox is unavailable, the driver transparently uses the
++	  generic software framebuffer helpers.
++
+ config FB_SIMPLE
+ 	tristate "Simple framebuffer support"
+ 	depends on FB
+--- a/drivers/video/fbdev/Makefile
++++ b/drivers/video/fbdev/Makefile
+@@ -123,1 +123,2 @@
++obj-$(CONFIG_FB_RV32_PV)          += rv32-pvfb.o
+ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o

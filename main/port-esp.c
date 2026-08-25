@@ -9,6 +9,7 @@
 #include <inttypes.h>
 #include <unistd.h>
 
+#include "sdkconfig.h"
 #include "esp_flash.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
@@ -16,11 +17,18 @@
 #include "esp_partition.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp32p4/rom/cache.h"
 #include "bootloader_random.h"
+#include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "hal/uart_ll.h"
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+#include "soc/cache_reg.h"
+#include "soc/soc.h"
+#endif
 #include "dwc2_passthrough.h"
 #include "port.h"
 #include "psram.h"
@@ -35,16 +43,88 @@
 #define HOST_UART_TX_QUEUE_SIZE (32u * 1024u)
 #define HOST_UART_TX_CHUNK_SIZE 256u
 #define HOST_UART_TX_STACK_SIZE 3072u
-#define HOST_UART_TX_PRIORITY   9u
+#define HOST_UART_TX_PRIORITY   (configMAX_PRIORITIES - 1)
+#define HOST_UART_DRIVER_RX_SIZE 2048u
+#define HOST_UART_DRIVER_TX_SIZE (8u * 1024u)
 
 static StaticStreamBuffer_t host_uart_tx_stream_control;
 static uint8_t host_uart_tx_stream_storage[HOST_UART_TX_QUEUE_SIZE];
 static StreamBufferHandle_t host_uart_tx_stream;
 static uint32_t host_uart_tx_dropped;
+static bool host_uart_driver_ready;
+static int host_uart_init_result = -1;
 
 static uint32_t read_be32(const uint8_t *value);
 
 uint64_t GetTimeMicroseconds() { return esp_timer_get_time(); }
+
+void HostEnableGuestRamPrefetch(const void *base, size_t size)
+{
+#if CONFIG_RV32_GUEST_RAM_PREFETCH
+  const uintptr_t line_size = CONFIG_CACHE_L2_CACHE_LINE_SIZE;
+  uintptr_t start;
+  uintptr_t end;
+
+  if (base == NULL || size == 0)
+    return;
+  start = (uintptr_t)base & ~(line_size - 1u);
+  end = ((uintptr_t)base + size + line_size - 1u) & ~(line_size - 1u);
+
+  /*
+   * Guest instruction fetches are ordinary P4 data reads from PSRAM. Ask the
+   * hardware for the following L2 line while the interpreter consumes the
+   * current one. This is deliberately scoped to the caller-provided active
+   * Linux RAM window; it does not include the reserved PSRAM prefix or LCD
+   * scanout allocation.
+   */
+  const struct l1_dcache_l2_autoload_config autoload = {
+    .gid = 0,
+    .order = CACHE_AUTOLOAD_POSITIVE,
+    .trigger = CACHE_AUTOLOAD_BOTH_TRIGGER,
+    .ena0 = 1,
+    .addr0 = start,
+    .size0 = end - start,
+  };
+
+  Cache_Disable_L2_Cache_Autoload();
+  Cache_Config_L2_Cache_Autoload(&autoload);
+  Cache_Enable_L2_Cache_Autoload();
+  printf("L2 next-line prefetch: host [%p, %p)\n", (void *)start,
+         (void *)end);
+#else
+  (void)base;
+  (void)size;
+#endif
+}
+
+void HostCacheStatsReset(void)
+{
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+	REG_SET_BIT(CACHE_L1_CACHE_ACS_CNT_CTRL_REG, CACHE_L1_DBUS0_CNT_CLR);
+	REG_SET_BIT(CACHE_L1_CACHE_ACS_CNT_CTRL_REG, CACHE_L1_DBUS0_CNT_ENA);
+	REG_SET_BIT(CACHE_L2_CACHE_ACS_CNT_CTRL_REG, CACHE_L2_DBUS0_CNT_CLR);
+	REG_SET_BIT(CACHE_L2_CACHE_ACS_CNT_CTRL_REG, CACHE_L2_DBUS0_CNT_ENA);
+#endif
+}
+
+void HostCacheStatsReadAndReset(struct host_cache_stats *stats)
+{
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+	stats->l1_hits = REG_READ(CACHE_L1_DBUS0_ACS_HIT_CNT_REG);
+	stats->l1_misses = REG_READ(CACHE_L1_DBUS0_ACS_MISS_CNT_REG);
+	stats->l1_conflicts = REG_READ(CACHE_L1_DBUS0_ACS_CONFLICT_CNT_REG);
+	stats->l1_next_reads = REG_READ(CACHE_L1_DBUS0_ACS_NXTLVL_RD_CNT_REG);
+	stats->l1_next_writes = REG_READ(CACHE_L1_DBUS0_ACS_NXTLVL_WR_CNT_REG);
+	stats->l2_hits = REG_READ(CACHE_L2_DBUS0_ACS_HIT_CNT_REG);
+	stats->l2_misses = REG_READ(CACHE_L2_DBUS0_ACS_MISS_CNT_REG);
+	stats->l2_conflicts = REG_READ(CACHE_L2_DBUS0_ACS_CONFLICT_CNT_REG);
+	stats->l2_next_reads = REG_READ(CACHE_L2_DBUS0_ACS_NXTLVL_RD_CNT_REG);
+	stats->l2_next_writes = REG_READ(CACHE_L2_DBUS0_ACS_NXTLVL_WR_CNT_REG);
+	HostCacheStatsReset();
+#else
+	memset(stats, 0, sizeof(*stats));
+#endif
+}
 
 static bool seed_linux_rng(uint8_t *dtb, size_t dtb_size)
 {
@@ -129,6 +209,21 @@ static void host_uart_hw_write(const uint8_t *buffer, size_t length)
 {
   uart_dev_t *console_uart = UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM);
 
+  if (__atomic_load_n(&host_uart_driver_ready, __ATOMIC_ACQUIRE)) {
+    while (length != 0u) {
+      int written = uart_write_bytes(CONFIG_ESP_CONSOLE_UART_NUM, buffer,
+                                     length);
+
+      if (written <= 0)
+        return;
+      buffer += written;
+      length -= (size_t)written;
+    }
+    return;
+  }
+
+  /* Early/failure fallback.  Normal operation uses the interrupt-driven path
+   * above, so its pacing is independent of CONFIG_FREERTOS_HZ. */
   while (length != 0u) {
     uint32_t available = uart_ll_get_txfifo_len(console_uart);
 
@@ -162,9 +257,23 @@ static void host_uart_report_drops(void)
 
 static void host_uart_tx_task(void *argument)
 {
+  TaskHandle_t init_waiter = (TaskHandle_t)argument;
   uint8_t buffer[HOST_UART_TX_CHUNK_SIZE];
+  esp_err_t error = ESP_OK;
 
-  (void)argument;
+  /* Interrupt allocation is core-local.  Install from this pinned task so RX
+   * and TX IRQ handling stays on CPU1 with the other host I/O services. */
+  if (!uart_is_driver_installed(CONFIG_ESP_CONSOLE_UART_NUM))
+    error = uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM,
+                                HOST_UART_DRIVER_RX_SIZE,
+                                HOST_UART_DRIVER_TX_SIZE, 0, NULL, 0);
+  if (error == ESP_OK) {
+    uart_vfs_dev_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
+    __atomic_store_n(&host_uart_driver_ready, true, __ATOMIC_RELEASE);
+    host_uart_init_result = 0;
+  }
+  xTaskNotifyGive(init_waiter);
+
   for (;;) {
     size_t length = xStreamBufferReceive(host_uart_tx_stream, buffer,
                                          sizeof(buffer), portMAX_DELAY);
@@ -187,13 +296,21 @@ int HostConsoleInit(void)
     return -1;
 
   if (xTaskCreatePinnedToCore(host_uart_tx_task, "uart_tx",
-                              HOST_UART_TX_STACK_SIZE, NULL,
+                              HOST_UART_TX_STACK_SIZE,
+                              xTaskGetCurrentTaskHandle(),
                               HOST_UART_TX_PRIORITY, NULL,
                               uart_core) != pdPASS) {
     host_uart_tx_stream = NULL;
     return -1;
   }
 
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  if (host_uart_init_result < 0)
+    printf("WARNING: UART interrupt driver unavailable; using polled TX\n");
+
+  printf("UART%d bridge: %d baud, interrupt-driven RX/TX on CPU%d\n",
+         CONFIG_ESP_CONSOLE_UART_NUM, CONFIG_ESP_CONSOLE_UART_BAUDRATE,
+         (int)uart_core);
   return 0;
 }
 
@@ -214,6 +331,11 @@ int ReadKBByte(void) {
   uint8_t value;
   uart_dev_t *console_uart = UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM);
 
+  if (__atomic_load_n(&host_uart_driver_ready, __ATOMIC_ACQUIRE))
+    return uart_read_bytes(CONFIG_ESP_CONSOLE_UART_NUM, &value, 1, 0) == 1
+               ? value
+               : -1;
+
   if (uart_ll_get_rxfifo_len(console_uart) == 0)
     return -1;
 
@@ -223,6 +345,12 @@ int ReadKBByte(void) {
 
 int IsKBHit(void) {
   uart_dev_t *console_uart = UART_LL_GET_HW(CONFIG_ESP_CONSOLE_UART_NUM);
+  size_t buffered = 0;
+
+  if (__atomic_load_n(&host_uart_driver_ready, __ATOMIC_ACQUIRE))
+    return uart_get_buffered_data_len(CONFIG_ESP_CONSOLE_UART_NUM, &buffered) ==
+                   ESP_OK &&
+           buffered != 0u;
 
   return uart_ll_get_rxfifo_len(console_uart) != 0;
 }
