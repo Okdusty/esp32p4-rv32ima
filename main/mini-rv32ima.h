@@ -115,9 +115,37 @@ struct MiniRV32TLBEntry
 struct MiniRV32FastTLBEntry
 {
 	uint32_t tag;
-	uint32_t physical_page;
-	uint8_t uncached;
+	/* Physical pages are 4 KiB aligned, so bit 0 carries the uncached flag. */
+	uint32_t physical_page_and_flags;
 };
+
+#ifdef MINIRV32_PERF_STATS
+struct MiniRV32PerfStats
+{
+	/* Standard 32-bit opcodes are identified by instruction bits [6:2]. */
+	uint32_t opcode[32];
+	uint32_t load_funct3[8];
+	uint32_t store_funct3[8];
+	uint32_t opimm_funct3[8];
+	uint32_t op_funct3[8];
+	uint32_t branch_funct3[8];
+	uint32_t muldiv;
+	uint32_t fast_tlb_hits;
+	uint32_t tlb_hits;
+	uint32_t tlb_walks;
+	uint32_t tlb_flushes;
+	uint32_t satp_writes;
+	uint32_t sfence_vma;
+	uint32_t sfence_global;
+	uint32_t sfence_page;
+	uint32_t exec_page_hits;
+	uint32_t kernel_linear_hits;
+	uint32_t read_page_hits;
+	uint32_t read_ram_page_hits;
+	uint32_t write_page_hits;
+	uint32_t write_ram_page_hits;
+};
+#endif
 
 struct MiniRV32IMAState
 {
@@ -153,15 +181,22 @@ struct MiniRV32IMAState
   uint32_t sie;
   uint32_t sip;
 
-	struct MiniRV32TLBEntry tlb[MINIRV32_TLB_ENTRIES];
-	struct MiniRV32FastTLBEntry fast_tlb[3][MINIRV32_FAST_TLB_SETS];
-
-
+	/* Keep per-instruction state close to the register/CSR block.  Previously
+	 * this lived after the 41 KiB translation caches, costing the hot loop a
+	 * second state-base register. */
 	// Note: only a few bits are used.  (Machine = 3, User = 0, Supervisor = 1)
 	// Bits 0..1 = privilege.
 	// Bit 2 = WFI (Wait for interrupt)
 	// Bit 3+ = Load/Store reservation LSBs.
 	uint32_t extraflags;
+	uint32_t tlb_epoch;
+
+#ifdef MINIRV32_PERF_STATS
+	struct MiniRV32PerfStats perf;
+#endif
+
+	struct MiniRV32TLBEntry tlb[MINIRV32_TLB_ENTRIES];
+	struct MiniRV32FastTLBEntry fast_tlb[3][MINIRV32_FAST_TLB_SETS];
 };
 
 enum {
@@ -172,6 +207,7 @@ enum {
 
 static uint32_t MiniRV32Translate(
 	struct MiniRV32IMAState *state,
+	uint8_t *image,
 	uint32_t va,
 	int access,
 	int *fault,
@@ -179,6 +215,7 @@ static uint32_t MiniRV32Translate(
 
 static uint32_t MiniRV32TranslateSlow(
 	struct MiniRV32IMAState *state,
+	uint8_t *image,
 	uint32_t va,
 	int access,
 	int *fault,
@@ -190,7 +227,10 @@ static uint32_t MiniRV32TranslateSlow(
 
 static int MiniRV32HandleSBI(struct MiniRV32IMAState *state);
 
-MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image, uint32_t vProcAddress, uint32_t elapsedUs, int count );
+MINIRV32_DECORATE int32_t MiniRV32IMAStep(
+	struct MiniRV32IMAState *state,
+	uint8_t *image, uint32_t vProcAddress,
+	uint32_t elapsedUs, int count );
 
 #ifdef MINIRV32_IMPLEMENTATION
 
@@ -199,7 +239,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 #define REG( x ) state->regs[x]
 #define REGSET( x, val ) { state->regs[x] = val; }
 
-static int MiniRV32PhysRead32(uint32_t pa, uint32_t *value)
+static int MiniRV32PhysRead32(
+	uint8_t *image, uint32_t pa, uint32_t *value)
 {
 	if (pa < MINIRV32_RAM_IMAGE_OFFSET)
 		return -1;
@@ -213,7 +254,8 @@ static int MiniRV32PhysRead32(uint32_t pa, uint32_t *value)
 	return 0;
 }
 
-static int MiniRV32PhysWrite32(uint32_t pa, uint32_t value)
+static int MiniRV32PhysWrite32(
+	uint8_t *image, uint32_t pa, uint32_t value)
 {
 	if (pa < MINIRV32_RAM_IMAGE_OFFSET)
 		return -1;
@@ -229,15 +271,53 @@ static int MiniRV32PhysWrite32(uint32_t pa, uint32_t value)
 
 /* Bit 31 is free because an Sv32 VPN is only 20 bits wide. */
 #define MINIRV32_TLB_VALID (1u << 31)
+#define MINIRV32_TLB_EPOCH_MASK 0x7fu
+#define MINIRV32_TLB_EPOCH_SHIFT 24
+#define MINIRV32_FAST_TLB_UNCACHED 1u
+
+#ifdef MINIRV32_PERF_STATS
+	#define MINIRV32_PERF_INC(field) (state->perf.field++)
+	#define MINIRV32_PERF_FUNCT3_INC(field, instruction) \
+		(state->perf.field[((instruction) >> 12) & 7u]++)
+#else
+	#define MINIRV32_PERF_INC(field) do { } while (0)
+	#define MINIRV32_PERF_FUNCT3_INC(field, instruction) do { } while (0)
+#endif
 
 static void MiniRV32FlushTLB(struct MiniRV32IMAState *state)
 {
+	/* Seven unused fast-tag bits form a generation number.  Most invalidations
+	 * now cost one increment instead of walking 2,816 entries spread over
+	 * roughly 41 KiB.  Clear physically only when the generation wraps. */
+	state->tlb_epoch =
+		(state->tlb_epoch + 1u) & MINIRV32_TLB_EPOCH_MASK;
+	MINIRV32_PERF_INC(tlb_flushes);
+	if (state->tlb_epoch != 0u)
+		return;
+
 	for (unsigned int i = 0; i < MINIRV32_TLB_ENTRIES; i++)
 		state->tlb[i].virtual_page = 0;
 
 	for (unsigned int access = 0; access < 3; access++)
 		for (unsigned int i = 0; i < MINIRV32_FAST_TLB_SETS; i++)
 			state->fast_tlb[access][i].tag = 0;
+}
+
+static __attribute__((noinline)) void MiniRV32FlushTLBPage(
+	struct MiniRV32IMAState *state, uint32_t va)
+{
+	uint32_t virtual_page = va >> 12;
+	uint32_t tlb_index =
+		(virtual_page ^ (virtual_page >> 8)) &
+		(MINIRV32_TLB_ENTRIES - 1);
+	uint32_t fast_index =
+		virtual_page & (MINIRV32_FAST_TLB_SETS - 1);
+
+	/* Both caches are direct-mapped.  Invalidating the target sets is enough;
+	 * evicting an unrelated collision is harmless and avoids a tag load. */
+	state->tlb[tlb_index].virtual_page = 0;
+	for (unsigned int access = 0; access < 3; access++)
+		state->fast_tlb[access][fast_index].tag = 0;
 }
 
 static int MiniRV32CheckLeafPermissions(
@@ -281,6 +361,7 @@ static int MiniRV32CheckLeafPermissions(
  */
 static inline __attribute__((always_inline)) uint32_t MiniRV32Translate(
 	struct MiniRV32IMAState *state,
+	uint8_t *image,
 	uint32_t va,
 	int access,
 	int *fault,
@@ -299,31 +380,40 @@ static inline __attribute__((always_inline)) uint32_t MiniRV32Translate(
 	uint32_t linear_offset = va - MINIRV32_KERNEL_LINEAR_BASE;
 	if (priv == 1 &&
 	    linear_offset <
-		MINI_RV32_RAM_SIZE - MINIRV32_KERNEL_LINEAR_PHYS_OFFSET)
+		MINI_RV32_RAM_SIZE - MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) {
+		MINIRV32_PERF_INC(kernel_linear_hits);
 		return MINIRV32_RAM_IMAGE_OFFSET +
 			MINIRV32_KERNEL_LINEAR_PHYS_OFFSET + linear_offset;
+	}
 
 	uint32_t virtual_page = va >> 12;
+	uint32_t epoch_tag =
+		CSR(tlb_epoch) << MINIRV32_TLB_EPOCH_SHIFT;
 	/* Include privilege, SUM and MXR in the fast permission context. */
 	uint32_t fast_tag = virtual_page | MINIRV32_TLB_VALID |
-		(priv << 20) | (((CSR(mstatus) >> 18) & 3u) << 22);
+		(priv << 20) | (((CSR(mstatus) >> 18) & 3u) << 22) |
+		epoch_tag;
 	struct MiniRV32FastTLBEntry *fast =
 		&state->fast_tlb[access]
 			[virtual_page & (MINIRV32_FAST_TLB_SETS - 1)];
 
 	if (fast->tag == fast_tag) {
+		uint32_t page_and_flags = fast->physical_page_and_flags;
+		MINIRV32_PERF_INC(fast_tlb_hits);
 		if (uncached)
-			*uncached = fast->uncached;
-		return fast->physical_page | (va & 0xfffu);
+			*uncached = !!(page_and_flags & MINIRV32_FAST_TLB_UNCACHED);
+		return (page_and_flags & ~MINIRV32_FAST_TLB_UNCACHED) |
+			(va & 0xfffu);
 	}
 
-	return MiniRV32TranslateSlow(state, va, access, fault, uncached,
+	return MiniRV32TranslateSlow(state, image, va, access, fault, uncached,
 		priv, virtual_page, fast_tag, fast);
 }
 
 /* Full TLB lookup and Sv32 page-table walk after a fast-TLB miss. */
 static __attribute__((noinline)) uint32_t MiniRV32TranslateSlow(
 	struct MiniRV32IMAState *state,
+	uint8_t *image,
 	uint32_t va,
 	int access,
 	int *fault,
@@ -338,9 +428,11 @@ static __attribute__((noinline)) uint32_t MiniRV32TranslateSlow(
 		(virtual_page ^ (virtual_page >> 8)) &
 		(MINIRV32_TLB_ENTRIES - 1);
 	struct MiniRV32TLBEntry *cached = &state->tlb[tlb_index];
+	uint32_t cached_tag = virtual_page | MINIRV32_TLB_VALID |
+		(CSR(tlb_epoch) << MINIRV32_TLB_EPOCH_SHIFT);
 
-	if (cached->virtual_page ==
-	    (virtual_page | MINIRV32_TLB_VALID)) {
+	if (cached->virtual_page == cached_tag) {
+		MINIRV32_PERF_INC(tlb_hits);
 		if (MiniRV32CheckLeafPermissions(
 				state, cached->pte, priv, access) < 0) {
 			*fault = 1;
@@ -351,7 +443,7 @@ static __attribute__((noinline)) uint32_t MiniRV32TranslateSlow(
 		if (access == ACCESS_WRITE && !(cached->pte & (1u << 7))) {
 			uint32_t new_pte = cached->pte | (1u << 7);
 
-			if (MiniRV32PhysWrite32(cached->pte_pa, new_pte) < 0) {
+			if (MiniRV32PhysWrite32(image, cached->pte_pa, new_pte) < 0) {
 				*fault = 1;
 				return va;
 			}
@@ -359,13 +451,15 @@ static __attribute__((noinline)) uint32_t MiniRV32TranslateSlow(
 			cached->pte = new_pte;
 		}
 
-		fast->physical_page = cached->physical_page;
-		fast->uncached = !!(cached->pte & (1u << 9));
+		fast->physical_page_and_flags = cached->physical_page |
+			((cached->pte & (1u << 9)) ?
+			 MINIRV32_FAST_TLB_UNCACHED : 0u);
 		fast->tag = fast_tag;
 		if (uncached)
-			*uncached = fast->uncached;
+			*uncached = !!(cached->pte & (1u << 9));
 		return cached->physical_page | (va & 0xfff);
 	}
+	MINIRV32_PERF_INC(tlb_walks);
 
 	uint32_t vpn[2];
 	vpn[0] = (va >> 12) & 0x3ff;
@@ -387,7 +481,7 @@ static __attribute__((noinline)) uint32_t MiniRV32TranslateSlow(
 		uint32_t pte_pa = (uint32_t)pte_pa64;
 		uint32_t pte;
 
-		if (MiniRV32PhysRead32(pte_pa, &pte) < 0) {
+		if (MiniRV32PhysRead32(image, pte_pa, &pte) < 0) {
 			*fault = 1;
 			return va;
 		}
@@ -423,7 +517,7 @@ static __attribute__((noinline)) uint32_t MiniRV32TranslateSlow(
 				new_pte |= (1u << 7);
 
 			if (new_pte != pte) {
-				if (MiniRV32PhysWrite32(pte_pa, new_pte) < 0) {
+				if (MiniRV32PhysWrite32(image, pte_pa, new_pte) < 0) {
 					*fault = 1;
 					return va;
 				}
@@ -461,13 +555,13 @@ static __attribute__((noinline)) uint32_t MiniRV32TranslateSlow(
 			cached->physical_page = (uint32_t)pa & ~0xfffu;
 			cached->pte_pa = pte_pa;
 			cached->pte = pte;
-			cached->virtual_page =
-				virtual_page | MINIRV32_TLB_VALID;
-			fast->physical_page = cached->physical_page;
-			fast->uncached = !!(pte & (1u << 9));
+			cached->virtual_page = cached_tag;
+			fast->physical_page_and_flags = cached->physical_page |
+				((pte & (1u << 9)) ?
+				 MINIRV32_FAST_TLB_UNCACHED : 0u);
 			fast->tag = fast_tag;
 			if (uncached)
-				*uncached = fast->uncached;
+				*uncached = !!(pte & (1u << 9));
 
 			return (uint32_t)pa;
 		}
@@ -555,7 +649,10 @@ static int MiniRV32HandleSBI(struct MiniRV32IMAState *state)
 	return 0;
 }
 
-static inline uint32_t MiniRV32SupervisorInterruptCause(
+/* This runs once per instruction batch and when interrupt-related CSRs
+ * change, not once per guest opcode.  Keeping it out of the opcode function
+ * reduces hot-loop code size without affecting the common dispatch path. */
+static __attribute__((noinline)) uint32_t MiniRV32SupervisorInterruptCause(
 	struct MiniRV32IMAState *state)
 {
 	uint32_t pending = state->sip & state->sie &
@@ -571,7 +668,10 @@ static inline uint32_t MiniRV32SupervisorInterruptCause(
 	return (pending & (1u << 9)) ? 9u : 5u;
 }
 
-MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image, uint32_t vProcAddress, uint32_t elapsedUs, int count )
+MINIRV32_DECORATE int32_t MiniRV32IMAStep(
+	struct MiniRV32IMAState *state,
+	uint8_t *image, uint32_t vProcAddress,
+	uint32_t elapsedUs, int count )
 {
 	uint32_t new_timer = CSR( timerl ) + elapsedUs;
 	if( new_timer < CSR( timerl ) ) CSR( timerh )++;
@@ -587,7 +687,11 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 	 * may also poll rdtime inside one batch (Linux __delay does this), so
 	 * retain a wall-clock anchor for an interpolated, read-only value.
 	 */
-	#ifdef MINIRV32_HOST_TIME_US
+	#if defined(MINIRV32_HOST_CYCLE_COUNT) && \
+	    defined(MINIRV32_HOST_CYCLES_PER_US)
+	uint64_t rdtime_timer_anchor = now;
+	uint32_t rdtime_cycle_anchor = MINIRV32_HOST_CYCLE_COUNT();
+	#elif defined(MINIRV32_HOST_TIME_US)
 	uint64_t rdtime_timer_anchor = now;
 	uint64_t rdtime_host_anchor = MINIRV32_HOST_TIME_US();
 	#endif
@@ -613,36 +717,46 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 	uint32_t cycle = CSR( cyclel );
 
 	uint32_t exec_virtual_page = UINT32_MAX;
-	uint32_t exec_offset_page = 0;
+	uint32_t exec_offset_bias = 0;
 	uint32_t read_virtual_page = UINT32_MAX;
 	uint32_t read_physical_page = 0;
+	uint32_t read_ram_offset_bias = UINT32_MAX;
 	int read_uncached = 0;
 	uint32_t write_virtual_page = UINT32_MAX;
 	uint32_t write_physical_page = 0;
+	uint32_t write_ram_offset_bias = UINT32_MAX;
 	int write_uncached = 0;
+	uint32_t kernel_linear_limit =
+		(((CSR(extraflags) & 3u) == 1u) &&
+		 (CSR(satp) & 0x80000000u)) ?
+			(MINI_RV32_RAM_SIZE -
+			 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
 
 	uint32_t supervisor_cause =
 		MiniRV32SupervisorInterruptCause(state);
+	int icount = 0;
 
 	if (supervisor_cause) {
 		trap = 0x80000000u | supervisor_cause;
 		pc -= 4;
+		/* No guest instruction executes in an interrupt-only batch. */
+		count = 0;
 	}
 	else // No timer interrupt?  Execute a bunch of instructions.
-	for( int icount = 0; icount < count; icount++ )
+	for( ; icount < count; icount++ )
 	{
 		uint32_t ir = 0;
 		rval = 0;
-		int fault = 0;
-		cycle++;
+		int fault;
 		uint32_t pc_page = pc & ~0xfffu;
 		uint32_t ofs_pc;
 
 		if (pc_page == exec_virtual_page) {
-			ofs_pc = exec_offset_page | (pc & 0xfffu);
+			MINIRV32_PERF_INC(exec_page_hits);
+			ofs_pc = pc + exec_offset_bias;
 		} else {
 			uint32_t phys_pc = MiniRV32Translate(
-				state, pc, ACCESS_EXEC, &fault, NULL);
+				state, image, pc, ACCESS_EXEC, &fault, NULL);
 
 			if (fault) {
 				trap = 12 + 1;
@@ -659,57 +773,86 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 			}
 
 			exec_virtual_page = pc_page;
-			exec_offset_page = ofs_pc & ~0xfffu;
+			/* Unsigned wraparound represents host-offset minus guest VA. */
+			exec_offset_bias = ofs_pc - pc;
 		}
 
+		#ifndef MINIRV32_TRUSTED_32BIT_FETCH
 		if( ofs_pc & 3 )
 		{
 			trap = 1 + 0;  //Handle PC-misaligned access
 			break;
 		}
 		else
+		#endif
 		{
-			ir = MINIRV32_LOAD4( ofs_pc );
-			uint32_t rdid = (ir >> 7) & 0x1f;
+				ir = MINIRV32_LOAD4( ofs_pc );
+				uint32_t opcode = (ir >> 2) & 0x1fu;
+				#ifdef MINIRV32_PERF_STATS
+				state->perf.opcode[opcode]++;
+				#endif
+				/* Decode rd only for opcode families that can write it.  Keeping
+				 * this out of the common fetch path saves two host instructions
+				 * for branches, stores, fences and other no-destination opcodes. */
+				uint32_t rdid = 0;
 
-			switch( ir & 0x7f )
-			{
-				case 0b0110111: // LUI
+				/* All supported instructions are 32-bit encodings ending in 0b11.
+				 * Bits [6:2] form a compact switch key, reducing the range tests GCC
+				 * emitted for a sparse switch over the full seven bits. */
+				#ifndef MINIRV32_TRUSTED_32BIT_FETCH
+				if (__builtin_expect((ir & 3u) != 3u, 0)) {
+					trap = 2 + 1;
+				} else
+				#endif
+				switch (opcode)
+				{
+					case 0b01101: // LUI
+					rdid = (ir >> 7) & 0x1f;
 					rval = ( ir & 0xfffff000 );
 					break;
-				case 0b0010111: // AUIPC
+					case 0b00101: // AUIPC
+					rdid = (ir >> 7) & 0x1f;
 					rval = pc + ( ir & 0xfffff000 );
 					break;
-				case 0b1101111: // JAL
+					case 0b11011: // JAL
 				{
+					rdid = (ir >> 7) & 0x1f;
 					int32_t reladdy = ((ir & 0x80000000)>>11) | ((ir & 0x7fe00000)>>20) | ((ir & 0x00100000)>>9) | ((ir&0x000ff000));
 					if( reladdy & 0x00100000 ) reladdy |= 0xffe00000; // Sign extension.
 					rval = pc + 4;
 					pc = pc + reladdy - 4;
 					break;
 				}
-				case 0b1100111: // JALR
+					case 0b11001: // JALR
 				{
+					rdid = (ir >> 7) & 0x1f;
 					uint32_t imm = ir >> 20;
 					int32_t imm_se = imm | (( imm & 0x800 )?0xfffff000:0);
 					rval = pc + 4;
 					pc = ( (REG( (ir >> 15) & 0x1f ) + imm_se) & ~1) - 4;
 					break;
 				}
-				case 0b1100011: // Branch
-				{
-					uint32_t immm4 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
+						case 0b11000: // Branch
+					{
+						MINIRV32_PERF_FUNCT3_INC(branch_funct3, ir);
+						uint32_t funct3 = (ir >> 12) & 0x7;
+						uint32_t immm4 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
 					if( immm4 & 0x1000 ) immm4 |= 0xffffe000;
 					int32_t rs1 = REG((ir >> 15) & 0x1f);
 					int32_t rs2 = REG((ir >> 20) & 0x1f);
 					immm4 = pc + immm4 - 4;
 					rdid = 0;
-					switch( ( ir >> 12 ) & 0x7 )
-					{
-						// BEQ, BNE, BLT, BGE, BLTU, BGEU
-						case 0b000: if( rs1 == rs2 ) pc = immm4; break;
-						case 0b001: if( rs1 != rs2 ) pc = immm4; break;
-						case 0b100: if( rs1 < rs2 ) pc = immm4; break;
+						/* BNE and BEQ make up most Linux branches. Keep them out of
+						 * the indirect switch used by the less common comparisons. */
+						if (__builtin_expect(funct3 == 0b001, 1)) {
+							if (rs1 != rs2)
+								pc = immm4;
+						} else if (funct3 == 0b000) {
+							if (rs1 == rs2)
+								pc = immm4;
+						} else switch (funct3) {
+							// BLT, BGE, BLTU, BGEU
+							case 0b100: if( rs1 < rs2 ) pc = immm4; break;
 						case 0b101: if( rs1 >= rs2 ) pc = immm4; break; //BGE
 						case 0b110: if( (uint32_t)rs1 < (uint32_t)rs2 ) pc = immm4; break;   //BLTU
 						case 0b111: if( (uint32_t)rs1 >= (uint32_t)rs2 ) pc = immm4; break;  //BGEU
@@ -717,14 +860,20 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 					}
 					break;
 				}
-				case 0b0000011: // Load
-				{
+					case 0b00000: // Load
+					{
+						rdid = (ir >> 7) & 0x1f;
+						MINIRV32_PERF_FUNCT3_INC(load_funct3, ir);
+						uint32_t funct3 = (ir >> 12) & 7;
 					uint32_t rs1 = REG((ir >> 15) & 0x1f);
 					uint32_t imm = ir >> 20;
 					int32_t imm_se =
 						imm | ((imm & 0x800) ? 0xfffff000 : 0);
 					uint32_t virtual_addr = rs1 + imm_se;
 					int uncached = 0;
+					uint32_t virtual_page = virtual_addr & ~0xfffu;
+					uint32_t phys_addr = 0;
+					uint32_t ofs = 0;
 					uint32_t linear_offset =
 						virtual_addr - MINIRV32_KERNEL_LINEAR_BASE;
 
@@ -735,94 +884,71 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 					 * uncached-memory dispatch below.
 					 */
 					if (__builtin_expect(
-						((CSR(extraflags) & 3u) == 1u) &&
-						(CSR(satp) & 0x80000000u) &&
-						linear_offset < MINI_RV32_RAM_SIZE -
-							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET,
+						linear_offset < kernel_linear_limit,
 						1)) {
-						uint32_t ofs =
+						ofs =
 							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET +
 							linear_offset;
-
-						switch ((ir >> 12) & 7) {
-						case 0b000:
-							rval = (int8_t)MINIRV32_LOAD1(ofs);
-							break;
-						case 0b001:
-							rval = (int16_t)MINIRV32_LOAD2(ofs);
-							break;
-						case 0b010:
-							rval = MINIRV32_LOAD4(ofs);
-							break;
-						case 0b100:
-							rval = MINIRV32_LOAD1(ofs);
-							break;
-						case 0b101:
-							rval = MINIRV32_LOAD2(ofs);
-							break;
-						default:
-							trap = 2 + 1;
-							break;
-						}
-						break;
+						MINIRV32_PERF_INC(kernel_linear_hits);
+						goto load_cached_ram;
 					}
-
-					uint32_t virtual_page = virtual_addr & ~0xfffu;
-					uint32_t phys_addr;
 
 					if (__builtin_expect(
 						virtual_page == read_virtual_page, 1)) {
+						MINIRV32_PERF_INC(read_page_hits);
+						if (__builtin_expect(
+							read_ram_offset_bias != UINT32_MAX, 1)) {
+							ofs = virtual_addr + read_ram_offset_bias;
+							MINIRV32_PERF_INC(read_ram_page_hits);
+							goto load_cached_ram;
+						}
 						phys_addr = read_physical_page |
 							(virtual_addr & 0xfffu);
 						uncached = read_uncached;
 					} else {
 						phys_addr = MiniRV32Translate(
-							state, virtual_addr, ACCESS_READ, &fault,
+							state, image, virtual_addr, ACCESS_READ, &fault,
 							&uncached);
-						if (!fault) {
-							read_virtual_page = virtual_page;
-							read_physical_page = phys_addr & ~0xfffu;
-							read_uncached = uncached;
+						if (fault) {
+							trap = 13 + 1; /* Load page fault. */
+							rval = virtual_addr;
+							break;
 						}
-					}
-
-					if (fault) {
-						trap = 13 + 1; /* Load page fault. */
-						rval = virtual_addr;
-						break;
+						read_virtual_page = virtual_page;
+						read_physical_page = phys_addr & ~0xfffu;
+						read_uncached = uncached;
+						if (!uncached &&
+						    read_physical_page >= MINIRV32_RAM_IMAGE_OFFSET &&
+						    read_physical_page - MINIRV32_RAM_IMAGE_OFFSET <=
+							MINI_RV32_RAM_SIZE - 0x1000u)
+							read_ram_offset_bias = read_physical_page -
+								MINIRV32_RAM_IMAGE_OFFSET - virtual_page;
+						else
+							read_ram_offset_bias = UINT32_MAX;
 					}
 
 					if (phys_addr >= MINIRV32_RAM_IMAGE_OFFSET &&
 						phys_addr - MINIRV32_RAM_IMAGE_OFFSET <
 							MINI_RV32_RAM_SIZE - 3) {
-						uint32_t ofs =
-							phys_addr - MINIRV32_RAM_IMAGE_OFFSET;
+						ofs = phys_addr - MINIRV32_RAM_IMAGE_OFFSET;
+							if (!uncached)
+								goto load_cached_ram;
 
-						switch ((ir >> 12) & 7) {
+							switch (funct3) {
 						case 0b000:
-							rval = (int8_t)(uncached ?
-								MINIRV32_LOAD1_UNCACHED(ofs) :
-								MINIRV32_LOAD1(ofs));
+							rval = (int8_t)MINIRV32_LOAD1_UNCACHED(ofs);
 							break;
 						case 0b001:
-							rval = (int16_t)(uncached ?
-								MINIRV32_LOAD2_UNCACHED(ofs) :
-								MINIRV32_LOAD2(ofs));
+							rval = (int16_t)MINIRV32_LOAD2_UNCACHED(ofs);
 							break;
 						case 0b010:
-							rval = uncached ?
-								MINIRV32_LOAD4_UNCACHED(ofs) :
-								MINIRV32_LOAD4(ofs);
+							rval = MINIRV32_LOAD4_UNCACHED(ofs);
 							break;
 						case 0b100:
-							rval = uncached ?
-								MINIRV32_LOAD1_UNCACHED(ofs) :
-								MINIRV32_LOAD1(ofs);
+							rval = MINIRV32_LOAD1_UNCACHED(ofs);
 							break;
 						case 0b101:
-							rval = uncached ?
-								MINIRV32_LOAD2_UNCACHED(ofs) :
-								MINIRV32_LOAD2(ofs);
+							rval = MINIRV32_LOAD2_UNCACHED(ofs);
 							break;
 						default:
 							trap = 2 + 1;
@@ -846,9 +972,37 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 						rval = virtual_addr;
 					}
 					break;
+
+					load_cached_ram:
+						/* Linux uses LW for nearly every cached load. Avoid a jump
+						 * table and indirect branch on that measured common case. */
+						if (__builtin_expect(funct3 == 0b010, 1)) {
+							rval = MINIRV32_LOAD4(ofs);
+							break;
+						}
+						switch (funct3) {
+					case 0b000:
+						rval = (int8_t)MINIRV32_LOAD1(ofs);
+						break;
+					case 0b001:
+						rval = (int16_t)MINIRV32_LOAD2(ofs);
+						break;
+						case 0b100:
+						rval = MINIRV32_LOAD1(ofs);
+						break;
+					case 0b101:
+						rval = MINIRV32_LOAD2(ofs);
+						break;
+					default:
+						trap = 2 + 1;
+						break;
+					}
+					break;
 				}
-				case 0b0100011: // Store
-				{
+						case 0b01000: // Store
+					{
+						MINIRV32_PERF_FUNCT3_INC(store_funct3, ir);
+						uint32_t funct3 = (ir >> 12) & 7;
 					uint32_t rs1 = REG((ir >> 15) & 0x1f);
 					uint32_t rs2 = REG((ir >> 20) & 0x1f);
 					uint32_t imm =
@@ -861,85 +1015,72 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 					uint32_t virtual_addr = rs1 + imm;
 					int uncached = 0;
 					rdid = 0;
+					uint32_t virtual_page = virtual_addr & ~0xfffu;
+					uint32_t phys_addr = 0;
+					uint32_t ofs = 0;
 					uint32_t linear_offset =
 						virtual_addr - MINIRV32_KERNEL_LINEAR_BASE;
 
 					if (__builtin_expect(
-						((CSR(extraflags) & 3u) == 1u) &&
-						(CSR(satp) & 0x80000000u) &&
-						linear_offset < MINI_RV32_RAM_SIZE -
-							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET,
+						linear_offset < kernel_linear_limit,
 						1)) {
-						uint32_t ofs =
+						ofs =
 							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET +
 							linear_offset;
-
-						switch ((ir >> 12) & 7) {
-						case 0b000:
-							MINIRV32_STORE1(ofs, rs2);
-							break;
-						case 0b001:
-							MINIRV32_STORE2(ofs, rs2);
-							break;
-						case 0b010:
-							MINIRV32_STORE4(ofs, rs2);
-							break;
-						default:
-							trap = 2 + 1;
-							break;
-						}
-						break;
+						MINIRV32_PERF_INC(kernel_linear_hits);
+						goto store_cached_ram;
 					}
-
-					uint32_t virtual_page = virtual_addr & ~0xfffu;
-					uint32_t phys_addr;
 
 					if (__builtin_expect(
 						virtual_page == write_virtual_page, 1)) {
+						MINIRV32_PERF_INC(write_page_hits);
+						if (__builtin_expect(
+							write_ram_offset_bias != UINT32_MAX, 1)) {
+							ofs = virtual_addr + write_ram_offset_bias;
+							MINIRV32_PERF_INC(write_ram_page_hits);
+							goto store_cached_ram;
+						}
 						phys_addr = write_physical_page |
 							(virtual_addr & 0xfffu);
 						uncached = write_uncached;
 					} else {
 						phys_addr = MiniRV32Translate(
-							state, virtual_addr, ACCESS_WRITE, &fault,
+							state, image, virtual_addr, ACCESS_WRITE, &fault,
 							&uncached);
-						if (!fault) {
-							write_virtual_page = virtual_page;
-							write_physical_page = phys_addr & ~0xfffu;
-							write_uncached = uncached;
+						if (fault) {
+							trap = 15 + 1; /* Store page fault. */
+							rval = virtual_addr;
+							break;
 						}
-					}
-
-					if (fault) {
-						trap = 15 + 1; /* Store page fault. */
-						rval = virtual_addr;
-						break;
+						write_virtual_page = virtual_page;
+						write_physical_page = phys_addr & ~0xfffu;
+						write_uncached = uncached;
+						if (!uncached &&
+						    write_physical_page >= MINIRV32_RAM_IMAGE_OFFSET &&
+						    write_physical_page - MINIRV32_RAM_IMAGE_OFFSET <=
+							MINI_RV32_RAM_SIZE - 0x1000u)
+							write_ram_offset_bias = write_physical_page -
+								MINIRV32_RAM_IMAGE_OFFSET - virtual_page;
+						else
+							write_ram_offset_bias = UINT32_MAX;
 					}
 
 					if (phys_addr >= MINIRV32_RAM_IMAGE_OFFSET &&
 						phys_addr - MINIRV32_RAM_IMAGE_OFFSET <
 							MINI_RV32_RAM_SIZE - 3) {
-						uint32_t ofs =
-							phys_addr - MINIRV32_RAM_IMAGE_OFFSET;
+						ofs = phys_addr - MINIRV32_RAM_IMAGE_OFFSET;
+							if (!uncached)
+								goto store_cached_ram;
 
-						switch ((ir >> 12) & 7) {
+							switch (funct3) {
 						case 0b000:
-							if (uncached)
-								MINIRV32_STORE1_UNCACHED(ofs, rs2);
-							else
-								MINIRV32_STORE1(ofs, rs2);
+							MINIRV32_STORE1_UNCACHED(ofs, rs2);
 							break;
 						case 0b001:
-							if (uncached)
-								MINIRV32_STORE2_UNCACHED(ofs, rs2);
-							else
-								MINIRV32_STORE2(ofs, rs2);
+							MINIRV32_STORE2_UNCACHED(ofs, rs2);
 							break;
 						case 0b010:
-							if (uncached)
-								MINIRV32_STORE4_UNCACHED(ofs, rs2);
-							else
-								MINIRV32_STORE4(ofs, rs2);
+							MINIRV32_STORE4_UNCACHED(ofs, rs2);
 							break;
 						default:
 							trap = 2 + 1;
@@ -967,17 +1108,36 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 						rval = virtual_addr;
 					}
 					break;
+
+					store_cached_ram:
+						/* SW accounts for almost every cached Linux store. */
+						if (__builtin_expect(funct3 == 0b010, 1)) {
+							MINIRV32_STORE4(ofs, rs2);
+						} else if (funct3 == 0b000) {
+							MINIRV32_STORE1(ofs, rs2);
+						} else if (funct3 == 0b001) {
+							MINIRV32_STORE2(ofs, rs2);
+						} else {
+							trap = 2 + 1;
+						}
+						break;
 				}
-				case 0b0010011: // Op-immediate
-				{
-					uint32_t imm = ir >> 20;
+					case 0b00100: // Op-immediate
+					{
+						rdid = (ir >> 7) & 0x1f;
+						MINIRV32_PERF_FUNCT3_INC(opimm_funct3, ir);
+						uint32_t funct3 = (ir >> 12) & 7;
+						uint32_t imm = ir >> 20;
 					imm = imm | (( imm & 0x800 )?0xfffff000:0);
 					uint32_t rs1 = REG((ir >> 15) & 0x1f);
 
-					switch( (ir>>12)&7 )
-					{
-						case 0b000: rval = rs1 + imm; break; // ADDI
-						case 0b001: rval = rs1 << (imm & 0x1f); break; // SLLI
+						/* ADDI is the dominant integer opcode during boot. */
+						if (__builtin_expect(funct3 == 0b000, 1)) {
+							rval = rs1 + imm;
+							break;
+						}
+						switch (funct3) {
+							case 0b001: rval = rs1 << (imm & 0x1f); break; // SLLI
 						case 0b010: rval = (int32_t)rs1 < (int32_t)imm; break; // SLTI
 						case 0b011: rval = rs1 < imm; break; // SLTIU
 						case 0b100: rval = rs1 ^ imm; break; // XORI
@@ -985,18 +1145,22 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 							((int32_t)rs1 >> (imm & 0x1f)) :
 							(rs1 >> (imm & 0x1f)); break; // SRAI/SRLI
 						case 0b110: rval = rs1 | imm; break; // ORI
-						case 0b111: rval = rs1 & imm; break; // ANDI
+							case 0b111: rval = rs1 & imm; break; // ANDI
 					}
 					break;
 				}
-				case 0b0110011: // Op
+					case 0b01100: // Op
 				{
+					rdid = (ir >> 7) & 0x1f;
+					MINIRV32_PERF_FUNCT3_INC(op_funct3, ir);
 					uint32_t rs1 = REG((ir >> 15) & 0x1f);
 					uint32_t rs2 = REG((ir >> 20) & 0x1f);
+					uint32_t funct3 = (ir >> 12) & 7u;
 
-					if( ir & 0x02000000 )
+					if (__builtin_expect(ir & 0x02000000, 0))
 					{
-						switch( (ir>>12)&7 ) //0x02000000 = RV32M
+						MINIRV32_PERF_INC(muldiv);
+						switch (funct3) //0x02000000 = RV32M
 						{
 							case 0b000: rval = rs1 * rs2; break; // MUL
 							case 0b001: rval = ((int64_t)((int32_t)rs1) * (int64_t)((int32_t)rs2)) >> 32; break; // MULH
@@ -1008,11 +1172,16 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 							case 0b111: if( rs2 == 0 ) rval = rs1; else rval = rs1 % rs2; break; // REMU
 						}
 					}
+					else if (__builtin_expect(funct3 == 0b000, 1))
+					{
+						/* ADD/SUB is the dominant base-register operation. */
+						rval = (ir & 0x40000000) ?
+							(rs1 - rs2) : (rs1 + rs2);
+					}
 					else
 					{
-						switch( (ir>>12)&7 )
+						switch (funct3)
 						{
-							case 0b000: rval = (ir & 0x40000000) ? (rs1 - rs2) : (rs1 + rs2); break;
 							case 0b001: rval = rs1 << (rs2 & 0x1f); break;
 							case 0b010: rval = (int32_t)rs1 < (int32_t)rs2; break;
 							case 0b011: rval = rs1 < rs2; break;
@@ -1024,7 +1193,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 					}
 					break;
 				}
-				case 0b0001111:
+					case 0b00011:
 					rdid = 0;
 					if (((ir >> 12) & 7) == 2 &&
 					    ((ir >> 7) & 0x1f) == 0) {
@@ -1040,7 +1209,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 						}
 
 						phys_addr = MiniRV32Translate(
-							state, virtual_addr, ACCESS_READ, &fault,
+							state, image, virtual_addr, ACCESS_READ, &fault,
 							NULL);
 						if (fault) {
 							trap = 13 + 1;
@@ -1057,8 +1226,9 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 					}
 					/* Plain FENCE/FENCE.I need no host action. */
 					break;
-				case 0b1110011: // Zifencei+Zicsr
+					case 0b11100: // Zifencei+Zicsr
 				{
+					rdid = (ir >> 7) & 0x1f;
 					uint32_t csrno = ir >> 20;
 					int microop = ( ir >> 12 ) & 0b111;
 					if( (microop & 3) ) // It's a Zicsr function.
@@ -1083,10 +1253,18 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 							case 0x340: rval = CSR( mscratch ); break;
 							case 0x305: rval = CSR( mtvec ); break;
 							case 0x304: rval = CSR( mie ); break;
-							case 0xC00: rval = cycle; break;
+							case 0xC00:
+								rval = cycle + (uint32_t)icount + 1u;
+								break;
 							case 0xC80: rval = CSR( cycleh ); break;
 							case 0xC01:
-								#ifdef MINIRV32_HOST_TIME_US
+								#if defined(MINIRV32_HOST_CYCLE_COUNT) && \
+								    defined(MINIRV32_HOST_CYCLES_PER_US)
+								rval = (uint32_t)(rdtime_timer_anchor +
+									(uint32_t)(MINIRV32_HOST_CYCLE_COUNT() -
+									 rdtime_cycle_anchor) /
+									 MINIRV32_HOST_CYCLES_PER_US);
+								#elif defined(MINIRV32_HOST_TIME_US)
 								rval = (uint32_t)(rdtime_timer_anchor +
 									(MINIRV32_HOST_TIME_US() -
 									 rdtime_host_anchor));
@@ -1095,7 +1273,13 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 								#endif
 								break;
 							case 0xC81:
-								#ifdef MINIRV32_HOST_TIME_US
+								#if defined(MINIRV32_HOST_CYCLE_COUNT) && \
+								    defined(MINIRV32_HOST_CYCLES_PER_US)
+								rval = (uint32_t)((rdtime_timer_anchor +
+									(uint32_t)(MINIRV32_HOST_CYCLE_COUNT() -
+									 rdtime_cycle_anchor) /
+									 MINIRV32_HOST_CYCLES_PER_US) >> 32);
+								#elif defined(MINIRV32_HOST_TIME_US)
 								rval = (uint32_t)((rdtime_timer_anchor +
 									(MINIRV32_HOST_TIME_US() -
 									 rdtime_host_anchor)) >> 32);
@@ -1137,12 +1321,12 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 								read_virtual_page = UINT32_MAX;
 								write_virtual_page = UINT32_MAX;
 								if (MiniRV32SupervisorInterruptCause(state))
-									icount = count;
+									count = icount + 1;
 								break;
 							case 0x104:
 								SETCSR(sie, writeval);
 								if (MiniRV32SupervisorInterruptCause(state))
-									icount = count;
+									count = icount + 1;
 								break;
 							case 0x105: SETCSR(stvec, writeval); break;
 							case 0x140: SETCSR(sscratch, writeval); break;
@@ -1152,14 +1336,22 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 							case 0x144:
 								SETCSR(sip, writeval);
 								if (MiniRV32SupervisorInterruptCause(state))
-									icount = count;
+									count = icount + 1;
 								break;
 							case 0x180:
-								SETCSR(satp, writeval);
-								MiniRV32FlushTLB(state);
-								exec_virtual_page = UINT32_MAX;
-								read_virtual_page = UINT32_MAX;
-								write_virtual_page = UINT32_MAX;
+								MINIRV32_PERF_INC(satp_writes);
+								if (writeval != CSR(satp)) {
+									SETCSR(satp, writeval);
+									kernel_linear_limit =
+										(((CSR(extraflags) & 3u) == 1u) &&
+										 (writeval & 0x80000000u)) ?
+											(MINI_RV32_RAM_SIZE -
+											 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
+									MiniRV32FlushTLB(state);
+									exec_virtual_page = UINT32_MAX;
+									read_virtual_page = UINT32_MAX;
+									write_virtual_page = UINT32_MAX;
+								}
 								break;
 							case 0x340: SETCSR( mscratch, writeval ); break;
 						case 0x305: SETCSR( mtvec, writeval ); break;
@@ -1190,11 +1382,38 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 						rdid = 0;
 
 						if ((ir & 0xfe007fffu) == 0x12000073u) {
-							/* Flushing all entries is valid for every operand form. */
-							MiniRV32FlushTLB(state);
-							exec_virtual_page = UINT32_MAX;
-							read_virtual_page = UINT32_MAX;
-							write_virtual_page = UINT32_MAX;
+							uint32_t rs1id = (ir >> 15) & 0x1f;
+							uint32_t rs2id = (ir >> 20) & 0x1f;
+							uint32_t current_asid =
+								(CSR(satp) >> 22) & 0x1ffu;
+							uint32_t requested_asid =
+								REG(rs2id) & 0x1ffu;
+
+							MINIRV32_PERF_INC(sfence_vma);
+							if (rs1id == 0) {
+								/* x0 selects every virtual address.  With the
+								 * current single-address-space cache, a fence for
+								 * another ASID cannot match any resident entry. */
+								if (rs2id == 0 || requested_asid == current_asid) {
+									MINIRV32_PERF_INC(sfence_global);
+									MiniRV32FlushTLB(state);
+									exec_virtual_page = UINT32_MAX;
+									read_virtual_page = UINT32_MAX;
+									write_virtual_page = UINT32_MAX;
+								}
+							} else if (rs2id == 0 ||
+								   requested_asid == current_asid) {
+								uint32_t page = REG(rs1id) & ~0xfffu;
+
+								MINIRV32_PERF_INC(sfence_page);
+								MiniRV32FlushTLBPage(state, page);
+								if (exec_virtual_page == page)
+									exec_virtual_page = UINT32_MAX;
+								if (read_virtual_page == page)
+									read_virtual_page = UINT32_MAX;
+								if (write_virtual_page == page)
+									write_virtual_page = UINT32_MAX;
+							}
 						} else if (csrno == 0x105) { /* WFI */
 							CSR(extraflags) |= 4;
 							SETCSR(pc, pc + 4);
@@ -1216,12 +1435,17 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 
 							CSR(extraflags) =
 								(CSR(extraflags) & ~3u) | new_priv;
+							kernel_linear_limit =
+								(new_priv == 1u &&
+								 (CSR(satp) & 0x80000000u)) ?
+									(MINI_RV32_RAM_SIZE -
+									 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
 							exec_virtual_page = UINT32_MAX;
 							read_virtual_page = UINT32_MAX;
 							write_virtual_page = UINT32_MAX;
 							pc = CSR(sepc) - 4;
 							if (MiniRV32SupervisorInterruptCause(state))
-								icount = count;
+								count = icount + 1;
 						} else if ((csrno & 0xff) == 0x02) { /* MRET */
 							uint32_t startmstatus = CSR(mstatus);
 							uint32_t startextraflags = CSR(extraflags);
@@ -1233,6 +1457,11 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 							SETCSR(extraflags,
 								(startextraflags & ~3) |
 								((startmstatus >> 11) & 3));
+							kernel_linear_limit =
+								((((startmstatus >> 11) & 3u) == 1u) &&
+								 (CSR(satp) & 0x80000000u)) ?
+									(MINI_RV32_RAM_SIZE -
+									 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
 							exec_virtual_page = UINT32_MAX;
 							read_virtual_page = UINT32_MAX;
 							write_virtual_page = UINT32_MAX;
@@ -1268,8 +1497,9 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 						trap = (2+1); 				// Note micrrop 0b100 == undefined.
 					break;
 				}
-				case 0b0101111: // RV32A
+					case 0b01011: // RV32A
 				{
+					rdid = (ir >> 7) & 0x1f;
 					uint32_t virtual_addr = REG((ir >> 15) & 0x1f);
 					uint32_t rs2 = REG((ir >> 20) & 0x1f);
 					uint32_t irmid = (ir >> 27) & 0x1f;
@@ -1286,25 +1516,21 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 					 * kernel loads/stores, so avoid a TLB lookup for that case.
 					 */
 					if (__builtin_expect(
-						((CSR(extraflags) & 3u) == 1u) &&
-						(CSR(satp) & 0x80000000u) &&
-						linear_offset < MINI_RV32_RAM_SIZE -
-							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET,
+						linear_offset < kernel_linear_limit,
 						1)) {
 						phys_addr = MINIRV32_RAM_IMAGE_OFFSET +
 							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET +
 							linear_offset;
 					} else {
 						phys_addr = MiniRV32Translate(
-							state, virtual_addr, access, &fault,
+							state, image, virtual_addr, access, &fault,
 							&uncached);
-					}
-
-					if (fault) {
-						trap =
-							((access == ACCESS_READ) ? 13 : 15) + 1;
-						rval = virtual_addr;
-						break;
+						if (fault) {
+							trap =
+								((access == ACCESS_READ) ? 13 : 15) + 1;
+							rval = virtual_addr;
+							break;
+						}
 					}
 
 					if (phys_addr < MINIRV32_RAM_IMAGE_OFFSET ||
@@ -1378,7 +1604,32 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 					}
 					break;
 				}
-				default: trap = (2+1); // Fault: Invalid opcode.
+					/* The switch key is instruction bits [6:2], so these are all
+					 * remaining entries in its 0..31 range.  Listing them makes the
+					 * dispatch exhaustive and lets the compiler omit a redundant
+					 * bounds branch before the jump table. */
+					case 0b00001:
+					case 0b00010:
+					case 0b00110:
+					case 0b00111:
+					case 0b01001:
+					case 0b01010:
+					case 0b01110:
+					case 0b01111:
+					case 0b10000:
+					case 0b10001:
+					case 0b10010:
+					case 0b10011:
+					case 0b10100:
+					case 0b10101:
+					case 0b10110:
+					case 0b10111:
+					case 0b11010:
+					case 0b11101:
+					case 0b11110:
+					case 0b11111:
+						trap = (2+1); // Fault: invalid or unsupported opcode.
+						break;
 			}
 
 			// If there was a trap, do NOT allow register writeback.
@@ -1511,8 +1762,16 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint
 		}
 	}
 
-	if( CSR( cyclel ) > cycle ) CSR( cycleh )++;
-	SETCSR( cyclel, cycle );
+	/* The loop index already advances once per instruction.  Reuse it for the
+	 * architectural cycle count instead of performing a second hot-loop add.
+	 * A trap breaks before the for-loop increment, so count that attempt here. */
+	uint32_t executed = (uint32_t)icount;
+	if (icount < count)
+		executed++;
+	uint32_t new_cycle = cycle + executed;
+	if (new_cycle < cycle)
+		CSR(cycleh)++;
+	SETCSR(cyclel, new_cycle);
 	SETCSR( pc, pc );
 	return 0;
 }

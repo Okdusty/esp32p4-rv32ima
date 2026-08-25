@@ -1,0 +1,17 @@
+--- a/drivers/video/fbdev/core/tileblit.c
++++ b/drivers/video/fbdev/core/tileblit.c
+@@ -116,11 +116,13 @@ static void tile_cursor(struct vc_data *vc, struct fb_info *info, bool enable,
+ 			int fg, int bg)
+ {
+ 	struct fb_tilecursor cursor;
++	struct fbcon_par *par = info->fbcon_par;
+ 	int use_sw = vc->vc_cursor_type & CUR_SW;
+ 
+ 	cursor.sx = vc->state.x;
+ 	cursor.sy = vc->state.y;
+-	cursor.mode = enable && !use_sw;
++	par->cursor_state.enable = enable && !use_sw;
++	cursor.mode = par->cursor_state.enable;
+ 	cursor.fg = fg;
+ 	cursor.bg = bg;
+ 

@@ -36,6 +36,28 @@ else
   exit 1
 fi
 
+pvfb_patch="$repo_root/linux-rv32-pvfb.patch"
+if git -C "$linux_dir" apply --reverse --check "$pvfb_patch" >/dev/null 2>&1; then
+  :
+elif git -C "$linux_dir" apply --check "$pvfb_patch"; then
+  git -C "$linux_dir" apply "$pvfb_patch"
+else
+  echo "error: Linux RV32 pvfb patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+
+cursor_patch="$repo_root/linux-fbcon-tile-cursor.patch"
+if git -C "$linux_dir" apply --reverse --check "$cursor_patch" >/dev/null 2>&1; then
+  :
+elif git -C "$linux_dir" apply --check "$cursor_patch"; then
+  git -C "$linux_dir" apply "$cursor_patch"
+else
+  echo "error: Linux fbcon tile-cursor patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+cp "$repo_root/guest/linux/rv32-pvfb.c" \
+  "$linux_dir/drivers/video/fbdev/rv32-pvfb.c"
+
 generated_cross_prefix=
 if [[ -s "$output_root/openwrt-cross-prefix" ]]; then
   generated_cross_prefix=$(<"$output_root/openwrt-cross-prefix")
@@ -83,6 +105,9 @@ config="$linux_dir/scripts/config"
 "$config" --file "$linux_dir/.config" --enable MMU
 "$config" --file "$linux_dir/.config" --enable RISCV_SBI
 "$config" --file "$linux_dir/.config" --disable SMP
+"$config" --file "$linux_dir/.config" --enable FB_RV32_PV
+"$config" --file "$linux_dir/.config" --enable FB_TILEBLITTING
+"$config" --file "$linux_dir/.config" --enable FRAMEBUFFER_CONSOLE_LEGACY_ACCELERATION
 
 make -C "$linux_dir" ARCH=riscv CROSS_COMPILE="$cross_prefix" olddefconfig
 make -C "$linux_dir" -j"$jobs" ARCH=riscv CROSS_COMPILE="$cross_prefix" Image

@@ -1,11 +1,109 @@
+menu "RV32 emulator"
+
+config RV32_GUEST_RAM_PREFETCH
+	bool "Enable ESP32-P4 L2 sequential prefetch for guest RAM"
+	default y
+	help
+	  Configure the ESP32-P4 L2 autoload engine for the Linux RAM window.
+	  This is a sequential next-line prefetch hint, not an emulator cache, and
+	  its benefit is workload dependent. Disable it when comparing cache or
+	  interpreter changes.
+
+config RV32_EMULATOR_PERF_STATS
+	bool "Enable RV32 emulator performance counters"
+	default n
+	help
+	  Instrument translation and page-cache paths and report guest MIPS plus
+	  the ESP32-P4 L2 data-cache hit rate. Keep this disabled for normal use:
+	  the counters deliberately add writes to the instruction hot path.
+
+config RV32_EMULATOR_PERF_INTERVAL_MS
+	int "Performance report interval (ms)"
+	depends on RV32_EMULATOR_PERF_STATS
+	range 1000 60000
+	default 5000
+	help
+	  Time between emulator performance reports on the host UART.
+
+config RV32_HOST_PERF_STATS
+	bool "Enable host core and display performance counters"
+	default n
+	select FREERTOS_GENERATE_RUN_TIME_STATS
+	help
+	  Report CPU0/CPU1 busy time, guest instruction rate, display work,
+	  cache-clean traffic, and PPA use every five seconds. This has much less
+	  overhead than the per-instruction emulator counters, but should still be
+	  disabled in normal builds after profiling is complete.
+
+endmenu
+
 menu "RV32 Linux hardware bridges"
+
+config RV32_DISPLAY_ACCEL
+	bool
+	help
+	  Internal switch for the backend-neutral paravirtual framebuffer command
+	  transport. Display backends select this when they provide a packed RGB565
+	  scanout surface and a CPU1 service task.
 
 config RV32_ST7703_DISPLAY
 	bool "Enable Waveshare 720x720 ST7703 display bridge"
 	default y
+	select RV32_DISPLAY_ACCEL
 	help
 	  Initialize the onboard MIPI-DSI ST7703 panel and expose its RGB565
 	  framebuffer to the RV32 guest as a simple-framebuffer device.
+
+config RV32_ST7703_REFRESH_HZ
+	int "ST7703 target refresh rate (Hz)"
+	depends on RV32_ST7703_DISPLAY
+	range 30 60
+	default 59
+	help
+	  Target panel refresh rate. The display bridge derives the MIPI-DPI
+	  pixel clock from this value and the Waveshare 720x720 porch timings.
+	  59 Hz is close to the panel vendor configuration's 59.22 Hz.
+
+config RV32_DISPLAY_FLUSH_INTERVAL_MS
+	int "Additional post-VSYNC cache-clean delay (ms)"
+	depends on RV32_DISPLAY_ACCEL
+	range 0 4
+	default 0
+	help
+	  Dirty writes are naturally coalesced until the panel's hardware VSYNC
+	  interrupt. Keep this at zero to clean PSRAM immediately in the vertical
+	  blanking window. A non-zero value is available only for bandwidth and
+	  timing experiments and increases visible latency.
+
+config RV32_DISPLAY_COMMAND_FIFO_DEPTH
+	int "Asynchronous framebuffer command FIFO depth"
+	depends on RV32_DISPLAY_ACCEL
+	range 4 32
+	default 16
+	help
+	  Number of backend-neutral fill, copy, image and tile descriptors that
+	  Linux can queue without waiting for the display worker. Descriptors do
+	  not contain bitmap data, so increasing this has a small RAM cost.
+
+config RV32_DISPLAY_PAYLOAD_BLOCK_SIZE
+	int "Framebuffer FIFO payload block size (bytes)"
+	depends on RV32_DISPLAY_ACCEL
+	range 2048 32768
+	default 16384
+	help
+	  Maximum bitmap, tile-index, or font payload accepted in one command.
+	  Payload capacity is reported to Linux through the PFB3 mailbox, allowing
+	  the same driver to adapt to displays with different resolutions.
+
+config RV32_DISPLAY_PAYLOAD_BLOCK_COUNT
+	int "Framebuffer FIFO payload block count"
+	depends on RV32_DISPLAY_ACCEL
+	range 2 4
+	default 4
+	help
+	  Number of payload-bearing commands that can be outstanding at once.
+	  Blocks are shared by all payload operations instead of being embedded in
+	  every command descriptor. The defaults reserve 64 KiB of internal RAM.
 
 endmenu
 

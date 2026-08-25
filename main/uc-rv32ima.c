@@ -15,6 +15,16 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#include "esp_cpu.h"
+#endif
+
+#if CONFIG_RV32_HOST_PERF_STATS
+#include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
+#endif
+
 #include "port.h"
 #include "cache.h"
 #include "display_bridge.h"
@@ -25,10 +35,19 @@
 static uint32_t ram_amt = GUEST_RAM_SIZE;
 static uint8_t *guest_ram;
 
-#define EMULATOR_BATCH_INSTRUCTIONS 16384
-#define DISPLAY_COMMIT_INTERVAL_US 5000u
+#define EMULATOR_BATCH_INSTRUCTIONS 32768
 #define USB_STATUS_INTERVAL_US 500000u
 #define EMULATOR_DEBUG_CSR 0
+
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+#define MINIRV32_PERF_STATS
+#define EMULATOR_PERF_INTERVAL_US \
+	((uint64_t)CONFIG_RV32_EMULATOR_PERF_INTERVAL_MS * 1000u)
+#endif
+
+#if CONFIG_RV32_HOST_PERF_STATS
+#define HOST_PERF_INTERVAL_US 5000000u
+#endif
 
 struct MiniRV32IMAState;
 void DumpState(struct MiniRV32IMAState *core);
@@ -42,19 +61,22 @@ static void GuestUartFlush(void);
 static void GuestUartFlushIfDue(uint64_t current_time);
 static void HandleOtherCSRWrite(uint8_t *image, uint16_t csrno, uint32_t value);
 static int32_t HandleOtherCSRRead(uint8_t *image, uint16_t csrno);
-static void MiniSleep();
+static void MiniSleep(void);
 
 #define MINIRV32WARN(x...) printf(x);
 #define MINI_RV32_RAM_SIZE ram_amt
 #define MINIRV32_IMPLEMENTATION
+/* The bundled kernel and supported replacement images use aligned, 32-bit
+ * RV32IMA instructions.  Skip redundant fetch checks in the hot loop; ports
+ * that include mini-rv32ima.h without this define retain strict validation. */
+#define MINIRV32_TRUSTED_32BIT_FETCH
 /* Per-instruction trap tracing is prohibitively expensive on the emulator. */
 #define MINIRV32_POSTEXEC(...) do { } while (0)
 
 #define MINIRV32_HANDLE_MEM_STORE_CONTROL(addy, val) \
 	do { \
 		size_t control_width = 1u << ((ir >> 12) & 3); \
-		if ((uint32_t)((addy) - DISPLAY_FB_GUEST_BASE) <= \
-		    DISPLAY_FB_SIZE - control_width) { \
+		if (display_bridge_contains((addy), control_width)) { \
 			display_bridge_store((addy), (val), control_width); \
 		} else if (HandleControlStore((addy), (val), control_width)) { \
 			return (val); \
@@ -63,8 +85,7 @@ static void MiniSleep();
 #define MINIRV32_HANDLE_MEM_LOAD_CONTROL(addy, rval) \
 	do { \
 		size_t control_width = 1u << ((ir >> 12) & 3); \
-		if ((uint32_t)((addy) - DISPLAY_FB_GUEST_BASE) <= \
-		    DISPLAY_FB_SIZE - control_width) \
+		if (display_bridge_contains((addy), control_width)) \
 			rval = display_bridge_load((addy), control_width); \
 		else \
 			rval = HandleControlLoad((addy), control_width); \
@@ -84,51 +105,64 @@ static void MiniSleep();
 #define MINIRV32_STORE4_UNCACHED(ofs, val) MiniRV32Store4Uncached(ofs, val)
 #define MINIRV32_STORE2_UNCACHED(ofs, val) MiniRV32Store2Uncached(ofs, val)
 #define MINIRV32_STORE1_UNCACHED(ofs, val) MiniRV32Store1Uncached(ofs, val)
-/* Keep rdtime monotonic inside a long instruction batch. */
-#define MINIRV32_HOST_TIME_US() GetTimeMicroseconds()
+/* Keep rdtime monotonic inside a long instruction batch without calling the
+ * 64-bit ESP timer for every guest CSR read.  CPU0 stays at the configured
+ * fixed frequency while the emulator runs. */
+#define MINIRV32_HOST_CYCLE_COUNT() esp_cpu_get_cycle_count()
+#define MINIRV32_HOST_CYCLES_PER_US CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ
 
 #define MINIRV32_CUSTOM_MEMORY_BUS
-static inline __attribute__((always_inline)) void MINIRV32_STORE4(
-	uint32_t ofs, uint32_t val)
+static inline __attribute__((always_inline)) void MiniRV32Store4(
+	uint8_t *image, uint32_t ofs, uint32_t val)
 {
-	memcpy(guest_ram + ofs, &val, sizeof(val));
+	memcpy(image + ofs, &val, sizeof(val));
 }
 
-static inline __attribute__((always_inline)) void MINIRV32_STORE2(
-	uint32_t ofs, uint16_t val)
+static inline __attribute__((always_inline)) void MiniRV32Store2(
+	uint8_t *image, uint32_t ofs, uint16_t val)
 {
-	memcpy(guest_ram + ofs, &val, sizeof(val));
+	memcpy(image + ofs, &val, sizeof(val));
 }
 
-static inline __attribute__((always_inline)) void MINIRV32_STORE1(
-	uint32_t ofs, uint8_t val)
+static inline __attribute__((always_inline)) void MiniRV32Store1(
+	uint8_t *image, uint32_t ofs, uint8_t val)
 {
-	guest_ram[ofs] = val;
+	image[ofs] = val;
 }
 
-static inline __attribute__((always_inline)) uint32_t MINIRV32_LOAD4(
-	uint32_t ofs)
+static inline __attribute__((always_inline)) uint32_t MiniRV32Load4(
+	const uint8_t *image, uint32_t ofs)
 {
 	uint32_t value;
 
-	memcpy(&value, guest_ram + ofs, sizeof(value));
+	memcpy(&value, image + ofs, sizeof(value));
 	return value;
 }
 
-static inline __attribute__((always_inline)) uint16_t MINIRV32_LOAD2(
-	uint32_t ofs)
+static inline __attribute__((always_inline)) uint16_t MiniRV32Load2(
+	const uint8_t *image, uint32_t ofs)
 {
 	uint16_t value;
 
-	memcpy(&value, guest_ram + ofs, sizeof(value));
+	memcpy(&value, image + ofs, sizeof(value));
 	return value;
 }
 
-static inline __attribute__((always_inline)) uint8_t MINIRV32_LOAD1(
-	uint32_t ofs)
+static inline __attribute__((always_inline)) uint8_t MiniRV32Load1(
+	const uint8_t *image, uint32_t ofs)
 {
-	return guest_ram[ofs];
+	return image[ofs];
 }
+
+/* mini-rv32ima's implementation functions all carry `image`.  Expanding the
+ * memory bus through that argument lets GCC retain the PSRAM base in a host
+ * register instead of loading the global guest_ram pointer for every fetch. */
+#define MINIRV32_STORE4(ofs, val) MiniRV32Store4(image, (ofs), (val))
+#define MINIRV32_STORE2(ofs, val) MiniRV32Store2(image, (ofs), (val))
+#define MINIRV32_STORE1(ofs, val) MiniRV32Store1(image, (ofs), (val))
+#define MINIRV32_LOAD4(ofs) MiniRV32Load4(image, (ofs))
+#define MINIRV32_LOAD2(ofs) MiniRV32Load2(image, (ofs))
+#define MINIRV32_LOAD1(ofs) MiniRV32Load1(image, (ofs))
 
 static uint32_t MiniRV32Load4Uncached(uint32_t ofs)
 {
@@ -197,6 +231,228 @@ void DumpState(struct MiniRV32IMAState *core)
 
 struct MiniRV32IMAState core;
 
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+static uint64_t emulator_perf_last_time;
+static uint64_t emulator_perf_last_cycle;
+
+static void EmulatorPerfStart(uint64_t current_time)
+{
+	emulator_perf_last_time = current_time;
+	emulator_perf_last_cycle =
+		((uint64_t)core.cycleh << 32) | core.cyclel;
+	memset(&core.perf, 0, sizeof(core.perf));
+	HostCacheStatsReset();
+}
+
+static void EmulatorPerfReport(uint64_t current_time)
+{
+	uint64_t elapsed_us = current_time - emulator_perf_last_time;
+	uint64_t guest_cycle = ((uint64_t)core.cycleh << 32) | core.cyclel;
+	uint64_t guest_delta = guest_cycle - emulator_perf_last_cycle;
+	uint64_t mips_x100;
+	uint64_t l1_total;
+	uint64_t l2_total;
+	struct host_cache_stats cache_stats;
+	uint32_t l1_hit_permille;
+	uint32_t l2_hit_permille;
+	uint64_t opcode_total = 0;
+
+	if (elapsed_us < EMULATOR_PERF_INTERVAL_US)
+		return;
+
+	HostCacheStatsReadAndReset(&cache_stats);
+	mips_x100 = elapsed_us ? guest_delta * 100u / elapsed_us : 0u;
+	l1_total = (uint64_t)cache_stats.l1_hits + cache_stats.l1_misses;
+	l2_total = (uint64_t)cache_stats.l2_hits + cache_stats.l2_misses;
+	l1_hit_permille = l1_total ?
+		(uint32_t)((uint64_t)cache_stats.l1_hits * 1000u / l1_total) : 0u;
+	l2_hit_permille = l2_total ?
+		(uint32_t)((uint64_t)cache_stats.l2_hits * 1000u / l2_total) : 0u;
+	for (unsigned int i = 0; i < 32; i++)
+		opcode_total += core.perf.opcode[i];
+
+	printf("\n[RV32 perf] %" PRIu64 ".%02" PRIu64 " MIPS; "
+	       "L1D %" PRIu32 ".%01" PRIu32 "%%; "
+	       "L2 %" PRIu32 ".%01" PRIu32 "%%\n",
+	       mips_x100 / 100u, mips_x100 % 100u,
+	       l1_hit_permille / 10u, l1_hit_permille % 10u,
+	       l2_hit_permille / 10u, l2_hit_permille % 10u);
+	printf("[RV32 perf] cache L1 hit=%" PRIu32 " miss=%" PRIu32
+	       " conflict=%" PRIu32 " next-r=%" PRIu32 " next-w=%" PRIu32
+	       "; L2 hit=%" PRIu32 " miss=%" PRIu32 " conflict=%" PRIu32
+	       " PSRAM-r=%" PRIu32 " PSRAM-w=%" PRIu32 "\n",
+	       cache_stats.l1_hits, cache_stats.l1_misses,
+	       cache_stats.l1_conflicts, cache_stats.l1_next_reads,
+	       cache_stats.l1_next_writes, cache_stats.l2_hits,
+	       cache_stats.l2_misses, cache_stats.l2_conflicts,
+	       cache_stats.l2_next_reads, cache_stats.l2_next_writes);
+	printf("[RV32 perf] TLB fast=%" PRIu32 " full=%" PRIu32
+	       " walk=%" PRIu32 " flush=%" PRIu32
+	       " (satp=%" PRIu32 " sfence=%" PRIu32
+	       ": global=%" PRIu32 " page=%" PRIu32 ")"
+	       "; page exec=%" PRIu32 " read=%" PRIu32
+	       " (RAM=%" PRIu32 ") write=%" PRIu32
+	       " (RAM=%" PRIu32 ") linear=%" PRIu32 "\n",
+	       core.perf.fast_tlb_hits, core.perf.tlb_hits,
+	       core.perf.tlb_walks, core.perf.tlb_flushes,
+	       core.perf.satp_writes, core.perf.sfence_vma,
+	       core.perf.sfence_global, core.perf.sfence_page,
+	       core.perf.exec_page_hits, core.perf.read_page_hits,
+	       core.perf.read_ram_page_hits, core.perf.write_page_hits,
+	       core.perf.write_ram_page_hits, core.perf.kernel_linear_hits);
+	#define OPCODE_PERCENT(index) \
+		(opcode_total ? \
+		 (uint32_t)((uint64_t)core.perf.opcode[(index)] * 1000u / \
+		 opcode_total) : 0u)
+	printf("[RV32 perf] op load=%" PRIu32 ".%01" PRIu32
+	       "%% store=%" PRIu32 ".%01" PRIu32
+	       "%% opimm=%" PRIu32 ".%01" PRIu32
+	       "%% op=%" PRIu32 ".%01" PRIu32
+	       "%% branch=%" PRIu32 ".%01" PRIu32 "%%\n",
+	       OPCODE_PERCENT(0) / 10u, OPCODE_PERCENT(0) % 10u,
+	       OPCODE_PERCENT(8) / 10u, OPCODE_PERCENT(8) % 10u,
+	       OPCODE_PERCENT(4) / 10u, OPCODE_PERCENT(4) % 10u,
+	       OPCODE_PERCENT(12) / 10u, OPCODE_PERCENT(12) % 10u,
+	       OPCODE_PERCENT(24) / 10u, OPCODE_PERCENT(24) % 10u);
+	printf("[RV32 perf] op jal=%" PRIu32 ".%01" PRIu32
+	       "%% jalr=%" PRIu32 ".%01" PRIu32
+	       "%% lui=%" PRIu32 ".%01" PRIu32
+	       "%% auipc=%" PRIu32 ".%01" PRIu32
+	       "%% system=%" PRIu32 ".%01" PRIu32
+	       "%% atomic=%" PRIu32 ".%01" PRIu32 "%%\n",
+	       OPCODE_PERCENT(27) / 10u, OPCODE_PERCENT(27) % 10u,
+	       OPCODE_PERCENT(25) / 10u, OPCODE_PERCENT(25) % 10u,
+	       OPCODE_PERCENT(13) / 10u, OPCODE_PERCENT(13) % 10u,
+	       OPCODE_PERCENT(5) / 10u, OPCODE_PERCENT(5) % 10u,
+	       OPCODE_PERCENT(28) / 10u, OPCODE_PERCENT(28) % 10u,
+	       OPCODE_PERCENT(11) / 10u, OPCODE_PERCENT(11) % 10u);
+	printf("[RV32 perf] load lb=%" PRIu32 " lh=%" PRIu32
+	       " lw=%" PRIu32 " lbu=%" PRIu32 " lhu=%" PRIu32
+	       "; store sb=%" PRIu32 " sh=%" PRIu32 " sw=%" PRIu32 "\n",
+	       core.perf.load_funct3[0], core.perf.load_funct3[1],
+	       core.perf.load_funct3[2], core.perf.load_funct3[4],
+	       core.perf.load_funct3[5], core.perf.store_funct3[0],
+	       core.perf.store_funct3[1], core.perf.store_funct3[2]);
+	printf("[RV32 perf] opimm add=%" PRIu32 " shift-l=%" PRIu32
+	       " slt=%" PRIu32 "/%" PRIu32 " xor=%" PRIu32
+	       " shift-r=%" PRIu32 " or=%" PRIu32 " and=%" PRIu32 "\n",
+	       core.perf.opimm_funct3[0], core.perf.opimm_funct3[1],
+	       core.perf.opimm_funct3[2], core.perf.opimm_funct3[3],
+	       core.perf.opimm_funct3[4], core.perf.opimm_funct3[5],
+	       core.perf.opimm_funct3[6], core.perf.opimm_funct3[7]);
+	printf("[RV32 perf] op add/sub=%" PRIu32 " shift-l=%" PRIu32
+	       " slt=%" PRIu32 "/%" PRIu32 " xor=%" PRIu32
+	       " shift-r=%" PRIu32 " or=%" PRIu32 " and=%" PRIu32 "\n",
+	       core.perf.op_funct3[0], core.perf.op_funct3[1],
+	       core.perf.op_funct3[2], core.perf.op_funct3[3],
+	       core.perf.op_funct3[4], core.perf.op_funct3[5],
+	       core.perf.op_funct3[6], core.perf.op_funct3[7]);
+	printf("[RV32 perf] branch eq=%" PRIu32 " ne=%" PRIu32
+	       " lt=%" PRIu32 " ge=%" PRIu32 " ltu=%" PRIu32
+	       " geu=%" PRIu32 "; mul/div=%" PRIu32 "\n",
+	       core.perf.branch_funct3[0], core.perf.branch_funct3[1],
+	       core.perf.branch_funct3[4], core.perf.branch_funct3[5],
+	       core.perf.branch_funct3[6], core.perf.branch_funct3[7],
+	       core.perf.muldiv);
+	#undef OPCODE_PERCENT
+
+	emulator_perf_last_time = current_time;
+	emulator_perf_last_cycle = guest_cycle;
+	memset(&core.perf, 0, sizeof(core.perf));
+}
+#endif
+
+#if CONFIG_RV32_HOST_PERF_STATS
+static uint64_t host_perf_last_time;
+static uint64_t host_perf_last_cycle;
+static configRUN_TIME_COUNTER_TYPE host_perf_last_idle[2];
+
+static uint32_t HostPerfBusyPermille(
+	configRUN_TIME_COUNTER_TYPE current_idle,
+	configRUN_TIME_COUNTER_TYPE previous_idle,
+	uint64_t elapsed_us)
+{
+	uint64_t idle_us = current_idle - previous_idle;
+
+	if (idle_us >= elapsed_us)
+		return 0;
+	return 1000u - (uint32_t)(idle_us * 1000u / elapsed_us);
+}
+
+static void HostPerfStart(uint64_t current_time)
+{
+	struct display_bridge_perf_stats ignored;
+
+	host_perf_last_time = current_time;
+	host_perf_last_cycle =
+		((uint64_t)core.cycleh << 32) | core.cyclel;
+	for (BaseType_t cpu = 0; cpu < 2; cpu++)
+		host_perf_last_idle[cpu] =
+			ulTaskGetIdleRunTimeCounterForCore(cpu);
+	display_bridge_perf_read_and_reset(&ignored);
+}
+
+static void HostPerfReport(uint64_t current_time)
+{
+	uint64_t elapsed_us = current_time - host_perf_last_time;
+	uint64_t guest_cycle;
+	uint64_t guest_delta;
+	uint64_t mips_x100;
+	configRUN_TIME_COUNTER_TYPE idle[2];
+	uint32_t busy[2];
+	uint32_t display_busy_permille;
+	struct display_bridge_perf_stats display;
+
+	if (elapsed_us < HOST_PERF_INTERVAL_US)
+		return;
+
+	guest_cycle = ((uint64_t)core.cycleh << 32) | core.cyclel;
+	guest_delta = guest_cycle - host_perf_last_cycle;
+	mips_x100 = elapsed_us ? guest_delta * 100u / elapsed_us : 0u;
+	for (BaseType_t cpu = 0; cpu < 2; cpu++) {
+		idle[cpu] = ulTaskGetIdleRunTimeCounterForCore(cpu);
+		busy[cpu] = HostPerfBusyPermille(
+			idle[cpu], host_perf_last_idle[cpu], elapsed_us);
+	}
+	display_bridge_perf_read_and_reset(&display);
+	display_busy_permille = elapsed_us
+		? (uint32_t)((uint64_t)display.service_us * 1000u / elapsed_us)
+		: 0u;
+
+	printf("\n[Host perf] CPU0 %" PRIu32 ".%" PRIu32
+	       "%% busy, CPU1 %" PRIu32 ".%" PRIu32
+	       "%% busy; RV32 %" PRIu64 ".%02" PRIu64 " MIPS\n",
+	       busy[0] / 10u, busy[0] % 10u,
+	       busy[1] / 10u, busy[1] % 10u,
+	       mips_x100 / 100u, mips_x100 % 100u);
+	printf("[Display perf] worker %" PRIu32 ".%" PRIu32
+	       "%%, wake=%" PRIu32 " vsync=%" PRIu32
+	       " cmd=%" PRIu32 " (fill=%" PRIu32 " copy=%" PRIu32
+	       " tile=%" PRIu32 "), FIFO high=%" PRIu32
+	       " busy=%" PRIu32 "\n",
+	       display_busy_permille / 10u, display_busy_permille % 10u,
+	       display.service_wakes, display.vsyncs, display.commands,
+	       display.fill_commands, display.copy_commands,
+	       display.tile_commands, display.fifo_high_water,
+	       display.fifo_busy);
+	printf("[Display perf] cache=%" PRIu32 " calls/%" PRIu32
+	       " KiB/%" PRIu32 " us; PPA=%" PRIu32
+	       " fills + %" PRIu32 " blits/%" PRIu32
+	       " us; pixels PPA=%" PRIu32 " CPU-fill=%" PRIu32
+	       " copy=%" PRIu32 " tile=%" PRIu32 "\n",
+	       display.cache_syncs, display.cache_bytes / 1024u,
+	       display.cache_us, display.ppa_fills, display.ppa_blits,
+	       display.ppa_us, display.ppa_fill_pixels,
+	       display.cpu_fill_pixels, display.copy_pixels,
+	       display.tile_pixels);
+
+	host_perf_last_time = current_time;
+	host_perf_last_cycle = guest_cycle;
+	for (BaseType_t cpu = 0; cpu < 2; cpu++)
+		host_perf_last_idle[cpu] = idle[cpu];
+}
+#endif
+
 void app_main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -213,6 +469,7 @@ void app_main(void)
 	}
 
 	/* Reserve guest RAM first, then allocate the LCD driver's framebuffer. */
+	display_bridge_set_guest_memory(guest_ram, GUEST_PHYS_BASE, ram_amt);
 	display_bridge_init();
 	if (HostInputInit() < 0)
 		return;
@@ -227,6 +484,8 @@ void app_main(void)
 
 	if (load_images(ram_amt, NULL) < 0)
 		return;
+	HostEnableGuestRamPrefetch(guest_ram + KERNEL_LOAD_OFFSET,
+				   ram_amt - KERNEL_LOAD_OFFSET);
 
   memset(&core, 0, sizeof(core));
 
@@ -237,9 +496,14 @@ void app_main(void)
 	core.satp = 0;       /* Linux enables Sv32 itself. */
 
 	uint64_t lastTime = GetTimeMicroseconds();
-	uint64_t last_display_commit = lastTime;
 	uint64_t last_usb_status = lastTime;
 	int instrs_per_flip = EMULATOR_BATCH_INSTRUCTIONS;
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+	EmulatorPerfStart(lastTime);
+#endif
+#if CONFIG_RV32_HOST_PERF_STATS
+	HostPerfStart(lastTime);
+#endif
 	printf("RV32IMA starting\n");
 	printf("Initial PC: 0x%08" PRIx32 "\n", core.pc);
 
@@ -257,12 +521,18 @@ void app_main(void)
 			last_usb_status = currentTime;
 		}
 
-		ret = MiniRV32IMAStep(&core, NULL, 0, elapsedUs, instrs_per_flip);
-		if (ret == 1 ||
-		    currentTime - last_display_commit >= DISPLAY_COMMIT_INTERVAL_US) {
-			display_bridge_commit();
-			last_display_commit = currentTime;
-		}
+		ret = MiniRV32IMAStep(&core, guest_ram, 0, elapsedUs,
+				       instrs_per_flip);
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+		EmulatorPerfReport(currentTime);
+#endif
+#if CONFIG_RV32_HOST_PERF_STATS
+		HostPerfReport(currentTime);
+#endif
+		/* simplefb has no end-of-frame callback.  Explicit full-frame
+		 * writers use the SYNC doorbell; this cheap batch-boundary handoff
+		 * keeps unmodified fbcon responsive without a wall-clock timer. */
+		display_bridge_commit();
 
 		switch (ret) {
 			case 0:
@@ -292,6 +562,9 @@ void app_main(void)
 
 static void MiniSleep(void)
 {
+	/* WFI must not hammer the outer device-poll loop.  This sub-tick pause is
+	 * a ROM busy wait (not a 100 Hz FreeRTOS delay), so host interrupts remain
+	 * responsive while idle cache traffic stays bounded. */
 	usleep(10);
 }
 
@@ -322,7 +595,7 @@ static uint8_t uart_fcr = 0;
 static bool uart_thre_irq_pending = true;
 
 #define GUEST_UART_TX_BUFFER_SIZE 256u
-#define GUEST_UART_TX_FLUSH_US    10000u
+#define GUEST_UART_TX_FLUSH_US    1000u
 
 static uint8_t guest_uart_tx_buffer[GUEST_UART_TX_BUFFER_SIZE];
 static size_t guest_uart_tx_length;
@@ -593,7 +866,7 @@ static void HandleOtherCSRWrite(uint8_t *image, uint16_t csrno, uint32_t value)
 				if (ptrstart >= ram_amt)
 					printf("DEBUG PASSED INVALID PTR (%"PRIu32")\n", value);
 			while (ptrend < ram_amt) {
-				uint8_t c = MINIRV32_LOAD1(ptrend);
+				uint8_t c = image[ptrend];
 				if (c == 0)
 					break;
 				fwrite(&c, 1, 1, stdout);
