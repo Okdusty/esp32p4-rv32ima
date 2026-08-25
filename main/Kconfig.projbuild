@@ -85,6 +85,16 @@ config RV32_DISPLAY_COMMAND_FIFO_DEPTH
 	  Linux can queue without waiting for the display worker. Descriptors do
 	  not contain bitmap data, so increasing this has a small RAM cost.
 
+config RV32_DISPLAY_COMMAND_SLICE
+	int "Framebuffer commands processed per CPU1 service slice"
+	depends on RV32_DISPLAY_ACCEL
+	range 1 16
+	default 4
+	help
+	  Bound one command-drain pass so a continuously full FIFO cannot postpone
+	  a pending VSYNC notification. Remaining commands immediately reschedule
+	  the service task; no timer delay is added.
+
 config RV32_DISPLAY_PAYLOAD_BLOCK_SIZE
 	int "Framebuffer FIFO payload block size (bytes)"
 	depends on RV32_DISPLAY_ACCEL

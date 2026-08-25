@@ -229,7 +229,7 @@ void DumpState(struct MiniRV32IMAState *core)
 		regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31] );
 }
 
-struct MiniRV32IMAState core;
+struct MiniRV32IMAState core __attribute__((aligned(128)));
 
 #if CONFIG_RV32_EMULATOR_PERF_STATS
 static uint64_t emulator_perf_last_time;
@@ -429,12 +429,14 @@ static void HostPerfReport(uint64_t current_time)
 	       "%%, wake=%" PRIu32 " vsync=%" PRIu32
 	       " cmd=%" PRIu32 " (fill=%" PRIu32 " copy=%" PRIu32
 	       " tile=%" PRIu32 "), FIFO high=%" PRIu32
-	       " busy=%" PRIu32 "\n",
+	       " busy=%" PRIu32 " slices=%" PRIu32
+	       " deferred=%" PRIu32 "\n",
 	       display_busy_permille / 10u, display_busy_permille % 10u,
 	       display.service_wakes, display.vsyncs, display.commands,
 	       display.fill_commands, display.copy_commands,
 	       display.tile_commands, display.fifo_high_water,
-	       display.fifo_busy);
+	       display.fifo_busy, display.fifo_slices,
+	       display.fifo_deferred);
 	printf("[Display perf] cache=%" PRIu32 " calls/%" PRIu32
 	       " KiB/%" PRIu32 " us; PPA=%" PRIu32
 	       " fills + %" PRIu32 " blits/%" PRIu32

@@ -1,4 +1,5 @@
-.PHONY: guest guest-rootfs guest-image guest-dtb guest-verify clean distclean
+.PHONY: guest guest-rootfs guest-image guest-dtb guest-verify test \
+	test-emulator clean distclean
 
 guest:
 	./scripts/build-guest.sh
@@ -14,6 +15,11 @@ guest-dtb:
 
 guest-verify:
 	./scripts/verify-guest-image.py main/Image
+
+test: test-emulator
+
+test-emulator:
+	./scripts/test-emulator.sh
 
 clean:
 	./scripts/clean-guest.sh clean

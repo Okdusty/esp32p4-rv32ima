@@ -59,6 +59,8 @@ struct display_bridge_perf_stats {
 	uint32_t cache_us;
 	uint32_t fifo_busy;
 	uint32_t fifo_high_water;
+	uint32_t fifo_slices;
+	uint32_t fifo_deferred;
 };
 
 #if defined(CONFIG_RV32_DISPLAY_ACCEL) && CONFIG_RV32_DISPLAY_ACCEL

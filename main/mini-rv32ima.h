@@ -195,8 +195,14 @@ struct MiniRV32IMAState
 	struct MiniRV32PerfStats perf;
 #endif
 
-	struct MiniRV32TLBEntry tlb[MINIRV32_TLB_ENTRIES];
-	struct MiniRV32FastTLBEntry fast_tlb[3][MINIRV32_FAST_TLB_SETS];
+	/* The three small first-level caches are touched by ordinary loads, stores
+	 * and instruction fetches. Keep them before the colder full TLB so their
+	 * base stays near the register block and their lines do not inherit the
+	 * full TLB's 32 KiB displacement. */
+	struct MiniRV32FastTLBEntry fast_tlb[3][MINIRV32_FAST_TLB_SETS]
+		__attribute__((aligned(128)));
+	struct MiniRV32TLBEntry tlb[MINIRV32_TLB_ENTRIES]
+		__attribute__((aligned(128)));
 };
 
 enum {
@@ -874,25 +880,14 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					uint32_t virtual_page = virtual_addr & ~0xfffu;
 					uint32_t phys_addr = 0;
 					uint32_t ofs = 0;
-					uint32_t linear_offset =
-						virtual_addr - MINIRV32_KERNEL_LINEAR_BASE;
 
 					/*
-					 * Linux kernel data overwhelmingly lives in its fixed
-					 * linear map.  Resolve that case before the generic
-					 * translator so it also skips physical-range and
-					 * uncached-memory dispatch below.
+					 * A process normally touches several values on one page.  Check
+					 * that page before asking whether this is a kernel-linear
+					 * address.  This makes both S-mode and U-mode cached RAM use the
+					 * same shortest path; the first linear-map access below seeds the
+					 * cache for the rest of that page.
 					 */
-					if (__builtin_expect(
-						linear_offset < kernel_linear_limit,
-						1)) {
-						ofs =
-							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET +
-							linear_offset;
-						MINIRV32_PERF_INC(kernel_linear_hits);
-						goto load_cached_ram;
-					}
-
 					if (__builtin_expect(
 						virtual_page == read_virtual_page, 1)) {
 						MINIRV32_PERF_INC(read_page_hits);
@@ -906,6 +901,23 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							(virtual_addr & 0xfffu);
 						uncached = read_uncached;
 					} else {
+						uint32_t linear_offset =
+							virtual_addr - MINIRV32_KERNEL_LINEAR_BASE;
+
+						if (linear_offset < kernel_linear_limit) {
+							ofs =
+								MINIRV32_KERNEL_LINEAR_PHYS_OFFSET +
+								linear_offset;
+							read_virtual_page = virtual_page;
+							read_physical_page =
+								MINIRV32_RAM_IMAGE_OFFSET +
+								(ofs & ~0xfffu);
+							read_uncached = 0;
+							read_ram_offset_bias = ofs - virtual_addr;
+							MINIRV32_PERF_INC(kernel_linear_hits);
+							goto load_cached_ram;
+						}
+
 						phys_addr = MiniRV32Translate(
 							state, image, virtual_addr, ACCESS_READ, &fault,
 							&uncached);
@@ -1018,18 +1030,6 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					uint32_t virtual_page = virtual_addr & ~0xfffu;
 					uint32_t phys_addr = 0;
 					uint32_t ofs = 0;
-					uint32_t linear_offset =
-						virtual_addr - MINIRV32_KERNEL_LINEAR_BASE;
-
-					if (__builtin_expect(
-						linear_offset < kernel_linear_limit,
-						1)) {
-						ofs =
-							MINIRV32_KERNEL_LINEAR_PHYS_OFFSET +
-							linear_offset;
-						MINIRV32_PERF_INC(kernel_linear_hits);
-						goto store_cached_ram;
-					}
 
 					if (__builtin_expect(
 						virtual_page == write_virtual_page, 1)) {
@@ -1044,6 +1044,23 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							(virtual_addr & 0xfffu);
 						uncached = write_uncached;
 					} else {
+						uint32_t linear_offset =
+							virtual_addr - MINIRV32_KERNEL_LINEAR_BASE;
+
+						if (linear_offset < kernel_linear_limit) {
+							ofs =
+								MINIRV32_KERNEL_LINEAR_PHYS_OFFSET +
+								linear_offset;
+							write_virtual_page = virtual_page;
+							write_physical_page =
+								MINIRV32_RAM_IMAGE_OFFSET +
+								(ofs & ~0xfffu);
+							write_uncached = 0;
+							write_ram_offset_bias = ofs - virtual_addr;
+							MINIRV32_PERF_INC(kernel_linear_hits);
+							goto store_cached_ram;
+						}
+
 						phys_addr = MiniRV32Translate(
 							state, image, virtual_addr, ACCESS_WRITE, &fault,
 							&uncached);
