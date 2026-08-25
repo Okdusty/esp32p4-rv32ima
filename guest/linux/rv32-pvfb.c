@@ -252,8 +252,8 @@ static bool rv32pvfb_submit(struct fb_info *info, u32 operation,
 	/* Publish every argument and any staging bytes before the doorbell. */
 	wmb();
 	if (par->features & RV32PV_FEATURE_ASYNC_FIFO) {
-		/* The MMIO store snapshots the command and bitmap into a FreeRTOS
-		 * queue before returning. Usually this loop executes exactly once;
+		/* The MMIO store snapshots the command and bitmap into the host FIFO
+		 * before returning. Usually this loop executes exactly once;
 		 * retrying BUSY briefly avoids an extremely expensive cfb fallback.
 		 */
 		deadline = ktime_get_mono_fast_ns() + RV32PV_COMMAND_TIMEOUT_NS;

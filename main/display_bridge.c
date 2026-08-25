@@ -23,7 +23,6 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/task.h"
 
 /*
@@ -54,6 +53,8 @@ _Static_assert(DISPLAY_PV_PAYLOAD_SIZE *
                        (DISPLAY_PV_PAYLOAD_BLOCK_COUNT + 1u) <=
                    160u * 1024u,
                "FIFO payload pool and tile cache exceed the RAM budget");
+_Static_assert(DISPLAY_PV_PAYLOAD_BLOCK_COUNT <= 32u,
+               "payload free mask is 32 bits");
 
 typedef struct {
   uint32_t sequence;
@@ -65,7 +66,9 @@ typedef struct {
   display_pv_command_t command;
   uint32_t payload_length;
   uint8_t *payload;
-} display_pv_queue_entry_t;
+  uint32_t payload_free_bit;
+} __attribute__((aligned(CONFIG_CACHE_L2_CACHE_LINE_SIZE)))
+    display_pv_queue_entry_t;
 
 typedef struct {
   uint16_t pixels[4];
@@ -104,19 +107,18 @@ static display_pv_queue_entry_t pv_queue_entries[DISPLAY_PV_FIFO_DEPTH];
  * can still enter the FIFO while bitmap producers are applying backpressure. */
 static uint8_t pv_payload_blocks[DISPLAY_PV_PAYLOAD_BLOCK_COUNT]
                                 [DISPLAY_PV_PAYLOAD_SIZE]
-    __attribute__((aligned(64)));
-static QueueHandle_t pv_ready_queue;
-static QueueHandle_t pv_free_queue;
-static QueueHandle_t pv_payload_free_queue;
-static StaticQueue_t pv_ready_queue_control;
-static StaticQueue_t pv_free_queue_control;
-static StaticQueue_t pv_payload_free_queue_control;
-static uint8_t pv_ready_queue_storage[DISPLAY_PV_FIFO_DEPTH *
-                                      sizeof(display_pv_queue_entry_t *)];
-static uint8_t pv_free_queue_storage[DISPLAY_PV_FIFO_DEPTH *
-                                     sizeof(display_pv_queue_entry_t *)];
-static uint8_t pv_payload_free_queue_storage[
-    DISPLAY_PV_PAYLOAD_BLOCK_COUNT * sizeof(uint8_t *)];
+    __attribute__((aligned(CONFIG_CACHE_L2_CACHE_LINE_SIZE)));
+/* CPU0 is the only producer and CPU1 is the only consumer. Monotonic indices
+ * therefore provide a bounded SPSC ring without the three FreeRTOS queues and
+ * their cross-core locks on every framebuffer command. Keep independently
+ * written indices on different P4 cache lines to avoid false sharing. */
+static uint32_t pv_producer_head
+    __attribute__((aligned(CONFIG_CACHE_L2_CACHE_LINE_SIZE)));
+static uint32_t pv_consumer_tail
+    __attribute__((aligned(CONFIG_CACHE_L2_CACHE_LINE_SIZE)));
+static uint32_t pv_payload_free_mask
+    __attribute__((aligned(CONFIG_CACHE_L2_CACHE_LINE_SIZE)));
+static bool pv_fifo_ready;
 static uint32_t pv_accepted_sequence;
 static uint32_t pv_accepted_status = DISPLAY_PV_STATUS_FAILED;
 static uint32_t pv_completed_sequence;
@@ -204,38 +206,64 @@ static bool IRAM_ATTR display_vsync_callback(void *context) {
   return higher_priority_task_woken == pdTRUE;
 }
 
+static uint32_t display_pv_queue_count(void) {
+  uint32_t head = __atomic_load_n(&pv_producer_head, __ATOMIC_ACQUIRE);
+  uint32_t tail = __atomic_load_n(&pv_consumer_tail, __ATOMIC_ACQUIRE);
+
+  return head - tail;
+}
+
+static uint32_t display_pv_queue_free(void) {
+  uint32_t used = display_pv_queue_count();
+
+  return used < DISPLAY_PV_FIFO_DEPTH ? DISPLAY_PV_FIFO_DEPTH - used : 0;
+}
+
+static bool display_pv_commands_pending(void) {
+  uint32_t tail =
+      __atomic_load_n(&pv_consumer_tail, __ATOMIC_RELAXED);
+  uint32_t head =
+      __atomic_load_n(&pv_producer_head, __ATOMIC_ACQUIRE);
+
+  return tail != head;
+}
+
+static uint32_t display_pv_payload_free_count(void) {
+  return (uint32_t)__builtin_popcount(
+      __atomic_load_n(&pv_payload_free_mask, __ATOMIC_ACQUIRE));
+}
+
+static uint8_t *display_pv_payload_take(uint32_t *free_bit) {
+  uint32_t available =
+      __atomic_load_n(&pv_payload_free_mask, __ATOMIC_ACQUIRE);
+
+  while (available != 0) {
+    uint32_t selected = available & (0u - available);
+    uint32_t remaining = available & ~selected;
+
+    if (__atomic_compare_exchange_n(&pv_payload_free_mask, &available,
+                                    remaining, false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+      *free_bit = selected;
+      return pv_payload_blocks[__builtin_ctz(selected)];
+    }
+  }
+  *free_bit = 0;
+  return NULL;
+}
+
 static bool display_pv_queue_init(void) {
-  pv_ready_queue = xQueueCreateStatic(
-      DISPLAY_PV_FIFO_DEPTH,
-      sizeof(display_pv_queue_entry_t *), pv_ready_queue_storage,
-      &pv_ready_queue_control);
-  pv_free_queue = xQueueCreateStatic(
-      DISPLAY_PV_FIFO_DEPTH,
-      sizeof(display_pv_queue_entry_t *), pv_free_queue_storage,
-      &pv_free_queue_control);
-  pv_payload_free_queue = xQueueCreateStatic(
-      DISPLAY_PV_PAYLOAD_BLOCK_COUNT, sizeof(uint8_t *),
-      pv_payload_free_queue_storage, &pv_payload_free_queue_control);
-  if (pv_ready_queue == NULL || pv_free_queue == NULL ||
-      pv_payload_free_queue == NULL)
-    return false;
+  pv_producer_head = 0;
+  pv_consumer_tail = 0;
+  pv_payload_free_mask =
+      DISPLAY_PV_PAYLOAD_BLOCK_COUNT == 32u
+          ? UINT32_MAX
+          : (1u << DISPLAY_PV_PAYLOAD_BLOCK_COUNT) - 1u;
+  pv_fifo_ready = true;
 
   for (uint32_t row = 0; row < DISPLAY_FB_HEIGHT; row++)
     accel_dirty_start[row] = DISPLAY_FB_WIDTH;
-  for (uint32_t index = 0; index < DISPLAY_PV_FIFO_DEPTH; index++) {
-    display_pv_queue_entry_t *entry = &pv_queue_entries[index];
-
-    entry->payload = NULL;
-    entry->payload_length = 0;
-    if (xQueueSend(pv_free_queue, &entry, 0) != pdTRUE)
-      return false;
-  }
-  for (uint32_t index = 0; index < DISPLAY_PV_PAYLOAD_BLOCK_COUNT; index++) {
-    uint8_t *payload = pv_payload_blocks[index];
-
-    if (xQueueSend(pv_payload_free_queue, &payload, 0) != pdTRUE)
-      return false;
-  }
+  memset(pv_queue_entries, 0, sizeof(pv_queue_entries));
   return true;
 }
 
@@ -901,15 +929,6 @@ static bool display_image1(const display_pv_command_t *command,
   return true;
 }
 
-static bool display_pv_payload_owned(const uint8_t *payload) {
-  uintptr_t start = (uintptr_t)&pv_payload_blocks[0][0];
-  uintptr_t end = start + sizeof(pv_payload_blocks);
-  uintptr_t address = (uintptr_t)payload;
-
-  return address >= start && address < end &&
-         (address - start) % DISPLAY_PV_PAYLOAD_SIZE == 0;
-}
-
 static void display_pv_record_fifo_error(void) {
   (void)__atomic_add_fetch(&pv_fifo_errors, 1u, __ATOMIC_RELAXED);
 }
@@ -919,24 +938,49 @@ static uint32_t display_pv_report_busy(void) {
   return DISPLAY_PV_STATUS_BUSY;
 }
 
-static void display_pv_release_entry(display_pv_queue_entry_t *entry) {
+static void display_pv_release_entry(display_pv_queue_entry_t *entry,
+                                     uint32_t tail) {
   uint8_t *payload = entry->payload;
+  uint32_t payload_free_bit = entry->payload_free_bit;
 
   entry->payload = NULL;
   entry->payload_length = 0;
+  entry->payload_free_bit = 0;
   if (payload != NULL) {
-    if (!display_pv_payload_owned(payload) ||
-        xQueueSend(pv_payload_free_queue, &payload, 0) != pdTRUE)
+    uint32_t valid_mask =
+        DISPLAY_PV_PAYLOAD_BLOCK_COUNT == 32u
+            ? UINT32_MAX
+            : (1u << DISPLAY_PV_PAYLOAD_BLOCK_COUNT) - 1u;
+
+    if (payload_free_bit == 0 || (payload_free_bit & valid_mask) == 0 ||
+        (payload_free_bit & (payload_free_bit - 1u)) != 0) {
       display_pv_record_fifo_error();
-  }
-  if (xQueueSend(pv_free_queue, &entry, 0) != pdTRUE)
+    } else {
+      uint32_t previous = __atomic_fetch_or(
+          &pv_payload_free_mask, payload_free_bit, __ATOMIC_RELEASE);
+
+      if (previous & payload_free_bit)
+        display_pv_record_fifo_error();
+    }
+  } else if (payload_free_bit != 0) {
     display_pv_record_fifo_error();
+  }
+  __atomic_store_n(&pv_consumer_tail, tail + 1u, __ATOMIC_RELEASE);
 }
 
-static void display_process_pv_commands(void) {
-  display_pv_queue_entry_t *entry;
+static bool display_process_pv_commands(void) {
+  uint32_t processed = 0;
 
-  while (xQueueReceive(pv_ready_queue, &entry, 0) == pdTRUE) {
+  while (processed < CONFIG_RV32_DISPLAY_COMMAND_SLICE) {
+    uint32_t tail =
+        __atomic_load_n(&pv_consumer_tail, __ATOMIC_RELAXED);
+    uint32_t head =
+        __atomic_load_n(&pv_producer_head, __ATOMIC_ACQUIRE);
+    display_pv_queue_entry_t *entry;
+
+    if (tail == head)
+      break;
+    entry = &pv_queue_entries[tail % DISPLAY_PV_FIFO_DEPTH];
     const display_pv_command_t *command = &entry->command;
     bool restore_cursor = false;
     bool success = false;
@@ -985,14 +1029,6 @@ static void display_process_pv_commands(void) {
     }
     if (restore_cursor && tile_cursor_active)
       display_toggle_tile_cursor();
-
-    /* Large text batches may use PPA for the background and CPU1 for glyphs.
-     * PPA writes are DMA-visible immediately, so clean the glyph rows now as
-     * one finished composite instead of exposing a blank intermediate frame. */
-    if (ppa_fill_touched_scanout) {
-      if (display_flush_accel_dirty())
-        ppa_fill_touched_scanout = false;
-    }
     DISPLAY_PERF_ADD(commands, 1u);
 
     portENTER_CRITICAL(&dirty_lock);
@@ -1000,8 +1036,22 @@ static void display_process_pv_commands(void) {
         success ? DISPLAY_PV_STATUS_OK : DISPLAY_PV_STATUS_INVALID;
     pv_completed_sequence = command->sequence;
     portEXIT_CRITICAL(&dirty_lock);
-    display_pv_release_entry(entry);
+    display_pv_release_entry(entry, tail);
+    processed++;
   }
+
+  /* A slice may contain several PPA backgrounds and CPU-expanded glyph runs.
+   * Publish their merged dirty rows once, as one completed composite. */
+  if (ppa_fill_touched_scanout && display_flush_accel_dirty())
+    ppa_fill_touched_scanout = false;
+
+  if (processed != 0)
+    DISPLAY_PERF_ADD(fifo_slices, 1u);
+  if (display_pv_commands_pending()) {
+    DISPLAY_PERF_ADD(fifo_deferred, 1u);
+    return true;
+  }
+  return false;
 }
 
 static void display_process_ppa_command(void) {
@@ -1114,18 +1164,18 @@ static void display_service_task(void *argument) {
     uint32_t events;
     uint32_t sync_target;
     bool frame_ready;
+    bool commands_pending = false;
 
     xTaskNotifyWait(0, UINT32_MAX, &events, portMAX_DELAY);
 #if CONFIG_RV32_HOST_PERF_STATS
     int64_t service_started = esp_timer_get_time();
 #endif
     DISPLAY_PERF_ADD(service_wakes, 1u);
-    /* Execute every queued native operation on CPU1.  Linux has already
-     * returned from its fbdev callback, and all resulting cache writeback is
-     * still coalesced below at the physical frame boundary. */
+    /* A bounded slice prevents an always-full producer FIFO from hiding a
+     * VSYNC bit behind an unbounded drain loop. */
     if ((events & LCD_NOTIFY_PV_COMMAND) ||
-        uxQueueMessagesWaiting(pv_ready_queue) != 0)
-      display_process_pv_commands();
+        display_pv_commands_pending())
+      commands_pending = display_process_pv_commands();
     if (events & LCD_NOTIFY_VSYNC) {
       DISPLAY_PERF_ADD(vsyncs, 1u);
 #if CONFIG_RV32_DISPLAY_FLUSH_INTERVAL_MS > 0
@@ -1150,6 +1200,10 @@ static void display_service_task(void *argument) {
         portEXIT_CRITICAL(&dirty_lock);
       }
     }
+    if (commands_pending &&
+        xTaskNotify(display_task_handle, LCD_NOTIFY_PV_COMMAND, eSetBits) !=
+            pdPASS)
+      display_pv_record_fifo_error();
 #if CONFIG_RV32_HOST_PERF_STATS
     DISPLAY_PERF_ADD(service_us, esp_timer_get_time() - service_started);
 #endif
@@ -1301,9 +1355,9 @@ uint32_t display_bridge_load(uint32_t address, size_t width) {
                   DISPLAY_PV_FEATURE_SURFACE_INFO;
       if (guest_memory_host != NULL)
         synthetic |= DISPLAY_PV_FEATURE_SHARED_COMMAND;
-      if (pv_ready_queue != NULL && pv_free_queue != NULL) {
+      if (pv_fifo_ready) {
         synthetic |= DISPLAY_PV_FEATURE_ASYNC_FIFO;
-        if (ppa_staging != NULL && pv_payload_free_queue != NULL)
+        if (ppa_staging != NULL)
           synthetic |= DISPLAY_PV_FEATURE_IMAGE1 | DISPLAY_PV_FEATURE_TILE |
                        DISPLAY_PV_FEATURE_PAYLOAD_POOL;
       }
@@ -1332,8 +1386,8 @@ uint32_t display_bridge_load(uint32_t address, size_t width) {
       synthetic = DISPLAY_PV_FIFO_DEPTH;
       break;
     case DISPLAY_PV_REG_QUEUE_FREE:
-      if (pv_free_queue != NULL)
-        synthetic = uxQueueMessagesWaiting(pv_free_queue);
+      if (pv_fifo_ready)
+        synthetic = display_pv_queue_free();
       break;
     case DISPLAY_PV_REG_PAYLOAD_LIMIT:
       synthetic = DISPLAY_PV_PAYLOAD_SIZE;
@@ -1342,8 +1396,8 @@ uint32_t display_bridge_load(uint32_t address, size_t width) {
       synthetic = DISPLAY_PV_PAYLOAD_BLOCK_COUNT;
       break;
     case DISPLAY_PV_REG_PAYLOAD_FREE:
-      if (pv_payload_free_queue != NULL)
-        synthetic = uxQueueMessagesWaiting(pv_payload_free_queue);
+      if (pv_fifo_ready)
+        synthetic = display_pv_payload_free_count();
       break;
     case DISPLAY_PV_REG_SURFACE_WIDTH:
       synthetic = DISPLAY_FB_WIDTH;
@@ -1403,9 +1457,12 @@ static uint32_t display_pv_enqueue(const display_pv_command_t *command,
   uint8_t *payload = NULL;
   const uint8_t *payload_source = NULL;
   uint32_t payload_length = 0;
+  uint32_t payload_free_bit = 0;
+  uint32_t head;
+  uint32_t tail;
 
-  if (display_task_handle == NULL || pv_ready_queue == NULL ||
-      pv_free_queue == NULL || command->sequence == 0)
+  if (display_task_handle == NULL || !pv_fifo_ready ||
+      command->sequence == 0)
     return DISPLAY_PV_STATUS_FAILED;
 
   switch (command->operation) {
@@ -1472,8 +1529,7 @@ static uint32_t display_pv_enqueue(const display_pv_command_t *command,
 
   if (payload_length > DISPLAY_PV_PAYLOAD_SIZE ||
       payload_length > DISPLAY_ACCEL_STAGE_SIZE ||
-      (payload_length != 0 &&
-       (ppa_staging == NULL || pv_payload_free_queue == NULL)))
+      (payload_length != 0 && ppa_staging == NULL))
     return DISPLAY_PV_STATUS_INVALID;
 
   if (shared_payload) {
@@ -1489,31 +1545,33 @@ static uint32_t display_pv_enqueue(const display_pv_command_t *command,
     payload_source = ppa_staging;
   }
 
-  if (xQueueReceive(pv_free_queue, &entry, 0) != pdTRUE)
+  head = __atomic_load_n(&pv_producer_head, __ATOMIC_RELAXED);
+  tail = __atomic_load_n(&pv_consumer_tail, __ATOMIC_ACQUIRE);
+  if (head - tail >= DISPLAY_PV_FIFO_DEPTH)
     return display_pv_report_busy();
+  entry = &pv_queue_entries[head % DISPLAY_PV_FIFO_DEPTH];
   entry->payload = NULL;
   entry->payload_length = 0;
+  entry->payload_free_bit = 0;
   if (payload_length != 0 &&
-      xQueueReceive(pv_payload_free_queue, &payload, 0) != pdTRUE) {
-    if (xQueueSend(pv_free_queue, &entry, 0) != pdTRUE)
-      display_pv_record_fifo_error();
+      (payload = display_pv_payload_take(&payload_free_bit)) == NULL)
     return display_pv_report_busy();
-  }
   entry->command = *command;
   entry->payload_length = payload_length;
   entry->payload = payload;
+  entry->payload_free_bit = payload_free_bit;
   if (payload != NULL)
     memcpy(payload, payload_source, payload_length);
-  if (xQueueSend(pv_ready_queue, &entry, 0) != pdTRUE) {
-    display_pv_record_fifo_error();
-    display_pv_release_entry(entry);
-    return display_pv_report_busy();
-  }
-  display_perf_update_fifo_high_water(
-      uxQueueMessagesWaiting(pv_ready_queue));
-  if (xTaskNotify(display_task_handle, LCD_NOTIFY_PV_COMMAND, eSetBits) !=
-      pdPASS)
-    display_pv_record_fifo_error();
+  /* Publish the fully initialized slot. CPU1 acquires this index before it
+   * reads the descriptor or its payload. */
+  __atomic_store_n(&pv_producer_head, head + 1u, __ATOMIC_RELEASE);
+  display_perf_update_fifo_high_water(head + 1u - tail);
+  /* One cross-core wake is sufficient for a whole burst. The consumer keeps
+   * rescheduling bounded slices until the ring is empty. */
+  if (head == tail &&
+      xTaskNotify(display_task_handle, LCD_NOTIFY_PV_COMMAND, eSetBits) !=
+          pdPASS)
+      display_pv_record_fifo_error();
   return DISPLAY_PV_STATUS_OK;
 }
 
@@ -1704,6 +1762,8 @@ void display_bridge_perf_read_and_reset(
   DISPLAY_PERF_TAKE(cache_us);
   DISPLAY_PERF_TAKE(fifo_busy);
   DISPLAY_PERF_TAKE(fifo_high_water);
+  DISPLAY_PERF_TAKE(fifo_slices);
+  DISPLAY_PERF_TAKE(fifo_deferred);
 #undef DISPLAY_PERF_TAKE
 #endif
 }
