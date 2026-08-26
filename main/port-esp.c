@@ -41,11 +41,23 @@
 #define FDT_END        9u
 #define LINUX_RNG_SEED_SIZE 64u
 #define HOST_UART_TX_QUEUE_SIZE (32u * 1024u)
-#define HOST_UART_TX_CHUNK_SIZE 256u
-#define HOST_UART_TX_STACK_SIZE 3072u
-#define HOST_UART_TX_PRIORITY   (configMAX_PRIORITIES - 1)
+#define HOST_UART_BITS_PER_BYTE 10u
+#define HOST_UART_TX_CHUNK_SIZE 1024u
+#define HOST_UART_TX_STACK_SIZE 4096u
+/* UART output is best-effort console traffic. Keep it below the display and
+ * network services, and feed the hardware no more than one line-rate quota per
+ * RTOS tick. This prevents a continuous ttyS0 stream from occupying CPU1. */
+#define HOST_UART_TX_PRIORITY   (tskIDLE_PRIORITY + 2u)
+#define HOST_UART_TX_TICK_BUDGET                                           \
+  (CONFIG_ESP_CONSOLE_UART_BAUDRATE /                                    \
+   (HOST_UART_BITS_PER_BYTE * CONFIG_FREERTOS_HZ))
 #define HOST_UART_DRIVER_RX_SIZE 2048u
 #define HOST_UART_DRIVER_TX_SIZE (8u * 1024u)
+
+_Static_assert(HOST_UART_TX_TICK_BUDGET > 0u,
+               "UART baud rate is too low for the FreeRTOS tick rate");
+_Static_assert(HOST_UART_TX_TICK_BUDGET <= HOST_UART_TX_CHUNK_SIZE,
+               "UART tick quota exceeds the TX worker buffer");
 
 static StaticStreamBuffer_t host_uart_tx_stream_control;
 static uint8_t host_uart_tx_stream_storage[HOST_UART_TX_QUEUE_SIZE];
@@ -275,8 +287,12 @@ static void host_uart_tx_task(void *argument)
   xTaskNotifyGive(init_waiter);
 
   for (;;) {
+    /* Do not wake CPU1 immediately for every guest newline. The producer may
+     * fill the stream continuously, but this background worker drains at most
+     * the physical UART's one-tick capacity and always yields a full tick. */
+    vTaskDelay(1);
     size_t length = xStreamBufferReceive(host_uart_tx_stream, buffer,
-                                         sizeof(buffer), portMAX_DELAY);
+                                         HOST_UART_TX_TICK_BUDGET, 0);
 
     if (length != 0u)
       host_uart_hw_write(buffer, length);
@@ -308,9 +324,11 @@ int HostConsoleInit(void)
   if (host_uart_init_result < 0)
     printf("WARNING: UART interrupt driver unavailable; using polled TX\n");
 
-  printf("UART%d bridge: %d baud, interrupt-driven RX/TX on CPU%d\n",
+  printf("UART%d bridge: %d baud, interrupt-buffered RX; "
+         "TX %u bytes/tick at priority %u on CPU%d\n",
          CONFIG_ESP_CONSOLE_UART_NUM, CONFIG_ESP_CONSOLE_UART_BAUDRATE,
-         (int)uart_core);
+         (unsigned int)HOST_UART_TX_TICK_BUDGET,
+         (unsigned int)HOST_UART_TX_PRIORITY, (int)uart_core);
   return 0;
 }
 

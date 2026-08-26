@@ -45,7 +45,9 @@ CONFIG_ESP_HOSTED_CLI_ENABLED=n
 CONFIG_ESP_HOSTED_ENABLE_PEER_DATA_TRANSFER=y
 # A missing/mismatched C6 must not reboot the P4 or interrupt Linux/display.
 CONFIG_ESP_HOSTED_TRANSPORT_RESTART_ON_FAILURE=n
-# Preserve scarce P4 internal RAM for task stacks and interrupt-time work.
+# The complete ESP-Hosted SDIO pool is allocated during early system startup.
+# Keep its payload buffers in DMA-capable PSRAM so IDF retains enough internal
+# memory to initialize the sleep clock and the remaining system services.
 CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
 
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
@@ -65,5 +67,7 @@ CONFIG_RV32_DISPLAY_PAYLOAD_BLOCK_SIZE=16384
 CONFIG_RV32_DISPLAY_PAYLOAD_BLOCK_COUNT=4
 
 # Default station used by the RV32 virtio-net bridge.
-CONFIG_RV32_WIFI_SSID="Java"
-CONFIG_RV32_WIFI_PASSWORD="baglanartik31"
+CONFIG_RV32_WIFI_SSID="SSID"
+CONFIG_RV32_WIFI_PASSWORD="12345"
+CONFIG_RV32_WIFI_LOW_LATENCY=y
+CONFIG_RV32_WIFI_HT40=y

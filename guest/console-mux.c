@@ -1,12 +1,12 @@
 /*
  * Give the framebuffer VT and emulated 16550 UART one interactive shell.
  *
- * The shell owns a pseudo-terminal.  Its output is rendered by a tty0 worker
- * first and acknowledged back to the parent before the same bytes are written
- * to ttyS0.  UART and framebuffer output therefore advance in identical
- * batches instead of UART running ahead during a large fbcon redraw.  UART
- * input remains polled while an acknowledgement is pending and is sent through
- * the PTY line discipline so editing and signals remain responsive and normal.
+ * The shell owns a pseudo-terminal. Its output is submitted to a tty0 worker
+ * before the same bytes are written to ttyS0. The acknowledgement covers the
+ * tty0 write, not a physical VSYNC: CPU1 may finish the queued display work
+ * independently while its lower-priority UART worker drains serial output on
+ * FreeRTOS ticks. UART input is sent through the PTY line discipline so
+ * editing, echo and signals remain normal.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -15,7 +15,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/fb.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -24,13 +23,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
-
-#include "display_accel_protocol.h"
 
 #define DISPLAY_BATCH_CAPACITY (8u * 1024u)
 #define DISPLAY_COALESCE_MS 2
@@ -83,57 +79,8 @@ static int make_raw_serial(int fd) {
   return tcsetattr(fd, TCSANOW, &settings);
 }
 
-static volatile uint32_t *map_display_fence(void) {
-  struct fb_fix_screeninfo fixed;
-  struct fb_var_screeninfo variable;
-  size_t visible_bytes;
-  size_t commit_offset;
-  unsigned char *mapping;
-  int framebuffer = open("/dev/fb0", O_RDWR | O_CLOEXEC);
-
-  if (framebuffer < 0 || ioctl(framebuffer, FBIOGET_FSCREENINFO, &fixed) < 0 ||
-      ioctl(framebuffer, FBIOGET_VSCREENINFO, &variable) < 0 ||
-      fixed.line_length == 0 || variable.yres > SIZE_MAX / fixed.line_length) {
-    if (framebuffer >= 0)
-      close(framebuffer);
-    return NULL;
-  }
-  visible_bytes = (size_t)fixed.line_length * variable.yres;
-  commit_offset = visible_bytes + DISPLAY_ACCEL_STAGE_SIZE +
-                  3u * sizeof(uint32_t);
-  if (commit_offset > fixed.smem_len ||
-      sizeof(uint32_t) > fixed.smem_len - commit_offset) {
-    close(framebuffer);
-    return NULL;
-  }
-
-  mapping = mmap(NULL, fixed.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED,
-                 framebuffer, 0);
-  close(framebuffer);
-  if (mapping == MAP_FAILED)
-    return NULL;
-  return (volatile uint32_t *)(mapping + commit_offset);
-}
-
-static void wait_for_physical_frame(volatile uint32_t *display_fence) {
-  uint32_t completed;
-
-  if (display_fence == NULL)
-    return;
-  completed = *display_fence;
-  *display_fence = DISPLAY_FB_COMMIT_SYNC;
-  /* Six 59 Hz periods are ample; degrade to UART instead of ever wedging the
-   * interactive shell if the native display service disappears. */
-  for (unsigned int retry = 0; retry < 100; retry++) {
-    if (*display_fence != completed)
-      return;
-    usleep(1000);
-  }
-}
-
 static pid_t start_display_worker(int display, int serial, int pipe_read,
-                                  int pipe_write, int ack_read, int ack_write,
-                                  volatile uint32_t *display_fence) {
+                                  int pipe_write, int ack_read, int ack_write) {
   pid_t child = fork();
 
   if (child != 0)
@@ -154,8 +101,7 @@ static pid_t start_display_worker(int display, int serial, int pipe_read,
     static const unsigned char rendered = 1;
 
     /* A length prefix preserves one logical tty burst even when the pipe
-     * splits a multi-kilobyte write. Each burst therefore costs one physical
-     * frame fence instead of one fence per pipe read. */
+     * splits a multi-kilobyte write. */
     if (read_all(pipe_read, &length, sizeof(length)) < 0)
       break;
     if (length == 0 || length > sizeof(buffer) ||
@@ -163,7 +109,6 @@ static pid_t start_display_worker(int display, int serial, int pipe_read,
       break;
     if (write_all(display, buffer, length) < 0)
       break;
-    wait_for_physical_frame(display_fence);
     if (write_all(ack_write, &rendered, sizeof(rendered)) < 0)
       break;
   }
@@ -373,7 +318,6 @@ int main(void) {
   int serial = open("/dev/ttyS0", O_RDWR | O_NOCTTY | O_CLOEXEC);
   int display_pipe[2];
   int display_ack[2];
-  volatile uint32_t *display_fence;
   pid_t display_worker;
 
   if (display < 0 || serial < 0) {
@@ -384,7 +328,6 @@ int main(void) {
     perror("console-mux: ttyS0");
     return 1;
   }
-  display_fence = map_display_fence();
   if (pipe2(display_pipe, O_CLOEXEC) < 0 ||
       pipe2(display_ack, O_CLOEXEC) < 0) {
     perror("console-mux: display pipe");
@@ -393,7 +336,7 @@ int main(void) {
   (void)signal(SIGPIPE, SIG_IGN);
   display_worker = start_display_worker(display, serial, display_pipe[0],
                                         display_pipe[1], display_ack[0],
-                                        display_ack[1], display_fence);
+                                        display_ack[1]);
   if (display_worker < 0) {
     perror("console-mux: display worker");
     return 1;

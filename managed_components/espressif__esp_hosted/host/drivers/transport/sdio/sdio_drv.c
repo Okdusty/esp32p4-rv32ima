@@ -239,6 +239,15 @@ static void sdio_write_task(void const* pvParameters);
 static void sdio_read_task(void const* pvParameters);
 static void sdio_process_rx_task(void const* pvParameters);
 
+/* Keep each RX consumer above its producer.  A completed SDIO read therefore
+ * wakes the unpacker immediately, and the unpacker wakes delivery before the
+ * reader can occupy both stream buffers.  Giving the reader the highest
+ * priority instead starves its own consumers under sustained traffic. */
+#define SDIO_RX_READ_TASK_PRIO    (DFLT_TASK_PRIO - 3u)
+#define SDIO_RX_UNPACK_TASK_PRIO  (DFLT_TASK_PRIO - 2u)
+#define SDIO_RX_DELIVER_TASK_PRIO (DFLT_TASK_PRIO - 1u)
+#define SDIO_TX_WRITE_TASK_PRIO   DFLT_TASK_PRIO
+
 static inline void sdio_mempool_create(int tx_q_size, int rx_q_size)
 {
 #if H_USE_MEMPOOL
@@ -1540,16 +1549,20 @@ void *bus_init_internal(void)
 	g_h.funcs->_h_get_semaphore(sem_double_buf_xfer_data, 0);
 
 	sdio_rx_buf_thread = g_h.funcs->_h_thread_create("sdio_rx_buf",
-		DFLT_TASK_PRIO, RX_BUF_TASK_STACK_SIZE, sdio_data_to_rx_buf_task, NULL);
+		SDIO_RX_UNPACK_TASK_PRIO, RX_BUF_TASK_STACK_SIZE,
+		sdio_data_to_rx_buf_task, NULL);
 
 	sdio_read_thread = g_h.funcs->_h_thread_create("sdio_read",
-		DFLT_TASK_PRIO, DFLT_TASK_STACK_SIZE, sdio_read_task, NULL);
+		SDIO_RX_READ_TASK_PRIO, DFLT_TASK_STACK_SIZE,
+		sdio_read_task, NULL);
 
 	sdio_process_rx_thread = g_h.funcs->_h_thread_create("sdio_process_rx",
-		DFLT_TASK_PRIO, DFLT_TASK_STACK_SIZE, sdio_process_rx_task, NULL);
+		SDIO_RX_DELIVER_TASK_PRIO, DFLT_TASK_STACK_SIZE,
+		sdio_process_rx_task, NULL);
 
 	sdio_write_thread = g_h.funcs->_h_thread_create("sdio_write",
-		DFLT_TASK_PRIO, DFLT_TASK_STACK_SIZE, sdio_write_task, NULL);
+		SDIO_TX_WRITE_TASK_PRIO, DFLT_TASK_STACK_SIZE,
+		sdio_write_task, NULL);
 
 	ESP_LOGD(TAG, "sdio bus init done");
 	return sdio_handle;

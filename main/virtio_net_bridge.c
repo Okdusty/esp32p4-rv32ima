@@ -61,16 +61,21 @@
 #define VIRTIO_MMIO_INT_CONFIG (1u << 1)
 
 #define VIRTIO_F_VERSION_1      32u
+#define VIRTIO_NET_F_CSUM        0u
 #define VIRTIO_NET_F_MAC         5u
 #define VIRTIO_NET_F_STATUS     16u
 #define VIRTIO_NET_S_LINK_UP     1u
 
 #define VIRTIO_STATUS_DRIVER_OK  (1u << 2)
 
+#define VIRTIO_F_RING_EVENT_IDX  29u
 #define VIRTQ_DESC_F_NEXT        1u
 #define VIRTQ_DESC_F_WRITE       2u
 #define VIRTQ_DESC_F_INDIRECT    4u
 #define VIRTQ_AVAIL_F_NO_INTERRUPT 1u
+
+#define VIRTIO_NET_HDR_F_NEEDS_CSUM 1u
+#define VIRTIO_NET_HDR_GSO_NONE     0u
 
 #define VIRTIO_NET_RX_QUEUE      0u
 #define VIRTIO_NET_TX_QUEUE      1u
@@ -78,10 +83,13 @@
 #define VIRTIO_NET_QUEUE_MAX     64u
 #define VIRTIO_NET_HEADER_SIZE   12u
 #define ETHERNET_FRAME_MAX       1600u
-#define RX_SOFTWARE_QUEUE_DEPTH  8u
+#define RX_SOFTWARE_QUEUE_DEPTH  16u
+#define VIRTIO_COMPLETION_BATCH_MAX 4u
 #define C6_RETRY_DELAY_MS        5000u
 #define WIFI_RETRY_DELAY_MS      2000u
-#define BRIDGE_TASK_PRIORITY     10u
+/* Preempt Hosted delivery as soon as one Ethernet frame is ready.  The SDIO
+ * receive pipeline climbs from priorities 20 through 22; display stays at 19. */
+#define BRIDGE_TASK_PRIORITY     23u
 
 struct virtq_desc {
 	uint64_t address;
@@ -95,6 +103,16 @@ struct virtq_used_elem {
 	uint32_t length;
 } __attribute__((packed));
 
+struct virtio_net_header {
+	uint8_t flags;
+	uint8_t gso_type;
+	uint16_t header_length;
+	uint16_t gso_size;
+	uint16_t checksum_start;
+	uint16_t checksum_offset;
+	uint16_t number_of_buffers;
+} __attribute__((packed));
+
 struct virtio_queue_state {
 	uint32_t size;
 	uint32_t ready;
@@ -106,7 +124,16 @@ struct virtio_queue_state {
 
 struct rx_packet {
 	uint16_t length;
-	uint8_t data[ETHERNET_FRAME_MAX];
+	uint8_t *data;
+	void *buffer_to_free;
+};
+
+struct virtio_completion_batch {
+	uint32_t queue_index;
+	struct virtio_queue_state queue;
+	uint16_t first_used;
+	uint16_t next_used;
+	bool active;
 };
 
 static struct virtio_queue_state queues[VIRTIO_NET_QUEUE_COUNT];
@@ -130,15 +157,10 @@ static uint32_t tx_frame_count;
 static uint32_t tx_error_count;
 static bool packet_path_reported;
 
-static struct rx_packet rx_packet_pool[RX_SOFTWARE_QUEUE_DEPTH];
 static QueueHandle_t rx_ready_queue;
-static QueueHandle_t rx_free_queue;
 static StaticQueue_t rx_ready_queue_control;
-static StaticQueue_t rx_free_queue_control;
 static uint8_t rx_ready_queue_storage[RX_SOFTWARE_QUEUE_DEPTH *
-				sizeof(struct rx_packet *)];
-static uint8_t rx_free_queue_storage[RX_SOFTWARE_QUEUE_DEPTH *
-			       sizeof(struct rx_packet *)];
+				sizeof(struct rx_packet)];
 static TaskHandle_t bridge_task_handle;
 
 static esp_err_t wifi_receive(void *buffer, uint16_t length,
@@ -222,44 +244,126 @@ static bool queue_pop_available(uint32_t index,
 	return true;
 }
 
-static void queue_complete(uint32_t index,
-			   const struct virtio_queue_state *queue,
-			   uint16_t head, uint32_t length)
+static bool feature_negotiated(uint32_t feature)
 {
-	uint16_t used_index;
-	uint16_t available_flags = 0;
+	return feature < 64u &&
+		(driver_features[feature / 32u] & (1u << (feature % 32u)));
+}
+
+static bool vring_need_event(uint16_t event_index, uint16_t new_index,
+			     uint16_t old_index)
+{
+	return (uint16_t)(new_index - event_index - 1u) <
+		(uint16_t)(new_index - old_index);
+}
+
+static bool completion_batch_add(struct virtio_completion_batch *batch,
+				 uint32_t index,
+				 const struct virtio_queue_state *queue,
+				 uint16_t head, uint32_t length)
+{
 	struct virtq_used_elem element = {
 		.id = head,
 		.length = length,
 	};
 
-	if (!guest_read(queue->used + 2u, &used_index, sizeof(used_index)))
-		return;
-	uint16_t slot = used_index % queue->size;
+	if (!batch->active) {
+		batch->queue_index = index;
+		batch->queue = *queue;
+		if (!guest_read(queue->used + 2u, &batch->first_used,
+				sizeof(batch->first_used)))
+			return false;
+		batch->next_used = batch->first_used;
+		batch->active = true;
+	} else if (batch->queue_index != index ||
+		   batch->queue.used != queue->used ||
+		   batch->queue.size != queue->size) {
+		return false;
+	}
+
+	uint16_t slot = batch->next_used % queue->size;
 	if (!guest_write(queue->used + 4u +
 			 slot * sizeof(struct virtq_used_elem),
 			 &element, sizeof(element)))
+		return false;
+	batch->next_used++;
+	return true;
+}
+
+static void completion_batch_publish(struct virtio_completion_batch *batch)
+{
+	uint16_t available_flags = 0;
+	bool interrupt_guest = false;
+
+	if (!batch->active || batch->first_used == batch->next_used)
 		return;
+
 	__atomic_thread_fence(__ATOMIC_RELEASE);
-	used_index++;
-	if (!guest_write(queue->used + 2u, &used_index, sizeof(used_index)))
+	if (!guest_write(batch->queue.used + 2u, &batch->next_used,
+			sizeof(batch->next_used)))
 		return;
 	__atomic_thread_fence(__ATOMIC_RELEASE);
 
-	guest_read(queue->avail, &available_flags, sizeof(available_flags));
-	if (!(available_flags & VIRTQ_AVAIL_F_NO_INTERRUPT))
+	if (feature_negotiated(VIRTIO_F_RING_EVENT_IDX)) {
+		uint16_t used_event = 0;
+		uint64_t used_event_address = batch->queue.avail + 4u +
+			batch->queue.size * sizeof(uint16_t);
+
+		if (guest_read(used_event_address, &used_event,
+			       sizeof(used_event)))
+			interrupt_guest = vring_need_event(used_event,
+				batch->next_used, batch->first_used);
+	} else if (guest_read(batch->queue.avail, &available_flags,
+			      sizeof(available_flags))) {
+		interrupt_guest =
+			!(available_flags & VIRTQ_AVAIL_F_NO_INTERRUPT);
+	}
+
+	if (interrupt_guest)
 		__atomic_fetch_or(&interrupt_status, VIRTIO_MMIO_INT_VRING,
 				  __ATOMIC_RELEASE);
 }
 
+static bool completion_batch_full(const struct virtio_completion_batch *batch)
+{
+	return batch->active &&
+		(uint16_t)(batch->next_used - batch->first_used) >=
+		VIRTIO_COMPLETION_BATCH_MAX;
+}
+
+static bool queue_rearm_and_has_available(uint32_t index)
+{
+	struct virtio_queue_state queue;
+	uint16_t available_index;
+	uint16_t requested_index;
+
+	if (!feature_negotiated(VIRTIO_F_RING_EVENT_IDX) ||
+	    !queue_snapshot(index, &queue))
+		return false;
+
+	requested_index = queues[index].last_avail;
+	if (!guest_write(queue.used + 4u +
+			 queue.size * sizeof(struct virtq_used_elem),
+			 &requested_index, sizeof(requested_index)))
+		return false;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (!guest_read(queue.avail + 2u, &available_index,
+			sizeof(available_index)))
+		return false;
+	return available_index != requested_index;
+}
+
 static bool descriptor_copy_out(const struct virtio_queue_state *queue,
 				uint16_t head, uint8_t *packet,
-				size_t *packet_length)
+				size_t *packet_length,
+				struct virtio_net_header *header)
 {
 	struct virtq_desc descriptor;
 	size_t total = 0;
 	size_t skipped = 0;
 	uint16_t index = head;
+
+	memset(header, 0, sizeof(*header));
 
 	for (uint32_t walked = 0; walked < queue->size; walked++) {
 		if (!queue_read_desc(queue, index, &descriptor) ||
@@ -272,6 +376,9 @@ static bool descriptor_copy_out(const struct virtio_queue_state *queue,
 		if (skipped < VIRTIO_NET_HEADER_SIZE) {
 			size_t need = VIRTIO_NET_HEADER_SIZE - skipped;
 			offset = descriptor.length < need ? descriptor.length : need;
+			if (!guest_read(descriptor.address,
+					(uint8_t *)header + skipped, offset))
+				return false;
 			skipped += offset;
 		}
 		if (descriptor.length > offset) {
@@ -293,6 +400,36 @@ static bool descriptor_copy_out(const struct virtio_queue_state *queue,
 		index = descriptor.next;
 	}
 	return false;
+}
+
+static bool complete_partial_checksum(uint8_t *packet, size_t packet_length,
+				      const struct virtio_net_header *header)
+{
+	size_t start = header->checksum_start;
+	size_t checksum_at = start + header->checksum_offset;
+	uint32_t sum = 0;
+
+	if (!(header->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM))
+		return true;
+	if (!feature_negotiated(VIRTIO_NET_F_CSUM) ||
+	    header->gso_type != VIRTIO_NET_HDR_GSO_NONE ||
+	    start >= packet_length || checksum_at > packet_length - 2u)
+		return false;
+
+	/* Linux leaves the pseudo-header checksum in the checksum field.  Sum the
+	 * network-order words from csum_start through the payload, including that
+	 * seed, then replace the field with the folded one's complement. */
+	for (size_t offset = start; offset + 1u < packet_length; offset += 2u)
+		sum += ((uint32_t)packet[offset] << 8) | packet[offset + 1u];
+	if ((packet_length - start) & 1u)
+		sum += (uint32_t)packet[packet_length - 1u] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffffu) + (sum >> 16);
+
+	uint16_t checksum = (uint16_t)~sum;
+	packet[checksum_at] = (uint8_t)(checksum >> 8);
+	packet[checksum_at + 1u] = (uint8_t)checksum;
+	return true;
 }
 
 static bool descriptor_copy_in(const struct virtio_queue_state *queue,
@@ -346,28 +483,36 @@ static bool descriptor_copy_in(const struct virtio_queue_state *queue,
 	return false;
 }
 
-static bool process_one_tx(void)
+static bool process_one_tx(struct virtio_completion_batch *batch)
 {
 	struct virtio_queue_state queue;
+	struct virtio_net_header header;
 	uint16_t head;
 	uint8_t packet[ETHERNET_FRAME_MAX];
 	size_t packet_length = 0;
+	bool packet_valid;
 
 	if (!queue_pop_available(VIRTIO_NET_TX_QUEUE, &queue, &head))
 		return false;
-	if (descriptor_copy_out(&queue, head, packet, &packet_length) &&
+	packet_valid = descriptor_copy_out(&queue, head, packet, &packet_length,
+				   &header) &&
+		complete_partial_checksum(packet, packet_length, &header);
+	if (packet_valid &&
 	    __atomic_load_n(&station_connected, __ATOMIC_ACQUIRE)) {
 		if (esp_wifi_internal_tx(WIFI_IF_STA, packet, packet_length) ==
 		    ESP_OK)
 			__atomic_add_fetch(&tx_frame_count, 1u, __ATOMIC_RELAXED);
 		else
 			__atomic_add_fetch(&tx_error_count, 1u, __ATOMIC_RELAXED);
+	} else if (!packet_valid) {
+		__atomic_add_fetch(&tx_error_count, 1u, __ATOMIC_RELAXED);
 	}
-	queue_complete(VIRTIO_NET_TX_QUEUE, &queue, head, 0);
+	completion_batch_add(batch, VIRTIO_NET_TX_QUEUE, &queue, head, 0);
 	return true;
 }
 
-static bool process_one_rx(const struct rx_packet *packet)
+static bool process_one_rx(const struct rx_packet *packet,
+			   struct virtio_completion_batch *batch)
 {
 	struct virtio_queue_state queue;
 	uint16_t head;
@@ -378,7 +523,8 @@ static bool process_one_rx(const struct rx_packet *packet)
 	if (!descriptor_copy_in(&queue, head, packet->data, packet->length,
 				&used_length))
 		used_length = 0;
-	queue_complete(VIRTIO_NET_RX_QUEUE, &queue, head, used_length);
+	completion_batch_add(batch, VIRTIO_NET_RX_QUEUE, &queue, head,
+			     used_length);
 	return true;
 }
 
@@ -506,27 +652,28 @@ static void process_wifi_event(void)
 static esp_err_t wifi_receive(void *buffer, uint16_t length,
 			      void *buffer_to_free)
 {
-	struct rx_packet *packet = NULL;
+	struct rx_packet packet = {
+		.length = length,
+		.data = buffer,
+		.buffer_to_free = buffer_to_free,
+	};
 	esp_err_t result = ESP_OK;
 
 	if (length < 14u || length > ETHERNET_FRAME_MAX ||
-	    rx_ready_queue == NULL || rx_free_queue == NULL) {
+	    buffer == NULL || buffer_to_free == NULL || rx_ready_queue == NULL) {
 		result = ESP_ERR_INVALID_SIZE;
-	} else if (xQueueReceive(rx_free_queue, &packet, 0) != pdTRUE) {
+	} else if (xQueueSend(rx_ready_queue, &packet, 0) != pdTRUE) {
 		__atomic_add_fetch(&rx_drop_count, 1u, __ATOMIC_RELAXED);
 		result = ESP_ERR_NO_MEM;
 	} else {
-		packet->length = length;
-		memcpy(packet->data, buffer, length);
-		if (xQueueSend(rx_ready_queue, &packet, 0) != pdTRUE) {
-			xQueueSend(rx_free_queue, &packet, 0);
-			__atomic_add_fetch(&rx_drop_count, 1u, __ATOMIC_RELAXED);
-			result = ESP_ERR_NO_MEM;
-		} else if (bridge_task_handle) {
-			__atomic_add_fetch(&rx_frame_count, 1u, __ATOMIC_RELAXED);
+		/* Ownership of ESP-Hosted's packet allocation remains with the
+		 * bridge until it has copied directly into Linux's virtqueue. */
+		__atomic_add_fetch(&rx_frame_count, 1u, __ATOMIC_RELAXED);
+		if (bridge_task_handle)
 			xTaskNotifyGive(bridge_task_handle);
-		}
+		return ESP_OK;
 	}
+
 	esp_wifi_internal_free_rx_buffer(buffer_to_free);
 	return result;
 }
@@ -583,6 +730,24 @@ static bool initialize_c6(void)
 	if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK)
 		return false;
 
+#if CONFIG_RV32_WIFI_LOW_LATENCY
+	error = esp_wifi_set_ps(WIFI_PS_NONE);
+	if (error != ESP_OK)
+		ESP_LOGW(TAG, "could not disable C6 modem power saving: %s",
+			 esp_err_to_name(error));
+	else
+		ESP_LOGI(TAG, "C6 modem power saving disabled");
+#endif
+
+#if CONFIG_RV32_WIFI_HT40
+	error = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW40);
+	if (error != ESP_OK)
+		ESP_LOGW(TAG, "could not enable C6 HT40 bandwidth: %s",
+			 esp_err_to_name(error));
+	else
+		ESP_LOGI(TAG, "C6 HT40 bandwidth enabled when supported by AP");
+#endif
+
 	if (CONFIG_RV32_WIFI_SSID[0] != '\0') {
 		strncpy((char *)wifi_config.sta.ssid, CONFIG_RV32_WIFI_SSID,
 			sizeof(wifi_config.sta.ssid) - 1u);
@@ -611,14 +776,28 @@ static bool initialize_c6(void)
 static void bridge_task(void *argument)
 {
 	(void)argument;
+	bridge_task_handle = xTaskGetCurrentTaskHandle();
 	bool c6_ready = initialize_c6();
-	struct rx_packet *pending_rx = NULL;
+	struct rx_packet pending_rx;
+	bool pending_rx_valid = false;
 
 	if (!c6_ready)
 		ESP_LOGE(TAG, "wireless link unavailable; Linux eth0 remains down");
 
 	for (;;) {
-		ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+		TickType_t wait_ticks = portMAX_DELAY;
+
+		if (c6_ready &&
+		    __atomic_load_n(&wifi_connect_pending, __ATOMIC_ACQUIRE)) {
+			TickType_t now = xTaskGetTickCount();
+			TickType_t due = __atomic_load_n(&wifi_connect_due,
+						       __ATOMIC_RELAXED);
+
+			wait_ticks = (int32_t)(due - now) > 0 ? due - now : 0;
+		}
+		/* Packet RX, guest queue kicks and link events notify this task
+		 * directly.  Only a delayed association retry uses a tick timeout. */
+		ulTaskNotifyTake(pdTRUE, wait_ticks);
 		process_hosted_event();
 		process_wifi_event();
 
@@ -646,20 +825,43 @@ static void bridge_task(void *argument)
 		      VIRTIO_STATUS_DRIVER_OK))
 			continue;
 
-		while (process_one_tx())
-			;
+		do {
+			struct virtio_completion_batch tx_batch = { 0 };
 
-		for (;;) {
-			if (pending_rx == NULL) {
-				if (xQueueReceive(rx_ready_queue, &pending_rx, 0) !=
-				    pdTRUE)
-					break;
+			while (process_one_tx(&tx_batch)) {
+				if (completion_batch_full(&tx_batch)) {
+					completion_batch_publish(&tx_batch);
+					memset(&tx_batch, 0, sizeof(tx_batch));
+				}
 			}
-			if (!process_one_rx(pending_rx))
-				break;
-			xQueueSend(rx_free_queue, &pending_rx, 0);
-			pending_rx = NULL;
-		}
+			completion_batch_publish(&tx_batch);
+		} while (queue_rearm_and_has_available(VIRTIO_NET_TX_QUEUE));
+
+		bool rx_buffers_added;
+		do {
+			struct virtio_completion_batch rx_batch = { 0 };
+
+			for (;;) {
+				if (!pending_rx_valid) {
+					if (xQueueReceive(rx_ready_queue, &pending_rx,
+							  0) != pdTRUE)
+						break;
+					pending_rx_valid = true;
+				}
+				if (!process_one_rx(&pending_rx, &rx_batch))
+					break;
+				esp_wifi_internal_free_rx_buffer(
+					pending_rx.buffer_to_free);
+				pending_rx_valid = false;
+				if (completion_batch_full(&rx_batch)) {
+					completion_batch_publish(&rx_batch);
+					memset(&rx_batch, 0, sizeof(rx_batch));
+				}
+			}
+			completion_batch_publish(&rx_batch);
+			rx_buffers_added = queue_rearm_and_has_available(
+				VIRTIO_NET_RX_QUEUE);
+		} while (pending_rx_valid && rx_buffers_added);
 
 		if (!packet_path_reported &&
 		    (__atomic_load_n(&rx_frame_count, __ATOMIC_RELAXED) != 0u ||
@@ -684,20 +886,11 @@ int virtio_net_bridge_init(void)
 
 	memset(queues, 0, sizeof(queues));
 	rx_ready_queue = xQueueCreateStatic(RX_SOFTWARE_QUEUE_DEPTH,
-					    sizeof(struct rx_packet *),
+					    sizeof(struct rx_packet),
 					    rx_ready_queue_storage,
 					    &rx_ready_queue_control);
-	rx_free_queue = xQueueCreateStatic(RX_SOFTWARE_QUEUE_DEPTH,
-					   sizeof(struct rx_packet *),
-					   rx_free_queue_storage,
-					   &rx_free_queue_control);
-	if (rx_ready_queue == NULL || rx_free_queue == NULL)
+	if (rx_ready_queue == NULL)
 		return -1;
-	for (size_t i = 0; i < RX_SOFTWARE_QUEUE_DEPTH; i++) {
-		struct rx_packet *packet = &rx_packet_pool[i];
-		if (xQueueSend(rx_free_queue, &packet, 0) != pdTRUE)
-			return -1;
-	}
 
 	error = esp_event_loop_create_default();
 	if (error != ESP_OK && error != ESP_ERR_INVALID_STATE)
@@ -756,8 +949,10 @@ uint32_t virtio_net_bridge_load(uint32_t address, size_t width)
 	case VIRTIO_MMIO_VENDOR_ID: return 0x505345u; /* "ESP" */
 	case VIRTIO_MMIO_DEVICE_FEATURES:
 		if (device_features_sel == 0)
-			return (1u << VIRTIO_NET_F_MAC) |
-			       (1u << VIRTIO_NET_F_STATUS);
+			return (1u << VIRTIO_NET_F_CSUM) |
+			       (1u << VIRTIO_NET_F_MAC) |
+			       (1u << VIRTIO_NET_F_STATUS) |
+			       (1u << VIRTIO_F_RING_EVENT_IDX);
 		if (device_features_sel == 1)
 			return 1u << (VIRTIO_F_VERSION_1 - 32u);
 		return 0;

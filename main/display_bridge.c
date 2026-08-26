@@ -30,12 +30,10 @@
  * CPU1 service merges wide regions and cleans sparse glyph rows independently.
  */
 #define LCD_TASK_STACK_SIZE 6144u
-/*
- * ESP-Hosted creates its SDIO workers at priority 23.  Keep the short,
- * event-driven cache-clean task above them so a broken or disconnected C6
- * cannot freeze an otherwise healthy framebuffer.
- */
-#define LCD_TASK_PRIORITY (configMAX_PRIORITIES - 1)
+/* SDIO and virtio use priorities 20..23 on CPU1.  Keep display work below
+ * that event-driven packet path: framebuffer cache cleans can be long, while
+ * disconnected SDIO workers block and therefore do not starve this task. */
+#define LCD_TASK_PRIORITY 19u
 #define LCD_NOTIFY_VSYNC (1u << 0)
 #define LCD_NOTIFY_PV_COMMAND (1u << 1)
 
@@ -473,6 +471,12 @@ static bool display_rect_valid(uint32_t x, uint32_t y, uint32_t width,
 static bool display_ppa_fill_rect(uint32_t x, uint32_t y, uint32_t width,
                                   uint32_t height, uint16_t color) {
   esp_err_t err;
+  const color_pixel_argb8888_data_t fill_color = {
+      .a = 0xff,
+      .r = (uint8_t)(((color >> 11) & 0x1fu) * 255u / 31u),
+      .g = (uint8_t)(((color >> 5) & 0x3fu) * 255u / 63u),
+      .b = (uint8_t)((color & 0x1fu) * 255u / 31u),
+  };
 #if CONFIG_RV32_HOST_PERF_STATS
   int64_t started;
 #endif
@@ -490,10 +494,13 @@ static bool display_ppa_fill_rect(uint32_t x, uint32_t y, uint32_t width,
               .block_offset_x = x,
               .block_offset_y = y,
               .fill_cm = PPA_FILL_COLOR_MODE_RGB565,
-          },
+      },
       .fill_block_w = width,
       .fill_block_h = height,
-      .fill_color_val = color,
+      /* The PPA fill interface accepts component-wise ARGB8888 here and
+       * converts it to the selected RGB565 output format.  A packed RGB565
+       * value would instead be interpreted as its low B/G bytes. */
+      .fill_argb_color = fill_color,
       .mode = PPA_TRANS_MODE_BLOCKING,
   };
 
