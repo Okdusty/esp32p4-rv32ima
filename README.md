@@ -2,10 +2,6 @@
 
 Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on [CNLohr's mini-rv32ima](https://github.com/cnlohr/mini-rv32ima). The ESP32-P4 is currently the only tested target.
 
-## Why
-
-- Just for fun.
-
 ## What changed from Epiczhul's + CNLohr's
 
 - Work is split between both ESP32-P4 CPU cores. The Linux guest is still single-core, but display, UART, and network work can run separately from the emulator.
@@ -32,7 +28,7 @@ Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on
 
   This work was inspired by [mini-rv32ima-mmu](https://github.com/cmdada/mini-rv32ima-mmu/blob/main/mini-rv32ima.h) and then adapted for this project.
 
-- Common Linux memory accesses go straight to guest RAM instead of repeating a full page-table lookup. Small caches handle the remaining lookups.
+- Common Linux memory accesses go straight to guest RAM instead of repeating a full page-table lookup. Small caches handle the remaining lookups. Later cache and instruction-fetch changes also reduce repeated address checks and unnecessary invalidation work.
 
   ```text
   Common path: guest address -> direct RAM offset -> PSRAM
@@ -40,8 +36,8 @@ Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on
   ```
 
 - WFI handling was fixed. When Linux executes WFI, the emulator pauses guest instructions until an interrupt arrives.
-- An asynchronous ST7703 framebuffer backend was added. Linux uses it as `fb0` and `tty0`, while CPU1 updates the physical display.
-- ESP32-C6 wireless support is provided through a virtual `eth0` device. Linux does not see a normal Wi-Fi interface, so the ESP32-P4 side manages the Wi-Fi connection.
+- An asynchronous ST7703 framebuffer backend was added. Linux uses it as `fb0` and `tty0`, while CPU1 updates the physical display. Console fills, copies, scrolling, glyphs, and cursor changes can use a bounded command FIFO instead of repeatedly repainting the full framebuffer. This significantly improves console rendering while keeping the interface usable by other guest images.
+- ESP32-C6 wireless support is provided through a virtual `eth0` device. Linux does not see a normal Wi-Fi interface, so the ESP32-P4 side manages the Wi-Fi connection. The four-bit SDIO and virtio path now avoids an extra packet copy, batches completion updates, and uses an ordered CPU1 task pipeline. Wi-Fi power saving can be disabled for lower latency, and HT40 can be negotiated with compatible access points.
 - Flash mode was changed from DIO to QIO. If flashing or booting is unreliable on another board, check this setting.
 - Dropbear SSH is included, and the ESP32-P4 gives Linux fresh random data during startup. Connect with the IP address assigned to `eth0`.
 - The OpenWrt RV32IMA root filesystem includes BusyBox, curl, APK, and Dropbear.
@@ -108,6 +104,15 @@ For custom images, use `make guest*` and `scripts/verify-guest-image.py`. Memory
   ```sh
   idf.py menuconfig
   ```
+
+  The low-latency and HT40 options are enabled by default when the bridge is enabled:
+
+  ```text
+  CONFIG_RV32_WIFI_LOW_LATENCY=y
+  CONFIG_RV32_WIFI_HT40=y
+  ```
+
+  Low-latency mode uses more power. HT40 automatically falls back when the access point or channel does not support it.
 
 - For the Waveshare ESP32-P4-WIFI6-Touch-LCD-4B display, enable:
 

@@ -141,4 +141,22 @@ config RV32_WIFI_PASSWORD
 	help
 	  WPA/WPA2/WPA3 passphrase used by the C6 station interface.
 
+config RV32_WIFI_LOW_LATENCY
+	bool "Disable C6 Wi-Fi modem power saving"
+	depends on RV32_WIFI_BRIDGE
+	default y
+	help
+	  Keep the C6 radio awake while associated. This reduces packet batching
+	  and latency and usually improves sustained receive throughput, at the
+	  cost of increased power consumption.
+
+config RV32_WIFI_HT40
+	bool "Allow 40 MHz 802.11n channel bandwidth"
+	depends on RV32_WIFI_BRIDGE
+	default y
+	help
+	  Allow the C6 to negotiate HT40 with a compatible access point. The
+	  connection automatically remains at 20 MHz when the access point or
+	  surrounding channel conditions do not permit HT40.
+
 endmenu
