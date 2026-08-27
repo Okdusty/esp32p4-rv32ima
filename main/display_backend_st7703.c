@@ -46,7 +46,7 @@ static bool IRAM_ATTR display_backend_vsync(
 
   if (backend_vsync_callback == NULL)
     return false;
-  return backend_vsync_callback(backend_vsync_context);
+  return backend_vsync_callback(backend_vsync_context, true);
 }
 
 static esp_err_t display_backend_enable_power(void) {
@@ -199,4 +199,9 @@ esp_err_t display_backend_start(void) {
   if (panel == NULL)
     return ESP_ERR_INVALID_STATE;
   return esp_lcd_panel_disp_on_off(panel, true);
+}
+
+esp_err_t display_backend_present(bool frame_changed) {
+  (void)frame_changed;
+  return ESP_OK;
 }

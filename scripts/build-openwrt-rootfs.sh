@@ -8,6 +8,44 @@ openwrt_dir=${OPENWRT_DIR:-"$work_root/openwrt"}
 openwrt_url=${OPENWRT_URL:-https://github.com/openwrt/openwrt.git}
 openwrt_revision=${OPENWRT_REVISION:-f0a60eee2fe051741c643ea6118718aae1ef17fb}
 jobs=${JOBS:-$(nproc)}
+sdkconfig_file=${SDKCONFIG:-"$repo_root/sdkconfig"}
+
+# Menuconfig owns the defaults, while environment overrides make automated
+# guest-image comparisons possible without editing any tracked file.
+guest_console=${RV32_GUEST_CONSOLE_MODE:-}
+if [[ -z $guest_console ]]; then
+  if [[ -f $sdkconfig_file ]] &&
+      grep -q '^CONFIG_RV32_GUEST_CONSOLE_MUX=y$' "$sdkconfig_file"; then
+    guest_console=console-mux
+  else
+    guest_console=display-shell
+  fi
+fi
+case "$guest_console" in
+  display-shell|console-mux) ;;
+  *)
+    echo "error: RV32_GUEST_CONSOLE_MODE must be display-shell or console-mux" >&2
+    exit 1
+    ;;
+esac
+
+guest_dropbear=${RV32_GUEST_DROPBEAR:-}
+if [[ -z $guest_dropbear ]]; then
+  if [[ ! -f $sdkconfig_file ]] ||
+      grep -q '^CONFIG_RV32_GUEST_DROPBEAR=y$' "$sdkconfig_file"; then
+    guest_dropbear=1
+  else
+    guest_dropbear=0
+  fi
+fi
+case "$guest_dropbear" in
+  1|y|yes|true) guest_dropbear=1 ;;
+  0|n|no|false) guest_dropbear=0 ;;
+  *)
+    echo "error: RV32_GUEST_DROPBEAR must be 0 or 1" >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "$work_root" "$output_root"
 
@@ -32,6 +70,9 @@ fi
 
 cp -a "$repo_root/guest/openwrt/overlay/." "$openwrt_dir/"
 cp -a "$repo_root/guest/openwrt/files/." "$openwrt_dir/files/"
+install -d -m 0755 "$openwrt_dir/files/etc"
+printf '%s\n' "$guest_console" >"$openwrt_dir/files/etc/rv32-console"
+printf '%s\n' "$guest_dropbear" >"$openwrt_dir/files/etc/rv32-dropbear"
 
 if [[ -n ${DROPBEAR_HOST_KEY:-} ]]; then
   install -D -m 0600 "$DROPBEAR_HOST_KEY" \
@@ -80,6 +121,14 @@ env STAGING_DIR="$openwrt_dir/staging_dir" \
 	-fno-caller-saves -fno-plt -fhonour-copts \
 	-Wformat -Werror=format-security -fstack-protector-strong \
 	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
+	"$repo_root/guest/display-shell.c" \
+	-o "$openwrt_dir/files/usr/sbin/display-shell"
+
+env STAGING_DIR="$openwrt_dir/staging_dir" \
+	"$cross_gcc" -Os -pipe -mabi=ilp32 -march=rv32ima \
+	-fno-caller-saves -fno-plt -fhonour-copts \
+	-Wformat -Werror=format-security -fstack-protector-strong \
+	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
 	-I"$repo_root/main" \
 	"$repo_root/guest/fbstream.c" \
 	-o "$openwrt_dir/files/usr/bin/fbstream"
@@ -118,3 +167,5 @@ mv "$rootfs_archive" "$output_root/openwrt-rootfs-rv32.tar.gz"
 
 echo "OpenWrt rootfs: $output_root/rootfs"
 echo "Cross prefix:    $cross_prefix"
+echo "Console:         $guest_console"
+echo "Dropbear:        $([[ $guest_dropbear == 1 ]] && echo enabled || echo disabled)"

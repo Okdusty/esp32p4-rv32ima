@@ -9,6 +9,16 @@ config RV32_GUEST_RAM_PREFETCH
 	  its benefit is workload dependent. Disable it when comparing cache or
 	  interpreter changes.
 
+config RV32_DECODED_BLOCK_CACHE
+	bool "Enable experimental decoded RV32 block cache"
+	default n
+	help
+	  Build an internal-RAM, direct-threaded cache with predecoded register
+	  fields and immediates. FENCE.I invalidates the cache for self-modifying
+	  code. This is retained for emulator experiments, but is slower than the
+	  normal ESP32-P4 path because guest instruction fetches already benefit
+	  from the hardware cache. Leave it disabled for production builds.
+
 config RV32_EMULATOR_PERF_STATS
 	bool "Enable RV32 emulator performance counters"
 	default n
@@ -31,9 +41,10 @@ config RV32_HOST_PERF_STATS
 	select FREERTOS_GENERATE_RUN_TIME_STATS
 	help
 	  Report CPU0/CPU1 busy time, guest instruction rate, display work,
-	  cache-clean traffic, and PPA use every five seconds. This has much less
-	  overhead than the per-instruction emulator counters, but should still be
-	  disabled in normal builds after profiling is complete.
+	  cache-clean traffic, PPA use, and per-operation display cycle costs every
+	  five seconds. This has much less overhead than the per-instruction emulator
+	  counters, but should still be disabled in normal builds after profiling is
+	  complete.
 
 endmenu
 
@@ -46,13 +57,42 @@ config RV32_DISPLAY_ACCEL
 	  transport. Display backends select this when they provide a packed RGB565
 	  scanout surface and a CPU1 service task.
 
+choice RV32_DISPLAY_BACKEND
+	prompt "Display backend"
+	default RV32_ST7703_DISPLAY
+	help
+	  Select one physical display. Linux and the accelerated console continue
+	  to use the same backend-neutral RGB565 surface and command transport.
+
 config RV32_ST7703_DISPLAY
 	bool "Enable Waveshare 720x720 ST7703 display bridge"
-	default y
 	select RV32_DISPLAY_ACCEL
 	help
 	  Initialize the onboard MIPI-DSI ST7703 panel and expose its RGB565
 	  framebuffer to the RV32 guest as a simple-framebuffer device.
+
+config RV32_ST7789_DISPLAY
+	bool "Enable ST7789 240x240 SPI display bridge"
+	select RV32_DISPLAY_ACCEL
+	help
+	  Render the Linux framebuffer and accelerated console on an external
+	  240x240 ST7789 SPI panel. CPU1 transfers changed RGB565 frames directly
+	  from PSRAM through SPI DMA.
+
+config RV32_SSD1306_DISPLAY
+	bool "Enable SSD1306 128x32/128x64 I2C display bridge"
+	select RV32_DISPLAY_ACCEL
+	help
+	  Render the accelerated Linux console to an external monochrome SSD1306
+	  OLED. The RGB565 virtual surface is converted to the controller's 1-bit
+	  page format on CPU1 and transferred only when its contents change.
+
+config RV32_DISPLAY_NONE
+	bool "Headless (UART/SSH only)"
+	help
+	  Do not initialize a physical display or expose framebuffer MMIO to Linux.
+
+endchoice
 
 config RV32_ST7703_REFRESH_HZ
 	int "ST7703 target refresh rate (Hz)"
@@ -63,6 +103,208 @@ config RV32_ST7703_REFRESH_HZ
 	  Target panel refresh rate. The display bridge derives the MIPI-DPI
 	  pixel clock from this value and the Waveshare 720x720 porch timings.
 	  59 Hz is close to the panel vendor configuration's 59.22 Hz.
+
+choice RV32_ST7789_SPI_HOST
+	prompt "ST7789 SPI controller"
+	depends on RV32_ST7789_DISPLAY
+	default RV32_ST7789_SPI2
+
+config RV32_ST7789_SPI2
+	bool "SPI2"
+
+config RV32_ST7789_SPI3
+	bool "SPI3"
+
+endchoice
+
+config RV32_ST7789_SPI_CLOCK_HZ
+	int "ST7789 SPI clock (Hz)"
+	depends on RV32_ST7789_DISPLAY
+	range 1000000 80000000
+	default 40000000
+	help
+	  Pixel-data clock. 40 MHz is a practical default for short wiring. Lower
+	  it if the panel shows corruption or the external wiring is long.
+
+config RV32_ST7789_SPI_MODE
+	int "ST7789 SPI mode"
+	depends on RV32_ST7789_DISPLAY
+	range 0 3
+	default 0
+
+config RV32_ST7789_SCLK_GPIO
+	int "ST7789 SCLK GPIO"
+	depends on RV32_ST7789_DISPLAY
+	range 0 54
+	default 2
+
+config RV32_ST7789_MOSI_GPIO
+	int "ST7789 MOSI GPIO"
+	depends on RV32_ST7789_DISPLAY
+	range 0 54
+	default 3
+
+config RV32_ST7789_CS_GPIO
+	int "ST7789 chip-select GPIO (-1 for hardwired select)"
+	depends on RV32_ST7789_DISPLAY
+	range -1 54
+	default 4
+
+config RV32_ST7789_DC_GPIO
+	int "ST7789 data/command GPIO"
+	depends on RV32_ST7789_DISPLAY
+	range 0 54
+	default 5
+
+config RV32_ST7789_RESET_GPIO
+	int "ST7789 reset GPIO (-1 for none)"
+	depends on RV32_ST7789_DISPLAY
+	range -1 54
+	default 6
+
+config RV32_ST7789_BACKLIGHT_GPIO
+	int "ST7789 backlight GPIO (-1 for always on)"
+	depends on RV32_ST7789_DISPLAY
+	range -1 54
+	default 7
+
+config RV32_ST7789_BACKLIGHT_ACTIVE_HIGH
+	bool "ST7789 backlight is active high"
+	depends on RV32_ST7789_DISPLAY
+	default y
+
+config RV32_ST7789_X_GAP
+	int "ST7789 column offset"
+	depends on RV32_ST7789_DISPLAY
+	range 0 320
+	default 0
+	help
+	  Controller RAM column offset for modules whose visible 240x240 window
+	  does not start at coordinate zero.
+
+config RV32_ST7789_Y_GAP
+	int "ST7789 row offset"
+	depends on RV32_ST7789_DISPLAY
+	range 0 320
+	default 0
+	help
+	  Controller RAM row offset. Some 240x240 modules require 80 here.
+
+config RV32_ST7789_BGR
+	bool "ST7789 uses BGR element order"
+	depends on RV32_ST7789_DISPLAY
+	default n
+
+config RV32_ST7789_INVERT_COLORS
+	bool "Enable ST7789 color inversion"
+	depends on RV32_ST7789_DISPLAY
+	default y
+
+config RV32_ST7789_SWAP_XY
+	bool "Swap ST7789 X and Y axes"
+	depends on RV32_ST7789_DISPLAY
+	default n
+
+config RV32_ST7789_MIRROR_X
+	bool "Mirror ST7789 X axis"
+	depends on RV32_ST7789_DISPLAY
+	default n
+
+config RV32_ST7789_MIRROR_Y
+	bool "Mirror ST7789 Y axis"
+	depends on RV32_ST7789_DISPLAY
+	default n
+
+config RV32_ST7789_REFRESH_HZ
+	int "ST7789 maximum frame-transfer rate (Hz)"
+	depends on RV32_ST7789_DISPLAY
+	range 1 60
+	default 30
+	help
+	  Maximum rate for transferring changed frames. Idle frames are skipped.
+	  The practical limit also depends on the selected SPI clock.
+
+config RV32_ST7789_STARTUP_TEST_PATTERN
+	bool "Show ST7789 RGB565 qualification pattern during startup"
+	depends on RV32_ST7789_DISPLAY
+	default y
+	help
+	  Show red, green, blue and white vertical bars briefly before Linux starts.
+	  The backend also verifies its GPIO pads and waits for SPI DMA completion.
+	  If the serial diagnostics pass but this pattern is not visible, investigate
+	  panel power, wiring, panel compatibility or a defective display. Disable
+	  this option after the hardware has been qualified.
+
+choice RV32_SSD1306_GEOMETRY
+	prompt "SSD1306 geometry"
+	depends on RV32_SSD1306_DISPLAY
+	default RV32_SSD1306_128X64
+
+config RV32_SSD1306_128X32
+	bool "128x32"
+
+config RV32_SSD1306_128X64
+	bool "128x64"
+
+endchoice
+
+config RV32_SSD1306_I2C_PORT
+	int "SSD1306 I2C controller"
+	depends on RV32_SSD1306_DISPLAY
+	range 0 1
+	default 0
+	help
+	  ESP32-P4 high-power I2C controller used by the OLED.
+
+config RV32_SSD1306_SDA_GPIO
+	int "SSD1306 SDA GPIO"
+	depends on RV32_SSD1306_DISPLAY
+	range 0 54
+	default 7
+
+config RV32_SSD1306_SCL_GPIO
+	int "SSD1306 SCL GPIO"
+	depends on RV32_SSD1306_DISPLAY
+	range 0 54
+	default 8
+
+config RV32_SSD1306_RESET_GPIO
+	int "SSD1306 reset GPIO (-1 for none)"
+	depends on RV32_SSD1306_DISPLAY
+	range -1 54
+	default -1
+
+config RV32_SSD1306_I2C_ADDRESS
+	hex "SSD1306 7-bit I2C address"
+	depends on RV32_SSD1306_DISPLAY
+	range 0x08 0x77
+	default 0x3c
+
+config RV32_SSD1306_I2C_CLOCK_HZ
+	int "SSD1306 I2C clock (Hz)"
+	depends on RV32_SSD1306_DISPLAY
+	range 10000 1000000
+	default 400000
+	help
+	  Most SSD1306 modules support 400 kHz. Use suitable external pull-ups at
+	  higher bus speeds.
+
+config RV32_SSD1306_INTERNAL_PULLUPS
+	bool "Enable internal I2C pull-ups"
+	depends on RV32_SSD1306_DISPLAY
+	default y
+	help
+	  Useful for short prototype wiring. External pull-ups are still preferred
+	  for a reliable 400 kHz bus.
+
+config RV32_SSD1306_REFRESH_HZ
+	int "SSD1306 maximum refresh rate (Hz)"
+	depends on RV32_SSD1306_DISPLAY
+	range 1 60
+	default 30
+	help
+	  Maximum rate at which CPU1 checks and transfers completed frames. Equal
+	  frames are skipped, so an idle display generates no I2C traffic.
 
 config RV32_DISPLAY_FLUSH_INTERVAL_MS
 	int "Additional post-VSYNC cache-clean delay (ms)"
@@ -89,7 +331,7 @@ config RV32_DISPLAY_COMMAND_SLICE
 	int "Framebuffer commands processed per CPU1 service slice"
 	depends on RV32_DISPLAY_ACCEL
 	range 1 16
-	default 4
+	default 8
 	help
 	  Bound one command-drain pass so a continuously full FIFO cannot postpone
 	  a pending VSYNC notification. Remaining commands immediately reschedule
@@ -114,6 +356,39 @@ config RV32_DISPLAY_PAYLOAD_BLOCK_COUNT
 	  Number of payload-bearing commands that can be outstanding at once.
 	  Blocks are shared by all payload operations instead of being embedded in
 	  every command descriptor. The defaults reserve 64 KiB of internal RAM.
+
+choice RV32_GUEST_CONSOLE
+	prompt "OpenWrt interactive console supervisor"
+	default RV32_GUEST_CONSOLE_HVC
+	help
+	  Select the PID 1 console supervisor installed into a newly built OpenWrt
+	  initramfs. Both programs remain in the image, allowing the generated
+	  /etc/rv32-console file to be changed for development without rebuilding
+	  either binary.
+
+config RV32_GUEST_CONSOLE_HVC
+	bool "Accelerated virtio-console display shell"
+	help
+	  Use the standard Linux virtio-console hvc0 device. UART0 input enters the
+	  hvc receive virtqueue and CPU1 renders the TERM=linux byte stream without
+	  making Linux draw every glyph through fbcon. This is the fastest mode.
+
+config RV32_GUEST_CONSOLE_MUX
+	bool "Legacy tty0 + ttyS0 console-mux"
+	help
+	  Run the original guest-side console multiplexer. Linux renders tty0 via
+	  fbcon and console-mux mirrors output to ttyS0. This is slower but useful
+	  as a compatibility and comparison path.
+
+endchoice
+
+config RV32_GUEST_DROPBEAR
+	bool "Start Dropbear SSH server in OpenWrt"
+	default y
+	help
+	  Generate an Ed25519 host key when needed and start Dropbear on port 22.
+	  Disable this to skip both key generation and SSH server startup. The
+	  package remains available in the initramfs for manual testing.
 
 endmenu
 

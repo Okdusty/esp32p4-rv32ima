@@ -23,12 +23,36 @@ if ip link show eth0 >/dev/null 2>&1; then
   printf '%s\n' 'nameserver 1.1.1.1' >/etc/resolv.conf
 fi
 
-if [ ! -s /etc/dropbear/dropbear_ed25519_host_key ]; then
-  dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key \
-    >/dev/null 2>&1
+dropbear_status=disabled
+if [ "$(sed -n '1p' /etc/rv32-dropbear 2>/dev/null)" = 1 ]; then
+  if [ ! -s /etc/dropbear/dropbear_ed25519_host_key ]; then
+    dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key \
+      >/dev/null 2>&1
+  fi
+  if /usr/sbin/dropbear -E -p 22 \
+    -r /etc/dropbear/dropbear_ed25519_host_key; then
+    dropbear_status=enabled
+  else
+    printf '%s\n' 'warning: Dropbear failed to start' >&2
+  fi
 fi
-/usr/sbin/dropbear -E -p 22 \
-  -r /etc/dropbear/dropbear_ed25519_host_key
 
-printf '\nOpenWrt RV32 on ESP32-P4 (apk + Dropbear)\n\n'
-exec /usr/sbin/console-mux
+console_service=$(sed -n '1p' /etc/rv32-console 2>/dev/null)
+case "$console_service" in
+console-mux) console_program=/usr/sbin/console-mux ;;
+display-shell) console_program=/usr/sbin/display-shell ;;
+*)
+  printf '%s\n' 'warning: invalid /etc/rv32-console; using display-shell' >&2
+  console_service=display-shell
+  console_program=/usr/sbin/display-shell
+  ;;
+esac
+if [ ! -x "$console_program" ]; then
+  printf 'warning: %s is unavailable; using display-shell\n' "$console_program" >&2
+  console_service=display-shell
+  console_program=/usr/sbin/display-shell
+fi
+
+printf '\nOpenWrt RV32 on ESP32-P4 (console: %s, Dropbear: %s)\n\n' \
+  "$console_service" "$dropbear_status"
+exec "$console_program"

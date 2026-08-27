@@ -30,6 +30,8 @@
 #include "display_bridge.h"
 #include "dwc2_passthrough.h"
 #include "psram.h"
+#include "pv_console_protocol.h"
+#include "virtio_console_bridge.h"
 #include "virtio_net_bridge.h"
 
 static uint32_t ram_amt = GUEST_RAM_SIZE;
@@ -70,12 +72,15 @@ static void MiniSleep(void);
  * RV32IMA instructions.  Skip redundant fetch checks in the hot loop; ports
  * that include mini-rv32ima.h without this define retain strict validation. */
 #define MINIRV32_TRUSTED_32BIT_FETCH
+#if CONFIG_RV32_DECODED_BLOCK_CACHE
+#define MINIRV32_DECODED_BLOCK_CACHE
+#endif
 /* Per-instruction trap tracing is prohibitively expensive on the emulator. */
 #define MINIRV32_POSTEXEC(...) do { } while (0)
 
 #define MINIRV32_HANDLE_MEM_STORE_CONTROL(addy, val) \
 	do { \
-		size_t control_width = 1u << ((ir >> 12) & 3); \
+		size_t control_width = 1u << (MINIRV32_DECODE_FUNCT3() & 3u); \
 		if (display_bridge_contains((addy), control_width)) { \
 			display_bridge_store((addy), (val), control_width); \
 		} else if (HandleControlStore((addy), (val), control_width)) { \
@@ -84,12 +89,12 @@ static void MiniSleep(void);
 	} while (0)
 #define MINIRV32_HANDLE_MEM_LOAD_CONTROL(addy, rval) \
 	do { \
-		size_t control_width = 1u << ((ir >> 12) & 3); \
+		size_t control_width = 1u << (MINIRV32_DECODE_FUNCT3() & 3u); \
 		if (display_bridge_contains((addy), control_width)) \
 			rval = display_bridge_load((addy), control_width); \
 		else \
 			rval = HandleControlLoad((addy), control_width); \
-		switch ((ir >> 12) & 7) { \
+		switch (MINIRV32_DECODE_FUNCT3()) { \
 		case 0: rval = (int8_t)rval; break; \
 		case 1: rval = (int16_t)rval; break; \
 		default: break; \
@@ -99,6 +104,12 @@ static void MiniSleep(void);
 #define MINIRV32_OTHERCSR_READ(csrno, value) value = HandleOtherCSRRead(image, csrno);
 #define MINIRV32_HANDLE_CACHE_OP(physical_address, operation) \
 	HandleCacheBlockOp(physical_address, operation)
+#define MINIRV32_IS_MMIO_ADDRESS(address) \
+	(((address) >= 0x10000000u && (address) < 0x12000200u) || \
+	 ((address) >= VIRTIO_CONSOLE_GUEST_BASE && \
+	  (address) < VIRTIO_CONSOLE_GUEST_BASE + VIRTIO_CONSOLE_GUEST_SIZE) || \
+	 ((address) >= 0x0c000000u && (address) < 0x0c400000u) || \
+	 ((address) >= 0x50000000u && (address) < 0x50040000u))
 #define MINIRV32_LOAD4_UNCACHED(ofs) MiniRV32Load4Uncached(ofs)
 #define MINIRV32_LOAD2_UNCACHED(ofs) MiniRV32Load2Uncached(ofs)
 #define MINIRV32_LOAD1_UNCACHED(ofs) MiniRV32Load1Uncached(ofs)
@@ -426,15 +437,19 @@ static void HostPerfReport(uint64_t current_time)
 	       busy[1] / 10u, busy[1] % 10u,
 	       mips_x100 / 100u, mips_x100 % 100u);
 	printf("[Display perf] worker %" PRIu32 ".%" PRIu32
-	       "%%, wake=%" PRIu32 " vsync=%" PRIu32
+	       "%%/%" PRIu32 " us, wake=%" PRIu32 " vsync=%" PRIu32
 	       " cmd=%" PRIu32 " (fill=%" PRIu32 " copy=%" PRIu32
-	       " tile=%" PRIu32 "), FIFO high=%" PRIu32
+	       " tile=%" PRIu32 ": set=%" PRIu32 " fill=%" PRIu32
+	       " blit=%" PRIu32 " cursor=%" PRIu32 "), FIFO high=%" PRIu32
 	       " busy=%" PRIu32 " slices=%" PRIu32
 	       " deferred=%" PRIu32 "\n",
 	       display_busy_permille / 10u, display_busy_permille % 10u,
-	       display.service_wakes, display.vsyncs, display.commands,
+	       display.service_us, display.service_wakes, display.vsyncs,
+	       display.commands,
 	       display.fill_commands, display.copy_commands,
-	       display.tile_commands, display.fifo_high_water,
+	       display.tile_commands, display.tile_set_commands,
+	       display.tile_fill_commands, display.tile_blit_commands,
+	       display.tile_cursor_commands, display.fifo_high_water,
 	       display.fifo_busy, display.fifo_slices,
 	       display.fifo_deferred);
 	printf("[Display perf] cache=%" PRIu32 " calls/%" PRIu32
@@ -445,9 +460,61 @@ static void HostPerfReport(uint64_t current_time)
 	       display.cache_syncs, display.cache_bytes / 1024u,
 	       display.cache_us, display.ppa_fills, display.ppa_blits,
 	       display.ppa_us, display.ppa_fill_pixels,
-	       display.cpu_fill_pixels, display.copy_pixels,
-	       display.tile_pixels);
-
+	       display.cpu_fill_pixels, display.copy_pixels, display.tile_pixels);
+	#define DISPLAY_AVG_CYCLES(total, count) \
+		((count) ? (total) / (count) : 0u)
+	printf("[Display cycles] dispatch=%" PRIu32 " total/%" PRIu32
+	       " avg/%" PRIu32 " max; avg/op fill=%" PRIu32
+	       " copy=%" PRIu32 " image1=%" PRIu32 " tile-set=%" PRIu32
+	       " tile-fill=%" PRIu32 " tile-blit=%" PRIu32
+	       " cursor=%" PRIu32 "\n",
+	       display.command_cycles,
+	       DISPLAY_AVG_CYCLES(display.command_cycles, display.commands),
+	       display.command_max_cycles,
+	       DISPLAY_AVG_CYCLES(display.fill_cycles, display.fill_commands),
+	       DISPLAY_AVG_CYCLES(display.copy_cycles, display.copy_commands),
+	       DISPLAY_AVG_CYCLES(display.image1_cycles,
+				  display.image1_commands),
+	       DISPLAY_AVG_CYCLES(display.tile_set_cycles,
+				  display.tile_set_commands),
+	       DISPLAY_AVG_CYCLES(display.tile_fill_cycles,
+				  display.tile_fill_commands),
+	       DISPLAY_AVG_CYCLES(display.tile_blit_cycles,
+				  display.tile_blit_commands),
+	       DISPLAY_AVG_CYCLES(display.tile_cursor_cycles,
+				  display.tile_cursor_commands));
+	printf("[Display cursor] toggles=%" PRIu32 " cycles=%" PRIu32
+	       " total/%" PRIu32 " avg/%" PRIu32 " max\n",
+	       display.cursor_toggles, display.cursor_toggle_cycles,
+	       DISPLAY_AVG_CYCLES(display.cursor_toggle_cycles,
+				  display.cursor_toggles),
+	       display.cursor_toggle_max_cycles);
+	#undef DISPLAY_AVG_CYCLES
+	printf("[Display frame] samples=%" PRIu32 " total=%" PRIu32
+	       " us avg=%" PRIu32 " us max=%" PRIu32
+	       " us; cache overhead=%" PRIu32 " us\n",
+	       display.frame_samples, display.frame_total_us,
+	       display.frame_samples
+		? display.frame_total_us / display.frame_samples : 0u,
+	       display.frame_max_us, display.cache_us);
+	printf("[Display producer] submit=%" PRIu32 "/%" PRIu32
+	       " us, payload=%" PRIu32 " KiB (inline=%" PRIu32
+	       " pool=%" PRIu32 "), shared-result=%" PRIu32
+	       "; cross-core wake=%" PRIu32
+	       "/%" PRIu32 " us\n",
+	       display.producer_submissions, display.producer_us,
+	       display.producer_payload_bytes / 1024u,
+	       display.producer_inline_payloads,
+	       display.producer_external_payloads,
+	       display.producer_shared_results,
+	       display.producer_wakes, display.producer_wake_us);
+	printf("[Display batch] outer=%" PRIu32 " records=%" PRIu32
+	       " avg=%" PRIu32 " fallback=%" PRIu32
+	       " cycles=%" PRIu32 "\n",
+	       display.tile_batch_commands, display.tile_batch_records,
+	       display.tile_batch_commands
+		? display.tile_batch_records / display.tile_batch_commands : 0u,
+	       display.tile_batch_fallbacks, display.tile_batch_cycles);
 	host_perf_last_time = current_time;
 	host_perf_last_cycle = guest_cycle;
 	for (BaseType_t cpu = 0; cpu < 2; cpu++)
@@ -479,6 +546,8 @@ void app_main(void)
 		printf("WARNING: C6/virtio-net bridge initialization failed\n");
 	if (HostConsoleInit() < 0)
 		printf("WARNING: Asynchronous UART console unavailable\n");
+	if (virtio_console_bridge_init() < 0)
+		printf("WARNING: virtio-console bridge initialization failed\n");
 
 	printf("\nLoading kernel from flash...\n");
 
@@ -517,6 +586,7 @@ void app_main(void)
 		if (elapsedUs > 100000) elapsedUs = 100000;
 		lastTime = currentTime;
 		GuestUartFlushIfDue(currentTime);
+		virtio_console_bridge_poll();
 		UpdatePlatformInterrupts(&core);
 		if (currentTime - last_usb_status >= USB_STATUS_INTERVAL_US) {
 			dwc2_passthrough_service();
@@ -595,6 +665,7 @@ static uint8_t uart_lcr = 0;
 static uint8_t uart_mcr = 0;
 static uint8_t uart_fcr = 0;
 static bool uart_thre_irq_pending = true;
+static uint32_t pv_console_pointer;
 
 #define GUEST_UART_TX_BUFFER_SIZE 256u
 #define GUEST_UART_TX_FLUSH_US    1000u
@@ -629,6 +700,38 @@ static void GuestUartFlushIfDue(uint64_t current_time)
 		GuestUartFlush();
 }
 
+static void GuestParavirtualConsoleWrite(uint32_t virtual_address,
+					 size_t length)
+{
+	if (length == 0 || length > RV32_PV_CONSOLE_MAX_LENGTH)
+		return;
+
+	while (length) {
+		int fault = 0;
+		int uncached = 0;
+		uint32_t physical_address = MiniRV32Translate(
+			&core, guest_ram, virtual_address, ACCESS_READ,
+			&fault, &uncached);
+		size_t chunk = 0x1000u - (virtual_address & 0xfffu);
+
+		(void)uncached;
+		if (fault || physical_address < MINIRV32_RAM_IMAGE_OFFSET ||
+		    physical_address - MINIRV32_RAM_IMAGE_OFFSET >= ram_amt)
+			return;
+		if (chunk > length)
+			chunk = length;
+		if (chunk > ram_amt -
+			    (physical_address - MINIRV32_RAM_IMAGE_OFFSET))
+			return;
+
+		HostConsoleWrite(
+			guest_ram + physical_address - MINIRV32_RAM_IMAGE_OFFSET,
+			chunk);
+		virtual_address += (uint32_t)chunk;
+		length -= chunk;
+	}
+}
+
 #define UART_BASE              0x10000000u
 #define UART_IER_RDI           (1u << 0)
 #define UART_IER_THRI          (1u << 1)
@@ -637,7 +740,8 @@ static void GuestUartFlushIfDue(uint64_t current_time)
 #define PLIC_UART_SOURCE       1u
 #define PLIC_USB_SOURCE        2u
 #define PLIC_NET_SOURCE        VIRTIO_NET_PLIC_SOURCE
-#define PLIC_SOURCE_COUNT      3u
+#define PLIC_CONSOLE_SOURCE    VIRTIO_CONSOLE_PLIC_SOURCE
+#define PLIC_SOURCE_COUNT      4u
 #define PLIC_PENDING_BASE      0x00001000u
 #define PLIC_ENABLE_BASE       0x00002000u
 #define PLIC_CONTEXT_BASE      0x00200000u
@@ -645,12 +749,14 @@ static void GuestUartFlushIfDue(uint64_t current_time)
 #define PLIC_CONTEXT_CLAIM     0x00000004u
 #define SIP_SEIP               (1u << 9)
 
-static uint32_t plic_priority[PLIC_SOURCE_COUNT + 1u] = { 0, 1, 1, 1 };
+static uint32_t plic_priority[PLIC_SOURCE_COUNT + 1u] = { 0, 1, 1, 1, 1 };
 static uint32_t plic_enable;
 static uint32_t plic_threshold;
 
 static bool uart_interrupt_pending(void)
 {
+	if (virtio_console_bridge_owns_uart_rx())
+		return false;
 	if ((uart_ier & UART_IER_RDI) && IsKBHit())
 		return true;
 
@@ -665,6 +771,8 @@ static bool plic_source_pending(uint32_t source)
 		return dwc2_passthrough_irq_pending();
 	if (source == PLIC_NET_SOURCE)
 		return virtio_net_bridge_irq_pending();
+	if (source == PLIC_CONSOLE_SOURCE)
+		return virtio_console_bridge_irq_pending();
 	return false;
 }
 
@@ -750,6 +858,17 @@ static void UpdatePlatformInterrupts(struct MiniRV32IMAState *state)
 static uint32_t HandleControlStore(
 	uint32_t addy, uint32_t val, size_t width)
 {
+	if (addy == RV32_PV_CONSOLE_BASE + RV32_PV_CONSOLE_POINTER_OFFSET &&
+	    width == sizeof(uint32_t)) {
+		pv_console_pointer = val;
+		return 0;
+	}
+	if (addy == RV32_PV_CONSOLE_BASE + RV32_PV_CONSOLE_LENGTH_OFFSET &&
+	    width == sizeof(uint32_t)) {
+		GuestParavirtualConsoleWrite(pv_console_pointer, val);
+		return 0;
+	}
+
 	if (display_bridge_contains(addy, width)) {
 		display_bridge_store(addy, val, width);
 		return 0;
@@ -762,6 +881,11 @@ static uint32_t HandleControlStore(
 
 	if (virtio_net_bridge_contains(addy, width)) {
 		virtio_net_bridge_store(addy, val, width);
+		return 0;
+	}
+
+	if (virtio_console_bridge_contains(addy, width)) {
+		virtio_console_bridge_store(addy, val, width);
 		return 0;
 	}
 
@@ -802,6 +926,13 @@ static uint32_t HandleControlStore(
 
 static uint32_t HandleControlLoad(uint32_t addy, size_t width)
 {
+	if (width == sizeof(uint32_t) &&
+	    addy == RV32_PV_CONSOLE_BASE + RV32_PV_CONSOLE_MAGIC_OFFSET)
+		return RV32_PV_CONSOLE_MAGIC;
+	if (width == sizeof(uint32_t) &&
+	    addy == RV32_PV_CONSOLE_BASE + RV32_PV_CONSOLE_MAX_LENGTH_OFFSET)
+		return RV32_PV_CONSOLE_MAX_LENGTH;
+
 	if (display_bridge_contains(addy, width))
 		return display_bridge_load(addy, width);
 
@@ -810,6 +941,9 @@ static uint32_t HandleControlLoad(uint32_t addy, size_t width)
 
 	if (virtio_net_bridge_contains(addy, width))
 		return virtio_net_bridge_load(addy, width);
+
+	if (virtio_console_bridge_contains(addy, width))
+		return virtio_console_bridge_load(addy, width);
 
 	if (addy >= PLIC_BASE && addy < PLIC_BASE + PLIC_SIZE)
 		return PlicLoad(addy);

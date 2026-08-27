@@ -124,4 +124,4 @@ LINUX_DIR="$linux_dir" "$repo_root/scripts/build-dtb.sh" all
 cp "$image" "$repo_root/main/Image"
 
 echo "Installed Linux Image: $repo_root/main/Image"
-echo "Installed four DTBs for the Wi-Fi/display configuration matrix"
+echo "Installed DTBs for the Wi-Fi/display configuration matrix"

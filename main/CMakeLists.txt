@@ -6,7 +6,8 @@ set(RV32_SOURCES
 	"uc-rv32ima.c"
 	"cache.c"
 	"dwc2_passthrough.c"
-	"port-esp.c")
+	"port-esp.c"
+	"virtio_console_bridge.c")
 
 set(RV32_LINKER_FRAGMENTS "link.lf")
 
@@ -17,6 +18,10 @@ endif()
 
 if(CONFIG_RV32_ST7703_DISPLAY)
 	list(APPEND RV32_SOURCES "display_backend_st7703.c")
+elseif(CONFIG_RV32_ST7789_DISPLAY)
+	list(APPEND RV32_SOURCES "display_backend_st7789.c")
+elseif(CONFIG_RV32_SSD1306_DISPLAY)
+	list(APPEND RV32_SOURCES "display_backend_ssd1306.c")
 endif()
 
 if(CONFIG_RV32_WIFI_BRIDGE)
@@ -27,6 +32,7 @@ idf_component_register(SRCS ${RV32_SOURCES}
 		       LDFRAGMENTS ${RV32_LINKER_FRAGMENTS}
 		       INCLUDE_DIRS "."
 		       PRIV_REQUIRES esp_lcd esp_driver_gpio esp_driver_ledc
+		                     esp_driver_i2c esp_driver_spi
 		                     esp_driver_ppa
 		                     esp_hw_support esp_mm esp_timer
 		                     bootloader_support

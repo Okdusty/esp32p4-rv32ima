@@ -17,6 +17,12 @@ clean_outputs()
   rm -f -- \
     "$repo_root/main/Image" \
     "$repo_root/main/uc.dtb" \
+    "$repo_root/main/uc-ssd1306-32.dtb" \
+    "$repo_root/main/uc-ssd1306-32-nowifi.dtb" \
+    "$repo_root/main/uc-ssd1306-64.dtb" \
+    "$repo_root/main/uc-ssd1306-64-nowifi.dtb" \
+	"$repo_root/main/uc-st7789.dtb" \
+	"$repo_root/main/uc-st7789-nowifi.dtb" \
     "$repo_root/main/uc-nowifi.dtb" \
     "$repo_root/main/uc-headless.dtb" \
     "$repo_root/main/uc-minimal.dtb"
