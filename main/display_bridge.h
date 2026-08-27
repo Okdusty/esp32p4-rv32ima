@@ -11,11 +11,23 @@
 #ifndef DISPLAY_FB_GUEST_BASE
 #define DISPLAY_FB_GUEST_BASE 0x11800000u
 #endif
+#if defined(CONFIG_RV32_ST7789_DISPLAY) && CONFIG_RV32_ST7789_DISPLAY
+#define DISPLAY_FB_WIDTH 240u
+#define DISPLAY_FB_HEIGHT 240u
+#elif defined(CONFIG_RV32_SSD1306_DISPLAY) && CONFIG_RV32_SSD1306_DISPLAY
+#define DISPLAY_FB_WIDTH 128u
+#if defined(CONFIG_RV32_SSD1306_128X32) && CONFIG_RV32_SSD1306_128X32
+#define DISPLAY_FB_HEIGHT 32u
+#else
+#define DISPLAY_FB_HEIGHT 64u
+#endif
+#else
 #ifndef DISPLAY_FB_WIDTH
 #define DISPLAY_FB_WIDTH 720u
 #endif
 #ifndef DISPLAY_FB_HEIGHT
 #define DISPLAY_FB_HEIGHT 720u
+#endif
 #endif
 #ifndef DISPLAY_FB_STRIDE
 #define DISPLAY_FB_STRIDE (DISPLAY_FB_WIDTH * sizeof(uint16_t))
@@ -43,10 +55,34 @@ struct display_bridge_perf_stats {
 	uint32_t service_wakes;
 	uint32_t service_us;
 	uint32_t vsyncs;
+	uint32_t frame_samples;
+	uint32_t frame_total_us;
+	uint32_t frame_max_us;
 	uint32_t commands;
+	uint32_t command_cycles;
+	uint32_t command_max_cycles;
 	uint32_t fill_commands;
+	uint32_t fill_cycles;
 	uint32_t copy_commands;
+	uint32_t copy_cycles;
+	uint32_t image1_commands;
+	uint32_t image1_cycles;
 	uint32_t tile_commands;
+	uint32_t tile_set_commands;
+	uint32_t tile_set_cycles;
+	uint32_t tile_fill_commands;
+	uint32_t tile_fill_cycles;
+	uint32_t tile_blit_commands;
+	uint32_t tile_blit_cycles;
+	uint32_t tile_cursor_commands;
+	uint32_t tile_cursor_cycles;
+	uint32_t tile_batch_commands;
+	uint32_t tile_batch_cycles;
+	uint32_t tile_batch_records;
+	uint32_t tile_batch_fallbacks;
+	uint32_t cursor_toggles;
+	uint32_t cursor_toggle_cycles;
+	uint32_t cursor_toggle_max_cycles;
 	uint32_t ppa_fills;
 	uint32_t ppa_blits;
 	uint32_t ppa_us;
@@ -61,6 +97,14 @@ struct display_bridge_perf_stats {
 	uint32_t fifo_high_water;
 	uint32_t fifo_slices;
 	uint32_t fifo_deferred;
+	uint32_t producer_submissions;
+	uint32_t producer_us;
+	uint32_t producer_payload_bytes;
+	uint32_t producer_inline_payloads;
+	uint32_t producer_external_payloads;
+	uint32_t producer_shared_results;
+	uint32_t producer_wakes;
+	uint32_t producer_wake_us;
 };
 
 #if defined(CONFIG_RV32_DISPLAY_ACCEL) && CONFIG_RV32_DISPLAY_ACCEL
@@ -76,6 +120,11 @@ void display_bridge_store(uint32_t address, uint32_t value, size_t width);
 void *display_bridge_accel_buffer(size_t *capacity);
 bool display_bridge_accel_blit(uint32_t width, uint32_t height);
 void display_bridge_accel_stop(void);
+/* Standard virtio-console output enters this bounded SPSC stream. ANSI/VT
+ * parsing and glyph painting then run only on the display service core. */
+bool display_bridge_terminal_write(const void *buffer, size_t length);
+uint32_t display_bridge_terminal_columns(void);
+uint32_t display_bridge_terminal_rows(void);
 void display_bridge_perf_read_and_reset(
 	struct display_bridge_perf_stats *stats);
 #else
@@ -135,6 +184,24 @@ static inline bool display_bridge_accel_blit(uint32_t width, uint32_t height)
 
 static inline void display_bridge_accel_stop(void)
 {
+}
+
+static inline bool display_bridge_terminal_write(const void *buffer,
+						   size_t length)
+{
+	(void)buffer;
+	(void)length;
+	return true;
+}
+
+static inline uint32_t display_bridge_terminal_columns(void)
+{
+	return 80u;
+}
+
+static inline uint32_t display_bridge_terminal_rows(void)
+{
+	return 25u;
 }
 
 static inline void display_bridge_perf_read_and_reset(

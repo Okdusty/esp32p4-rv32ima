@@ -29,12 +29,14 @@ This performs the following reproducible pipeline:
    `.guest-work/linux/arch/riscv/boot/Image`.
 8. Validate the RISC-V header, 4 MiB text offset, PSRAM/DTB boundary, and flash
    partition limit before installing the result as `main/Image`.
-9. Preprocess `main/uc.dts` and generate the four DTBs covering the Wi-Fi and
-   ST7703 display configuration matrix. Disabled devices are absent from the
-   hardware description instead of probing non-existent emulator MMIO.
+9. Preprocess `main/uc.dts` and generate the DTBs covering Wi-Fi with the
+   ST7703, ST7789 240x240, SSD1306 128x32, SSD1306 128x64, and headless
+   configurations.
+   Disabled devices are absent from the hardware description instead of
+   probing non-existent emulator MMIO.
 
 The ESP-IDF CMake build selects the correct DTB from
-`CONFIG_RV32_WIFI_BRIDGE` and `CONFIG_RV32_ST7703_DISPLAY`, and registers both
+`CONFIG_RV32_WIFI_BRIDGE` and the selected display backend, and registers both
 the kernel and DTB partitions in the normal `idf.py flash` operation.
 
 For isolated configuration testing, append one of the defaults in
@@ -56,8 +58,8 @@ Useful targets:
 
 ```sh
 make guest-rootfs       # OpenWrt packages and rootfs only
-make guest-image        # Linux Image and four DTBs, using an existing rootfs
-make guest-dtb          # regenerate only the four DTBs
+make guest-image        # Linux Image and display/Wi-Fi DTBs, existing rootfs
+make guest-dtb          # regenerate only the display/Wi-Fi DTBs
 make guest-verify       # validate the currently installed main/Image
 make clean              # remove outputs/Linux objects; retain download caches
 make distclean          # also remove .guest-work checkouts and caches

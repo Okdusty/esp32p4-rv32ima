@@ -29,3 +29,63 @@
 @@ -123,1 +123,2 @@
 +obj-$(CONFIG_FB_RV32_PV)          += rv32-pvfb.o
  obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
+--- a/include/linux/fb.h
++++ b/include/linux/fb.h
+@@ -354,6 +354,19 @@ struct fb_tileblit {
+ 	__u32 *indices;             /* array of indices to tile map */
+ };
+ 
++/* Optional direct path for drivers which consume VT cells themselves. */
++struct fb_tileblit_cells {
++	__u32 sx;
++	__u32 sy;
++	__u32 width;
++	__u32 height;
++	__u32 fg;
++	__u32 bg;
++	__u32 length;
++	const __u16 *cells;
++	__u32 charmask;
++};
++
+ struct fb_tilecursor {
+ 	__u32 sx;                   /* cursor position in the x-axis */
+ 	__u32 sy;                   /* cursor position in the y-axis */
+@@ -374,6 +386,9 @@ struct fb_tile_ops {
+ 	void (*fb_tilefill)(struct fb_info *info, struct fb_tilerect *rect);
+ 	/* copy an array of tiles */
+ 	void (*fb_tileblit)(struct fb_info *info, struct fb_tileblit *blit);
++	/* consume encoded VT cells without first expanding them to u32 indices */
++	void (*fb_tileblit_cells)(struct fb_info *info,
++				  struct fb_tileblit_cells *blit);
+ 	/* cursor */
+ 	void (*fb_tilecursor)(struct fb_info *info,
+ 			      struct fb_tilecursor *cursor);
+--- a/drivers/video/fbdev/core/tileblit.c
++++ b/drivers/video/fbdev/core/tileblit.c
+@@ -57,6 +57,25 @@ static void tile_putcs(struct vc_data *vc, struct fb_info *info,
+ 	unsigned short charmask = vc->vc_hi_font_mask ? 0x1ff : 0xff;
+ 	int size = sizeof(u32) * count, i;
+ 
++	if (info->tileops->fb_tileblit_cells) {
++		struct fb_tileblit_cells cells = {
++			.sx = xx,
++			.sy = yy,
++			.width = count,
++			.height = 1,
++			.fg = fg,
++			.bg = bg,
++			.length = count,
++			.cells = s,
++			.charmask = charmask,
++		};
++
++		/* The driver must snapshot cells before returning. The VT owns the
++		 * source buffer and may reuse it immediately after this callback. */
++		info->tileops->fb_tileblit_cells(info, &cells);
++		return;
++	}
++
+ 	blit.sx = xx;
+ 	blit.sy = yy;
+ 	blit.width = count;

@@ -10,8 +10,15 @@
 # 0x1F10000 - 0x1F20000 : DTB (64KB)
 # 0x1F20000 - 0x2000000 : Reserved (896KB)
 
-nvs,      data, nvs,     0x9000,    0x6000,
-phy_init, data, phy,     0xf000,    0x1000,
-factory,  app,  factory, 0x10000,   1M,
-kernel,   data, 0x58,    0x110000,  30M,
+#nvs,      data, nvs,     0x9000,    0x6000,
+#phy_init, data, phy,     0xf000,    0x1000,
+#factory,  app,  factory, 0x10000,   1M,
+#kernel,   data, 0x58,    0x110000,  30M,
+#dtb,      data, 0x58,    0x1F10000, 0x10000,
+
+# Name,   Type, SubType, Offset,   Size,      Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x100000,
+kernel,   data, 0x58,    0x110000, 0x1E00000,
 dtb,      data, 0x58,    0x1F10000, 0x10000,

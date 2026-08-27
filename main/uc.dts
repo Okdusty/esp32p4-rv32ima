@@ -20,27 +20,27 @@
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 		];
-#if RV32_ST7703_DISPLAY
+#if RV32_DISPLAY_ENABLED
 		bootargs = "console=tty0 console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
 #else
 		bootargs = "console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
 #endif
 		stdout-path = "serial0:921600n8";
 
-	#if RV32_ST7703_DISPLAY
+	#if RV32_DISPLAY_ENABLED
 		framebuffer0: framebuffer@11800000 {
 			/* The second compatible keeps unmodified kernel Images usable. */
 			compatible = "mini-rv32ima,pvfb", "simple-framebuffer";
 			/* Scanout followed by generic staging and command apertures. */
-			reg = <0x00 0x11800000 0x00 0x0011e000>;
-			width = <720>;
-			height = <720>;
-			stride = <1440>;
+			reg = <0x00 0x11800000 0x00 RV32_DISPLAY_APERTURE_SIZE>;
+			width = <RV32_DISPLAY_WIDTH>;
+			height = <RV32_DISPLAY_HEIGHT>;
+			stride = <RV32_DISPLAY_STRIDE>;
 			format = "r5g6b5";
-			mini-rv32ima,staging-offset = <0x000fd200>;
+			mini-rv32ima,staging-offset = <RV32_DISPLAY_STAGING_OFFSET>;
 			mini-rv32ima,staging-size = <0x00020000>;
-			mini-rv32ima,fence-offset = <0x0011d20c>;
-			mini-rv32ima,accel-offset = <0x0011d210>;
+			mini-rv32ima,fence-offset = <RV32_DISPLAY_FENCE_OFFSET>;
+			mini-rv32ima,accel-offset = <RV32_DISPLAY_ACCEL_OFFSET>;
 			status = "okay";
 		};
 #endif
@@ -103,11 +103,8 @@
 			reg = <0x00 0x0c000000 0x00 0x00400000>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-#if RV32_WIFI_BRIDGE
-			riscv,ndev = <3>;
-#else
-			riscv,ndev = <2>;
-#endif
+			/* UART, USB, optional virtio-net, and virtio-console. */
+			riscv,ndev = <4>;
 			interrupts-extended = <&cpu_intc 9>;
 		};
 
@@ -119,6 +116,13 @@
 			interrupts = <3>;
 		};
 #endif
+
+		virtio_console: virtio@12100000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x12100000 0x00 0x00000200>;
+			interrupt-parent = <&plic>;
+			interrupts = <4>;
+		};
 
 		usb@50000000 {
 			compatible = "snps,dwc2";

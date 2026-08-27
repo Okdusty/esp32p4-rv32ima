@@ -33,12 +33,15 @@
  * after the display worker executes an entry.  A guest must wait for COMPLETED
  * before declaring a frame synchronized. Version 4 also accepts a command
  * descriptor and payload directly from guest RAM. The doorbell copies both
- * while still running on CPU0, avoiding repeated emulated MMIO stores.
+ * while still running on CPU0, avoiding repeated emulated MMIO stores. The
+ * optional shared-result feature writes acceptance back into that descriptor,
+ * replacing two emulated MMIO reads with ordinary guest-RAM loads.
  */
 #define DISPLAY_PV_MAGIC                 0x31424650u /* "PFB1" */
 #define DISPLAY_PV_VERSION               4u
 #define DISPLAY_PV_SUBMIT                0x54494d53u /* "SMIT" */
 #define DISPLAY_PV_SHARED_COMMAND_MAGIC  0x34444d43u /* "CMD4" */
+#define DISPLAY_PV_SHARED_RESULT_MAGIC   0x35444d43u /* "CMD5" */
 
 #define DISPLAY_PV_FEATURE_FILL          (1u << 0)
 #define DISPLAY_PV_FEATURE_COPY          (1u << 1)
@@ -49,6 +52,9 @@
 #define DISPLAY_PV_FEATURE_PAYLOAD_POOL  (1u << 6)
 #define DISPLAY_PV_FEATURE_SURFACE_INFO  (1u << 7)
 #define DISPLAY_PV_FEATURE_SHARED_COMMAND (1u << 8)
+#define DISPLAY_PV_FEATURE_SHARED_RESULT  (1u << 9)
+#define DISPLAY_PV_FEATURE_TILE_BATCH     (1u << 10)
+#define DISPLAY_PV_FEATURE_TEXT_RUN16     (1u << 11)
 
 #define DISPLAY_PV_FORMAT_RGB565         1u
 
@@ -59,6 +65,8 @@
 #define DISPLAY_PV_OP_TILE_FILL          5u
 #define DISPLAY_PV_OP_TILE_BLIT          6u
 #define DISPLAY_PV_OP_TILE_CURSOR        7u
+#define DISPLAY_PV_OP_TILE_BATCH         8u
+#define DISPLAY_PV_OP_TEXT_RUN16         9u
 
 #define DISPLAY_PV_ROP_COPY              0u
 #define DISPLAY_PV_ROP_XOR               1u
@@ -108,6 +116,23 @@ typedef struct {
 	uint32_t payload_address;
 	uint32_t payload_length;
 } display_pv_shared_command_t;
+
+typedef struct {
+	display_pv_shared_command_t command;
+	uint32_t accepted_sequence;
+	uint32_t accepted_status;
+} display_pv_shared_result_t;
+
+/*
+ * TILE_BATCH carries an array of these headers. Each header is followed by
+ * payload_length bytes rounded up to a four-byte boundary. The outer command
+ * stores the record count in args[0] and total byte length in args[1].
+ */
+typedef struct {
+	uint32_t operation;
+	uint32_t payload_length;
+	uint32_t args[8];
+} display_pv_batch_record_t;
 
 #define DISPLAY_ACCEL_PACK_SIZE(width, height) \
 	(((width) & 0xffffu) | (((height) & 0xffffu) << 16))

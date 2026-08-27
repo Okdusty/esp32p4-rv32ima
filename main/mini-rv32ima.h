@@ -69,6 +69,15 @@
 	#define MINIRV32_HANDLE_MEM_LOAD_CONTROL(...);
 #endif
 
+/* Ports may extend the physical MMIO map without editing the interpreter.
+ * Keep the original mini-rv32ima devices as the standalone default. */
+#ifndef MINIRV32_IS_MMIO_ADDRESS
+	#define MINIRV32_IS_MMIO_ADDRESS(address) \
+		(((address) >= 0x10000000u && (address) < 0x12000200u) || \
+		 ((address) >= 0x0c000000u && (address) < 0x0c400000u) || \
+		 ((address) >= 0x50000000u && (address) < 0x50040000u))
+#endif
+
 #ifndef MINIRV32_HANDLE_CACHE_OP
 	#define MINIRV32_HANDLE_CACHE_OP(...);
 #endif
@@ -118,6 +127,47 @@ struct MiniRV32FastTLBEntry
 	/* Physical pages are 4 KiB aligned, so bit 0 carries the uncached flag. */
 	uint32_t physical_page_and_flags;
 };
+
+#ifdef MINIRV32_DECODED_BLOCK_CACHE
+#ifndef MINIRV32_DECODE_BLOCK_WORDS
+	#define MINIRV32_DECODE_BLOCK_WORDS 32
+#endif
+#ifndef MINIRV32_DECODE_BLOCK_SETS
+	#define MINIRV32_DECODE_BLOCK_SETS 128
+#endif
+
+#if (MINIRV32_DECODE_BLOCK_WORDS & (MINIRV32_DECODE_BLOCK_WORDS - 1)) != 0
+	#error "MINIRV32_DECODE_BLOCK_WORDS must be a power of two"
+#endif
+#if (MINIRV32_DECODE_BLOCK_SETS & (MINIRV32_DECODE_BLOCK_SETS - 1)) != 0
+	#error "MINIRV32_DECODE_BLOCK_SETS must be a power of two"
+#endif
+
+/*
+ * Thirty-two adjacent instructions share one physical-address tag. A local
+ * pointer walks a cached basic block and taken control flow ends the stream.
+ * Each entry retains predecoded operands and its GNU C direct-threaded handler
+ * target. This moves guest fetch, opcode extraction and switch-table lookup
+ * out of the repeated execution path.
+ */
+struct MiniRV32DecodedInstruction
+{
+	const void *handler;
+	/* rd[4:0], rs1[9:5], rs2[14:10], funct3[17:15],
+	 * opcode[27:23], opcode-specific flags[22:18]. */
+	uint32_t operands;
+	uint32_t immediate;
+};
+
+struct MiniRV32DecodedBlock
+{
+	/* Aligned physical byte offset with bit 0 set; zero means invalid. */
+	uint32_t tag;
+	/* The extra entry is a refill sentinel, not a guest instruction. */
+	struct MiniRV32DecodedInstruction decoded[
+		MINIRV32_DECODE_BLOCK_WORDS + 1];
+};
+#endif
 
 #ifdef MINIRV32_PERF_STATS
 struct MiniRV32PerfStats
@@ -203,6 +253,10 @@ struct MiniRV32IMAState
 		__attribute__((aligned(128)));
 	struct MiniRV32TLBEntry tlb[MINIRV32_TLB_ENTRIES]
 		__attribute__((aligned(128)));
+#ifdef MINIRV32_DECODED_BLOCK_CACHE
+	struct MiniRV32DecodedBlock decode_cache[MINIRV32_DECODE_BLOCK_SETS]
+		__attribute__((aligned(128)));
+#endif
 };
 
 enum {
@@ -283,8 +337,8 @@ static int MiniRV32PhysWrite32(
 
 #ifdef MINIRV32_PERF_STATS
 	#define MINIRV32_PERF_INC(field) (state->perf.field++)
-	#define MINIRV32_PERF_FUNCT3_INC(field, instruction) \
-		(state->perf.field[((instruction) >> 12) & 7u]++)
+	#define MINIRV32_PERF_FUNCT3_INC(field, funct3_value) \
+		(state->perf.field[(funct3_value) & 7u]++)
 #else
 	#define MINIRV32_PERF_INC(field) do { } while (0)
 	#define MINIRV32_PERF_FUNCT3_INC(field, instruction) do { } while (0)
@@ -308,6 +362,109 @@ static void MiniRV32FlushTLB(struct MiniRV32IMAState *state)
 		for (unsigned int i = 0; i < MINIRV32_FAST_TLB_SETS; i++)
 			state->fast_tlb[access][i].tag = 0;
 }
+
+#ifdef MINIRV32_DECODED_BLOCK_CACHE
+#define MINIRV32_DECODE_BLOCK_BYTES (MINIRV32_DECODE_BLOCK_WORDS * 4u)
+
+/* Decode misses are cold.  Keeping block construction outside the opcode
+ * loop prevents its branches from displacing the hot dispatch path. */
+static __attribute__((noinline)) struct MiniRV32DecodedBlock *
+MiniRV32FillDecodeBlock(struct MiniRV32IMAState *state, uint8_t *image,
+	uint32_t ofs_pc, const void *const dispatch[32],
+	const void *refill_handler)
+{
+	uint32_t block_base = ofs_pc & ~(MINIRV32_DECODE_BLOCK_BYTES - 1u);
+	uint32_t block_number = block_base /
+		MINIRV32_DECODE_BLOCK_BYTES;
+	struct MiniRV32DecodedBlock *block =
+		&state->decode_cache[block_number &
+			(MINIRV32_DECODE_BLOCK_SETS - 1u)];
+
+	/* Publish the tag only after every decoded word is complete. */
+	block->tag = 0;
+	for (uint32_t i = 0; i < MINIRV32_DECODE_BLOCK_WORDS; i++) {
+		uint32_t ofs = block_base + i * 4u;
+		uint32_t ir = 0;
+
+		if (ofs <= MINI_RV32_RAM_SIZE - 4u)
+			ir = MINIRV32_LOAD4(ofs);
+
+		uint32_t opcode = (ir >> 2) & 0x1fu;
+		uint32_t rd = (ir >> 7) & 0x1fu;
+		uint32_t funct3 = (ir >> 12) & 7u;
+		uint32_t rs1 = (ir >> 15) & 0x1fu;
+		uint32_t rs2 = (ir >> 20) & 0x1fu;
+		uint32_t flags = 0;
+		uint32_t immediate = 0;
+
+		switch (opcode) {
+		case 0b01101: /* LUI */
+		case 0b00101: /* AUIPC */
+			immediate = ir & 0xfffff000u;
+			break;
+		case 0b11011: /* JAL */
+			immediate = ((ir & 0x80000000u) >> 11) |
+				((ir & 0x7fe00000u) >> 20) |
+				((ir & 0x00100000u) >> 9) |
+				(ir & 0x000ff000u);
+			if (immediate & 0x00100000u)
+				immediate |= 0xffe00000u;
+			break;
+		case 0b11000: /* Branch */
+			immediate = ((ir & 0xf00u) >> 7) |
+				((ir & 0x7e000000u) >> 20) |
+				((ir & 0x80u) << 4) |
+				((ir >> 31) << 12);
+			if (immediate & 0x1000u)
+				immediate |= 0xffffe000u;
+			break;
+		case 0b01000: /* Store */
+			immediate = ((ir >> 7) & 0x1fu) |
+				((ir & 0xfe000000u) >> 20);
+			if (immediate & 0x800u)
+				immediate |= 0xfffff000u;
+			break;
+		case 0b11001: /* JALR */
+		case 0b00000: /* Load */
+		case 0b00100: /* Op-immediate */
+			immediate = (uint32_t)((int32_t)ir >> 20);
+			flags = (ir >> 29) & 2u; /* SRAI. */
+			break;
+		case 0b00011: /* FENCE/CBO */
+		case 0b11100: /* SYSTEM/CSR */
+			immediate = ir >> 20;
+			break;
+		case 0b01100: /* Register operation */
+			flags = ((ir >> 25) & 1u) |
+				((ir >> 29) & 2u); /* M, SUB/SRA. */
+			break;
+		case 0b01011: /* Atomic operation */
+			flags = (ir >> 27) & 0x1fu;
+			break;
+		default:
+			break;
+		}
+
+		block->decoded[i].handler = dispatch[opcode];
+		block->decoded[i].operands = rd | (rs1 << 5) | (rs2 << 10) |
+			(funct3 << 15) | (flags << 18) | (opcode << 23);
+		block->decoded[i].immediate = immediate;
+	}
+	block->decoded[MINIRV32_DECODE_BLOCK_WORDS].handler = refill_handler;
+	block->decoded[MINIRV32_DECODE_BLOCK_WORDS].operands = 0;
+	block->decoded[MINIRV32_DECODE_BLOCK_WORDS].immediate = 0;
+	block->tag = block_base | 1u;
+
+	return block;
+}
+
+static __attribute__((noinline)) void MiniRV32FlushDecodeCache(
+	struct MiniRV32IMAState *state)
+{
+	for (unsigned int i = 0; i < MINIRV32_DECODE_BLOCK_SETS; i++)
+		state->decode_cache[i].tag = 0;
+}
+#endif
 
 static __attribute__((noinline)) void MiniRV32FlushTLBPage(
 	struct MiniRV32IMAState *state, uint32_t va)
@@ -674,6 +831,53 @@ static __attribute__((noinline)) uint32_t MiniRV32SupervisorInterruptCause(
 	return (pending & (1u << 9)) ? 9u : 5u;
 }
 
+#ifdef MINIRV32_DECODED_BLOCK_CACHE
+	#define MINIRV32_OPCODE_CASE(value, label) label:
+	#define MINIRV32_DECODE_OPCODE() \
+		((decoded_operands >> 23) & 0x1fu)
+	#define MINIRV32_DECODE_RD() \
+		(decoded_operands & 0x1fu)
+	#define MINIRV32_DECODE_RS1() \
+		((decoded_operands >> 5) & 0x1fu)
+	#define MINIRV32_DECODE_RS2() \
+		((decoded_operands >> 10) & 0x1fu)
+	#define MINIRV32_DECODE_FUNCT3() \
+		((decoded_operands >> 15) & 7u)
+	#define MINIRV32_DECODE_AUX() \
+		((decoded_operands >> 18) & 0x1fu)
+	#define MINIRV32_DECODE_I_IMMEDIATE(fallback) \
+		(decoded_immediate)
+	#define MINIRV32_DECODE_S_IMMEDIATE(fallback) \
+		(decoded_immediate)
+	#define MINIRV32_DECODE_B_IMMEDIATE(fallback) \
+		(decoded_immediate)
+	#define MINIRV32_DECODE_J_IMMEDIATE(fallback) \
+		(decoded_immediate)
+	#define MINIRV32_DECODE_U_IMMEDIATE(fallback) \
+		(decoded_immediate)
+	#define MINIRV32_DECODE_UIMM12(fallback) \
+		(decoded_immediate)
+	#define MINIRV32_DECODE_M_EXTENSION() (MINIRV32_DECODE_AUX() & 1u)
+	#define MINIRV32_DECODE_SUB_SRA() (MINIRV32_DECODE_AUX() & 2u)
+	#define MINIRV32_DECODE_OPIMM_SRA() (MINIRV32_DECODE_AUX() & 2u)
+#else
+	#define MINIRV32_OPCODE_CASE(value, label) case value:
+	#define MINIRV32_DECODE_OPCODE() ((ir >> 2) & 0x1fu)
+	#define MINIRV32_DECODE_RD() ((ir >> 7) & 0x1fu)
+	#define MINIRV32_DECODE_RS1() ((ir >> 15) & 0x1fu)
+	#define MINIRV32_DECODE_RS2() ((ir >> 20) & 0x1fu)
+	#define MINIRV32_DECODE_FUNCT3() ((ir >> 12) & 7u)
+	#define MINIRV32_DECODE_I_IMMEDIATE(fallback) (fallback)
+	#define MINIRV32_DECODE_S_IMMEDIATE(fallback) (fallback)
+	#define MINIRV32_DECODE_B_IMMEDIATE(fallback) (fallback)
+	#define MINIRV32_DECODE_J_IMMEDIATE(fallback) (fallback)
+	#define MINIRV32_DECODE_U_IMMEDIATE(fallback) (fallback)
+	#define MINIRV32_DECODE_UIMM12(fallback) (fallback)
+	#define MINIRV32_DECODE_M_EXTENSION() (ir & 0x02000000u)
+	#define MINIRV32_DECODE_SUB_SRA() (ir & 0x40000000u)
+	#define MINIRV32_DECODE_OPIMM_SRA() (ir & 0x40000000u)
+#endif
+
 MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 	struct MiniRV32IMAState *state,
 	uint8_t *image, uint32_t vProcAddress,
@@ -717,6 +921,26 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 	if( CSR( extraflags ) & 4 )
 		return 1;
 
+	#ifdef MINIRV32_DECODED_BLOCK_CACHE
+	/* Entries are instruction bits [6:2]. Unsupported encodings share one
+	 * cold illegal-instruction target. */
+	static const void *const decoded_dispatch[32] = {
+		&&rv_op_load,    &&rv_op_illegal, &&rv_op_illegal, &&rv_op_fence,
+		&&rv_op_opimm,   &&rv_op_auipc,   &&rv_op_illegal, &&rv_op_illegal,
+		&&rv_op_store,   &&rv_op_illegal, &&rv_op_illegal, &&rv_op_atomic,
+		&&rv_op_op,      &&rv_op_lui,     &&rv_op_illegal, &&rv_op_illegal,
+		&&rv_op_illegal, &&rv_op_illegal, &&rv_op_illegal, &&rv_op_illegal,
+		&&rv_op_illegal, &&rv_op_illegal, &&rv_op_illegal, &&rv_op_illegal,
+		&&rv_op_branch,  &&rv_op_jalr,    &&rv_op_illegal, &&rv_op_jal,
+		&&rv_op_system,  &&rv_op_illegal, &&rv_op_illegal, &&rv_op_illegal,
+	};
+	struct MiniRV32DecodedInstruction decoded_refill_entry = {
+		.handler = &&rv_decode_refill,
+		.operands = 0,
+		.immediate = 0,
+	};
+	#endif
+
 	uint32_t trap = 0;
 	uint32_t rval = 0;
 	uint32_t pc = CSR( pc );
@@ -732,6 +956,10 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 	uint32_t write_physical_page = 0;
 	uint32_t write_ram_offset_bias = UINT32_MAX;
 	int write_uncached = 0;
+	#ifdef MINIRV32_DECODED_BLOCK_CACHE
+	struct MiniRV32DecodedInstruction *decoded_ptr =
+		&decoded_refill_entry;
+	#endif
 	uint32_t kernel_linear_limit =
 		(((CSR(extraflags) & 3u) == 1u) &&
 		 (CSR(satp) & 0x80000000u)) ?
@@ -752,6 +980,11 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 	for( ; icount < count; icount++ )
 	{
 		uint32_t ir = 0;
+		#ifdef MINIRV32_DECODED_BLOCK_CACHE
+		uint32_t decoded_operands;
+		uint32_t decoded_immediate;
+		const void *decoded_handler;
+		#endif
 		rval = 0;
 		int fault;
 		uint32_t pc_page = pc & ~0xfffu;
@@ -781,6 +1014,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 			exec_virtual_page = pc_page;
 			/* Unsigned wraparound represents host-offset minus guest VA. */
 			exec_offset_bias = ofs_pc - pc;
+
 		}
 
 		#ifndef MINIRV32_TRUSTED_32BIT_FETCH
@@ -792,8 +1026,21 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 		else
 		#endif
 		{
-				ir = MINIRV32_LOAD4( ofs_pc );
-				uint32_t opcode = (ir >> 2) & 0x1fu;
+				#ifdef MINIRV32_DECODED_BLOCK_CACHE
+				rv_decode_fetch:
+				{
+					struct MiniRV32DecodedInstruction *decoded = decoded_ptr++;
+					decoded_handler = decoded->handler;
+					decoded_operands = decoded->operands;
+					decoded_immediate = decoded->immediate;
+				}
+				#else
+				ir = MINIRV32_LOAD4(ofs_pc);
+				#endif
+				#if defined(MINIRV32_PERF_STATS) || \
+				    !defined(MINIRV32_DECODED_BLOCK_CACHE)
+				uint32_t opcode = MINIRV32_DECODE_OPCODE();
+				#endif
 				#ifdef MINIRV32_PERF_STATS
 				state->perf.opcode[opcode]++;
 				#endif
@@ -810,71 +1057,147 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					trap = 2 + 1;
 				} else
 				#endif
+				#ifdef MINIRV32_DECODED_BLOCK_CACHE
+				do {
+					goto *decoded_handler;
+
+					rv_decode_refill:
+					{
+						uint32_t block_base = ofs_pc &
+							~(MINIRV32_DECODE_BLOCK_BYTES - 1u);
+						uint32_t block_number = block_base /
+							MINIRV32_DECODE_BLOCK_BYTES;
+						uint32_t slot = (ofs_pc >> 2) &
+							(MINIRV32_DECODE_BLOCK_WORDS - 1u);
+						struct MiniRV32DecodedBlock *block =
+							&state->decode_cache[block_number &
+								(MINIRV32_DECODE_BLOCK_SETS - 1u)];
+
+						if (__builtin_expect(
+							block->tag != (block_base | 1u), 0))
+							block = MiniRV32FillDecodeBlock(
+								state, image, ofs_pc, decoded_dispatch,
+								&&rv_decode_refill);
+						decoded_ptr = &block->decoded[slot];
+					}
+					goto rv_decode_fetch;
+				#else
 				switch (opcode)
 				{
-					case 0b01101: // LUI
-					rdid = (ir >> 7) & 0x1f;
-					rval = ( ir & 0xfffff000 );
+				#endif
+					MINIRV32_OPCODE_CASE(0b01101, rv_op_lui) // LUI
+					rdid = MINIRV32_DECODE_RD();
+					rval = MINIRV32_DECODE_U_IMMEDIATE(
+						(int32_t)(ir & 0xfffff000u));
 					break;
-					case 0b00101: // AUIPC
-					rdid = (ir >> 7) & 0x1f;
-					rval = pc + ( ir & 0xfffff000 );
+					MINIRV32_OPCODE_CASE(0b00101, rv_op_auipc) // AUIPC
+					rdid = MINIRV32_DECODE_RD();
+					rval = pc + MINIRV32_DECODE_U_IMMEDIATE(
+						(int32_t)(ir & 0xfffff000u));
 					break;
-					case 0b11011: // JAL
+					MINIRV32_OPCODE_CASE(0b11011, rv_op_jal) // JAL
 				{
-					rdid = (ir >> 7) & 0x1f;
+					rdid = MINIRV32_DECODE_RD();
 					int32_t reladdy = ((ir & 0x80000000)>>11) | ((ir & 0x7fe00000)>>20) | ((ir & 0x00100000)>>9) | ((ir&0x000ff000));
 					if( reladdy & 0x00100000 ) reladdy |= 0xffe00000; // Sign extension.
+					reladdy = MINIRV32_DECODE_J_IMMEDIATE(reladdy);
 					rval = pc + 4;
 					pc = pc + reladdy - 4;
+					#ifdef MINIRV32_DECODED_BLOCK_CACHE
+					decoded_ptr = &decoded_refill_entry;
+					#endif
 					break;
 				}
-					case 0b11001: // JALR
+					MINIRV32_OPCODE_CASE(0b11001, rv_op_jalr) // JALR
 				{
-					rdid = (ir >> 7) & 0x1f;
+					rdid = MINIRV32_DECODE_RD();
 					uint32_t imm = ir >> 20;
 					int32_t imm_se = imm | (( imm & 0x800 )?0xfffff000:0);
+					imm_se = MINIRV32_DECODE_I_IMMEDIATE(imm_se);
 					rval = pc + 4;
-					pc = ( (REG( (ir >> 15) & 0x1f ) + imm_se) & ~1) - 4;
+					pc = ((REG(MINIRV32_DECODE_RS1()) + imm_se) & ~1u) - 4;
+					#ifdef MINIRV32_DECODED_BLOCK_CACHE
+					decoded_ptr = &decoded_refill_entry;
+					#endif
 					break;
 				}
-						case 0b11000: // Branch
+					MINIRV32_OPCODE_CASE(0b11000, rv_op_branch) // Branch
 					{
-						MINIRV32_PERF_FUNCT3_INC(branch_funct3, ir);
-						uint32_t funct3 = (ir >> 12) & 0x7;
+						MINIRV32_PERF_FUNCT3_INC(
+							branch_funct3, MINIRV32_DECODE_FUNCT3());
+						uint32_t funct3 = MINIRV32_DECODE_FUNCT3();
 						uint32_t immm4 = ((ir & 0xf00)>>7) | ((ir & 0x7e000000)>>20) | ((ir & 0x80) << 4) | ((ir >> 31)<<12);
 					if( immm4 & 0x1000 ) immm4 |= 0xffffe000;
-					int32_t rs1 = REG((ir >> 15) & 0x1f);
-					int32_t rs2 = REG((ir >> 20) & 0x1f);
+					immm4 = MINIRV32_DECODE_B_IMMEDIATE(immm4);
+					int32_t rs1 = REG(MINIRV32_DECODE_RS1());
+					int32_t rs2 = REG(MINIRV32_DECODE_RS2());
 					immm4 = pc + immm4 - 4;
 					rdid = 0;
 						/* BNE and BEQ make up most Linux branches. Keep them out of
 						 * the indirect switch used by the less common comparisons. */
 						if (__builtin_expect(funct3 == 0b001, 1)) {
-							if (rs1 != rs2)
+							if (rs1 != rs2) {
 								pc = immm4;
+								#ifdef MINIRV32_DECODED_BLOCK_CACHE
+								decoded_ptr = &decoded_refill_entry;
+								#endif
+							}
 						} else if (funct3 == 0b000) {
-							if (rs1 == rs2)
+							if (rs1 == rs2) {
 								pc = immm4;
+								#ifdef MINIRV32_DECODED_BLOCK_CACHE
+								decoded_ptr = &decoded_refill_entry;
+								#endif
+							}
 						} else switch (funct3) {
 							// BLT, BGE, BLTU, BGEU
-							case 0b100: if( rs1 < rs2 ) pc = immm4; break;
-						case 0b101: if( rs1 >= rs2 ) pc = immm4; break; //BGE
-						case 0b110: if( (uint32_t)rs1 < (uint32_t)rs2 ) pc = immm4; break;   //BLTU
-						case 0b111: if( (uint32_t)rs1 >= (uint32_t)rs2 ) pc = immm4; break;  //BGEU
+							case 0b100:
+								if (rs1 < rs2) {
+									pc = immm4;
+									#ifdef MINIRV32_DECODED_BLOCK_CACHE
+									decoded_ptr = &decoded_refill_entry;
+									#endif
+								}
+								break;
+						case 0b101:
+							if (rs1 >= rs2) {
+								pc = immm4;
+								#ifdef MINIRV32_DECODED_BLOCK_CACHE
+								decoded_ptr = &decoded_refill_entry;
+								#endif
+							}
+							break;
+						case 0b110:
+							if ((uint32_t)rs1 < (uint32_t)rs2) {
+								pc = immm4;
+								#ifdef MINIRV32_DECODED_BLOCK_CACHE
+								decoded_ptr = &decoded_refill_entry;
+								#endif
+							}
+							break;
+						case 0b111:
+							if ((uint32_t)rs1 >= (uint32_t)rs2) {
+								pc = immm4;
+								#ifdef MINIRV32_DECODED_BLOCK_CACHE
+								decoded_ptr = &decoded_refill_entry;
+								#endif
+							}
+							break;
 						default: trap = (2+1);
 					}
 					break;
 				}
-					case 0b00000: // Load
+					MINIRV32_OPCODE_CASE(0b00000, rv_op_load) // Load
 					{
-						rdid = (ir >> 7) & 0x1f;
-						MINIRV32_PERF_FUNCT3_INC(load_funct3, ir);
-						uint32_t funct3 = (ir >> 12) & 7;
-					uint32_t rs1 = REG((ir >> 15) & 0x1f);
+						rdid = MINIRV32_DECODE_RD();
+						MINIRV32_PERF_FUNCT3_INC(
+							load_funct3, MINIRV32_DECODE_FUNCT3());
+						uint32_t funct3 = MINIRV32_DECODE_FUNCT3();
+					uint32_t rs1 = REG(MINIRV32_DECODE_RS1());
 					uint32_t imm = ir >> 20;
 					int32_t imm_se =
 						imm | ((imm & 0x800) ? 0xfffff000 : 0);
+					imm_se = MINIRV32_DECODE_I_IMMEDIATE(imm_se);
 					uint32_t virtual_addr = rs1 + imm_se;
 					int uncached = 0;
 					uint32_t virtual_page = virtual_addr & ~0xfffu;
@@ -966,12 +1289,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							trap = 2 + 1;
 							break;
 						}
-					} else if ((phys_addr >= 0x10000000 &&
-						    phys_addr < 0x12000200) ||
-						   (phys_addr >= 0x0c000000 &&
-						    phys_addr < 0x0c400000) ||
-						   (phys_addr >= 0x50000000 &&
-						    phys_addr < 0x50040000)) {
+					} else if (MINIRV32_IS_MMIO_ADDRESS(phys_addr)) {
 						if (phys_addr == 0x1100bffc)
 							rval = CSR(timerh);
 						else if (phys_addr == 0x1100bff8)
@@ -1011,18 +1329,20 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					}
 					break;
 				}
-						case 0b01000: // Store
+					MINIRV32_OPCODE_CASE(0b01000, rv_op_store) // Store
 					{
-						MINIRV32_PERF_FUNCT3_INC(store_funct3, ir);
-						uint32_t funct3 = (ir >> 12) & 7;
-					uint32_t rs1 = REG((ir >> 15) & 0x1f);
-					uint32_t rs2 = REG((ir >> 20) & 0x1f);
+						MINIRV32_PERF_FUNCT3_INC(
+							store_funct3, MINIRV32_DECODE_FUNCT3());
+						uint32_t funct3 = MINIRV32_DECODE_FUNCT3();
+					uint32_t rs1 = REG(MINIRV32_DECODE_RS1());
+					uint32_t rs2 = REG(MINIRV32_DECODE_RS2());
 					uint32_t imm =
 						((ir >> 7) & 0x1f) |
 						((ir & 0xfe000000) >> 20);
 
 					if (imm & 0x800)
 						imm |= 0xfffff000;
+					imm = MINIRV32_DECODE_S_IMMEDIATE(imm);
 
 					uint32_t virtual_addr = rs1 + imm;
 					int uncached = 0;
@@ -1103,12 +1423,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							trap = 2 + 1;
 							break;
 						}
-					} else if ((phys_addr >= 0x10000000 &&
-						    phys_addr < 0x12000200) ||
-						   (phys_addr >= 0x0c000000 &&
-						    phys_addr < 0x0c400000) ||
-						   (phys_addr >= 0x50000000 &&
-						    phys_addr < 0x50040000)) {
+					} else if (MINIRV32_IS_MMIO_ADDRESS(phys_addr)) {
 						if (phys_addr == 0x11004004)
 							CSR(timermatchh) = rs2;
 						else if (phys_addr == 0x11004000)
@@ -1139,14 +1454,16 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 						}
 						break;
 				}
-					case 0b00100: // Op-immediate
+					MINIRV32_OPCODE_CASE(0b00100, rv_op_opimm) // Op-immediate
 					{
-						rdid = (ir >> 7) & 0x1f;
-						MINIRV32_PERF_FUNCT3_INC(opimm_funct3, ir);
-						uint32_t funct3 = (ir >> 12) & 7;
+						rdid = MINIRV32_DECODE_RD();
+						MINIRV32_PERF_FUNCT3_INC(
+							opimm_funct3, MINIRV32_DECODE_FUNCT3());
+						uint32_t funct3 = MINIRV32_DECODE_FUNCT3();
 						uint32_t imm = ir >> 20;
 					imm = imm | (( imm & 0x800 )?0xfffff000:0);
-					uint32_t rs1 = REG((ir >> 15) & 0x1f);
+					imm = MINIRV32_DECODE_I_IMMEDIATE(imm);
+					uint32_t rs1 = REG(MINIRV32_DECODE_RS1());
 
 						/* ADDI is the dominant integer opcode during boot. */
 						if (__builtin_expect(funct3 == 0b000, 1)) {
@@ -1158,7 +1475,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 						case 0b010: rval = (int32_t)rs1 < (int32_t)imm; break; // SLTI
 						case 0b011: rval = rs1 < imm; break; // SLTIU
 						case 0b100: rval = rs1 ^ imm; break; // XORI
-						case 0b101: rval = (ir & 0x40000000) ?
+						case 0b101: rval = MINIRV32_DECODE_OPIMM_SRA() ?
 							((int32_t)rs1 >> (imm & 0x1f)) :
 							(rs1 >> (imm & 0x1f)); break; // SRAI/SRLI
 						case 0b110: rval = rs1 | imm; break; // ORI
@@ -1166,15 +1483,16 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					}
 					break;
 				}
-					case 0b01100: // Op
+					MINIRV32_OPCODE_CASE(0b01100, rv_op_op) // Op
 				{
-					rdid = (ir >> 7) & 0x1f;
-					MINIRV32_PERF_FUNCT3_INC(op_funct3, ir);
-					uint32_t rs1 = REG((ir >> 15) & 0x1f);
-					uint32_t rs2 = REG((ir >> 20) & 0x1f);
-					uint32_t funct3 = (ir >> 12) & 7u;
+					rdid = MINIRV32_DECODE_RD();
+					MINIRV32_PERF_FUNCT3_INC(
+						op_funct3, MINIRV32_DECODE_FUNCT3());
+					uint32_t rs1 = REG(MINIRV32_DECODE_RS1());
+					uint32_t rs2 = REG(MINIRV32_DECODE_RS2());
+					uint32_t funct3 = MINIRV32_DECODE_FUNCT3();
 
-					if (__builtin_expect(ir & 0x02000000, 0))
+					if (__builtin_expect(MINIRV32_DECODE_M_EXTENSION(), 0))
 					{
 						MINIRV32_PERF_INC(muldiv);
 						switch (funct3) //0x02000000 = RV32M
@@ -1192,7 +1510,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					else if (__builtin_expect(funct3 == 0b000, 1))
 					{
 						/* ADD/SUB is the dominant base-register operation. */
-						rval = (ir & 0x40000000) ?
+						rval = MINIRV32_DECODE_SUB_SRA() ?
 							(rs1 - rs2) : (rs1 + rs2);
 					}
 					else
@@ -1203,21 +1521,21 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							case 0b010: rval = (int32_t)rs1 < (int32_t)rs2; break;
 							case 0b011: rval = rs1 < rs2; break;
 							case 0b100: rval = rs1 ^ rs2; break;
-							case 0b101: rval = (ir & 0x40000000) ? ((int32_t)rs1 >> (rs2 & 0x1f)) : (rs1 >> (rs2 & 0x1f)); break;
+							case 0b101: rval = MINIRV32_DECODE_SUB_SRA() ? ((int32_t)rs1 >> (rs2 & 0x1f)) : (rs1 >> (rs2 & 0x1f)); break;
 							case 0b110: rval = rs1 | rs2; break;
 							case 0b111: rval = rs1 & rs2; break;
 						}
 					}
 					break;
 				}
-					case 0b00011:
+					MINIRV32_OPCODE_CASE(0b00011, rv_op_fence)
 					rdid = 0;
-					if (((ir >> 12) & 7) == 2 &&
-					    ((ir >> 7) & 0x1f) == 0) {
+					if (MINIRV32_DECODE_FUNCT3() == 2 &&
+					    MINIRV32_DECODE_RD() == 0) {
 						/* Zicbom CBOs use rs1 as the cache-block address. */
-						uint32_t operation = ir >> 20;
+						uint32_t operation = MINIRV32_DECODE_UIMM12(ir >> 20);
 						uint32_t virtual_addr =
-							REG((ir >> 15) & 0x1f);
+							REG(MINIRV32_DECODE_RS1());
 						uint32_t phys_addr;
 
 						if (operation > 2) {
@@ -1241,16 +1559,24 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							rval = virtual_addr;
 						}
 					}
-					/* Plain FENCE/FENCE.I need no host action. */
+					#ifdef MINIRV32_DECODED_BLOCK_CACHE
+					else if (MINIRV32_DECODE_FUNCT3() == 1) {
+						/* Guest stores become executable only after FENCE.I. */
+						MiniRV32FlushDecodeCache(state);
+						decoded_ptr = &decoded_refill_entry;
+						exec_virtual_page = UINT32_MAX;
+					}
+					#endif
+					/* Plain FENCE needs no host action. */
 					break;
-					case 0b11100: // Zifencei+Zicsr
+					MINIRV32_OPCODE_CASE(0b11100, rv_op_system) // Zifencei+Zicsr
 				{
-					rdid = (ir >> 7) & 0x1f;
-					uint32_t csrno = ir >> 20;
-					int microop = ( ir >> 12 ) & 0b111;
+					rdid = MINIRV32_DECODE_RD();
+					uint32_t csrno = MINIRV32_DECODE_UIMM12(ir >> 20);
+					int microop = MINIRV32_DECODE_FUNCT3();
 					if( (microop & 3) ) // It's a Zicsr function.
 					{
-						int rs1imm = (ir >> 15) & 0x1f;
+						int rs1imm = MINIRV32_DECODE_RS1();
 						uint32_t rs1 = REG(rs1imm);
 						uint32_t writeval = rs1;
 
@@ -1366,6 +1692,9 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 											 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
 									MiniRV32FlushTLB(state);
 									exec_virtual_page = UINT32_MAX;
+									#ifdef MINIRV32_DECODED_BLOCK_CACHE
+									decoded_ptr = &decoded_refill_entry;
+									#endif
 									read_virtual_page = UINT32_MAX;
 									write_virtual_page = UINT32_MAX;
 								}
@@ -1398,9 +1727,11 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					{
 						rdid = 0;
 
-						if ((ir & 0xfe007fffu) == 0x12000073u) {
-							uint32_t rs1id = (ir >> 15) & 0x1f;
-							uint32_t rs2id = (ir >> 20) & 0x1f;
+						if ((csrno & 0xfe0u) == 0x120u &&
+						    MINIRV32_DECODE_FUNCT3() == 0 &&
+						    MINIRV32_DECODE_RD() == 0) {
+							uint32_t rs1id = MINIRV32_DECODE_RS1();
+							uint32_t rs2id = MINIRV32_DECODE_RS2();
 							uint32_t current_asid =
 								(CSR(satp) >> 22) & 0x1ffu;
 							uint32_t requested_asid =
@@ -1415,6 +1746,9 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 									MINIRV32_PERF_INC(sfence_global);
 									MiniRV32FlushTLB(state);
 									exec_virtual_page = UINT32_MAX;
+									#ifdef MINIRV32_DECODED_BLOCK_CACHE
+									decoded_ptr = &decoded_refill_entry;
+									#endif
 									read_virtual_page = UINT32_MAX;
 									write_virtual_page = UINT32_MAX;
 								}
@@ -1424,8 +1758,12 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 
 								MINIRV32_PERF_INC(sfence_page);
 								MiniRV32FlushTLBPage(state, page);
-								if (exec_virtual_page == page)
+								if (exec_virtual_page == page) {
 									exec_virtual_page = UINT32_MAX;
+									#ifdef MINIRV32_DECODED_BLOCK_CACHE
+									decoded_ptr = &decoded_refill_entry;
+									#endif
+								}
 								if (read_virtual_page == page)
 									read_virtual_page = UINT32_MAX;
 								if (write_virtual_page == page)
@@ -1458,6 +1796,9 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 									(MINI_RV32_RAM_SIZE -
 									 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
 							exec_virtual_page = UINT32_MAX;
+							#ifdef MINIRV32_DECODED_BLOCK_CACHE
+							decoded_ptr = &decoded_refill_entry;
+							#endif
 							read_virtual_page = UINT32_MAX;
 							write_virtual_page = UINT32_MAX;
 							pc = CSR(sepc) - 4;
@@ -1480,6 +1821,9 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 									(MINI_RV32_RAM_SIZE -
 									 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
 							exec_virtual_page = UINT32_MAX;
+							#ifdef MINIRV32_DECODED_BLOCK_CACHE
+							decoded_ptr = &decoded_refill_entry;
+							#endif
 							read_virtual_page = UINT32_MAX;
 							write_virtual_page = UINT32_MAX;
 							pc = CSR(mepc) - 4;
@@ -1514,12 +1858,17 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 						trap = (2+1); 				// Note micrrop 0b100 == undefined.
 					break;
 				}
-					case 0b01011: // RV32A
+					MINIRV32_OPCODE_CASE(0b01011, rv_op_atomic) // RV32A
 				{
-					rdid = (ir >> 7) & 0x1f;
-					uint32_t virtual_addr = REG((ir >> 15) & 0x1f);
-					uint32_t rs2 = REG((ir >> 20) & 0x1f);
-					uint32_t irmid = (ir >> 27) & 0x1f;
+					rdid = MINIRV32_DECODE_RD();
+					uint32_t virtual_addr = REG(MINIRV32_DECODE_RS1());
+					uint32_t rs2 = REG(MINIRV32_DECODE_RS2());
+					uint32_t irmid =
+						#ifdef MINIRV32_DECODED_BLOCK_CACHE
+						MINIRV32_DECODE_AUX() & 0x1fu;
+						#else
+						(ir >> 27) & 0x1fu;
+						#endif
 					int access =
 						(irmid == 0b00010) ? ACCESS_READ : ACCESS_WRITE;
 					int uncached = 0;
@@ -1621,6 +1970,12 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					}
 					break;
 				}
+					#ifdef MINIRV32_DECODED_BLOCK_CACHE
+					rv_op_illegal:
+						trap = (2+1);
+						break;
+				} while (0);
+					#else
 					/* The switch key is instruction bits [6:2], so these are all
 					 * remaining entries in its 0..31 range.  Listing them makes the
 					 * dispatch exhaustive and lets the compiler omit a redundant
@@ -1648,6 +2003,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 						trap = (2+1); // Fault: invalid or unsupported opcode.
 						break;
 			}
+					#endif
 
 			// If there was a trap, do NOT allow register writeback.
 			if( trap )
