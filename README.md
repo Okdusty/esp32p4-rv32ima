@@ -2,6 +2,11 @@
 
 Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on [CNLohr's mini-rv32ima](https://github.com/cnlohr/mini-rv32ima). The ESP32-P4 is currently the only tested target.
 
+<div align="center">
+<img width="400" height="300" alt="20260827_142552" src="https://github.com/user-attachments/assets/fc94d895-d524-4a0b-a763-805fbcfaff4c" />
+<img width="400" height="300" alt="20260827_144636" src="https://github.com/user-attachments/assets/ab346992-d67d-4b86-9319-969dcc64a5f5" />
+</div>
+
 ## What changed from Epiczhul's + CNLohr's
 
 - Work is split between both ESP32-P4 CPU cores. The Linux guest is still single-core, but display, UART, and network work can run separately from the emulator.
