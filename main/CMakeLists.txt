@@ -34,7 +34,7 @@ idf_component_register(SRCS ${RV32_SOURCES}
 		       PRIV_REQUIRES esp_lcd esp_driver_gpio esp_driver_ledc
 		                     esp_driver_i2c esp_driver_spi
 		                     esp_driver_ppa
-		                     esp_hw_support esp_mm esp_timer
+		                     esp_hw_support esp_mm esp_timer soc
 		                     bootloader_support
 		                     esp_partition spi_flash heap esp_hal_usb
 		                     esp_event esp_wifi espressif__esp_hosted
