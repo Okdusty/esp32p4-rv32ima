@@ -1,0 +1,55 @@
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index 2414291aa908..008a8ac4fb09 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -212,30 +212,27 @@ static void dwc2_calculate_dynamic_fifo(struct dwc2_hsotg *hsotg)
+ 	 */
+ 	if (total_fifo_size < (rxfsiz + nptxfsiz + ptxfsiz)) {
+ 		/*
+-		 * For Buffer DMA mode/Scatter Gather DMA mode
+-		 * 2 * ((Largest Packet size / 4) + 1 + 1) + n
+-		 * with n = number of host channel.
+-		 * 2 * ((1024/4) + 2) = 516
+-		 */
+-		rxfsiz = 516 + hw->host_channels;
+-
+-		/*
+-		 * min non-periodic tx fifo depth
+-		 * 2 * (largest non-periodic USB packet used / 4)
+-		 * 2 * (512/4) = 256
+-		 */
+-		nptxfsiz = 256;
+-
+-		/*
+-		 * min periodic tx fifo depth
+-		 * (largest packet size*MC)/4
+-		 * (1024 * 3)/4 = 768
++		 * Keep the programmed regions inside the physical FIFO.  Some
++		 * high-speed cores reserve endpoint-info RAM at the end of DFIFO
++		 * and expose less than the Method 2 worst-case total.  Programming
++		 * the unbounded 516+n / 256 / 768 layout overlaps that reservation
++		 * and breaks even endpoint-zero control transfers.
++		 *
++		 * 512 RX words retain room for a 1024-byte packet plus status, 128
++		 * non-periodic TX words hold one high-speed bulk packet, and the
++		 * remaining words are assigned to periodic TX.  Keep a 16-word
++		 * floor for each TX FIFO on exceptionally small implementations.
+ 		 */
+-		ptxfsiz = 768;
+-
+-		params->host_rx_fifo_size = rxfsiz;
+-		params->host_nperio_tx_fifo_size = nptxfsiz;
+-		params->host_perio_tx_fifo_size = ptxfsiz;
++		if (total_fifo_size >= 48) {
++			rxfsiz = min_t(u32, 512, total_fifo_size - 32);
++			nptxfsiz = min_t(u32, 128,
++					   total_fifo_size - rxfsiz - 16);
++			ptxfsiz = total_fifo_size - rxfsiz - nptxfsiz;
++
++			params->host_rx_fifo_size = rxfsiz;
++			params->host_nperio_tx_fifo_size = nptxfsiz;
++			params->host_perio_tx_fifo_size = ptxfsiz;
++		}
+ 	}
+ 
+ 	/*

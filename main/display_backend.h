@@ -24,6 +24,10 @@ typedef struct {
   uint32_t format;
   uint32_t refresh_hz;
   const char *name;
+  /* True when CPU writes reach memory currently scanned by the panel. The
+   * bridge inserts a host-only render surface for these backends so partially
+   * painted frames are not exposed before VSYNC. */
+  bool framebuffer_is_live_scanout;
 } display_backend_surface_t;
 
 /* Initialize a packed RGB565 scanout but leave it disabled until start(). */

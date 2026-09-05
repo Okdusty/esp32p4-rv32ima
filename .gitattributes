@@ -1,0 +1,3 @@
+# Keep captured terminal whitespace and unified-diff context intact.
+docs/*.log -whitespace
+*.patch -whitespace

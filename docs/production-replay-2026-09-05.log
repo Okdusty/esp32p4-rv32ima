@@ -1,0 +1,21 @@
+pwd; pidof doom-bench-640; cat /proc/uptime
+pwd; pidof doom-bench-640; cat /proc/uptime
+/mnt/sd/opt/doom/save
+4166.35 4069.30
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ../doom-bench-640 -iwad ../freedoom1.wad \
+../doom-bench-640 -iwad ../freedoom1.wad \
+> -gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+-gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+> >/tmp/doom-replay.out 2>&1; rv32_bench_status=$?
+>/tmp/doom-replay.out 2>&1; rv32_bench_status=$?
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# printf 'benchmark_exit=%s\n' "$rv32_bench_status"
+printf 'benchmark_exit=%s\n' "$rv32_bench_stat
+us"
+benchmark_exit=0
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/doom-benchmark.log
+cat /tmp/doom-benchmark.log
+frames=100 elapsed_ms=31687 fps_x100=315 mode=present
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# sha256sum ../doom-bench-640
+sha256sum ../doom-bench-640
+66304de72f65948eaad46284cc3f0bf02ea74ed78387f5dea7ab8a398b532285  ../doom-bench-640
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# 

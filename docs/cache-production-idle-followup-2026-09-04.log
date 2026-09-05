@@ -1,0 +1,9 @@
+cat /proc/uptime; cat /proc/swaps
+cat /proc/uptime; cat /proc/swaps
+837.05 733.13
+Filename				Type		Size		Used		Priority
+/mnt/sd/.doom-swap                      file		16380		5632		-1
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# dmesg | grep -Ei 'panic|oops|BUG:|out of memory|underrun'
+dmesg | grep -Ei 'panic|oops|BUG:|out of memor
+y|underrun'
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# 

@@ -1,0 +1,13 @@
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.hMt4fm/production-shortcuts.elf has a LOAD segment with RWX permissions
+Native JIT production self-tests and 36 memory cases passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.hMt4fm/production-lifetime.elf has a LOAD segment with RWX permissions
+Native JIT production lifetime: 256 hot pairs, 64 cold-reuse cycles, rejection/flush passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.hMt4fm/production-backedges.elf has a LOAD segment with RWX permissions
+Native JIT production: 7056 branch/backedge register/PC/budget cases passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.hMt4fm/profile-shortcuts.elf has a LOAD segment with RWX permissions
+Native JIT profile self-tests and 36 memory cases passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.hMt4fm/profile-lifetime.elf has a LOAD segment with RWX permissions
+Native JIT profile lifetime: 256 hot pairs, 64 cold-reuse cycles, rejection/flush passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.hMt4fm/profile-backedges.elf has a LOAD segment with RWX permissions
+Native JIT profile: 7056 branch/backedge register/PC/budget cases passed
+Standalone artifacts: /tmp/rv32-native-jit.hMt4fm

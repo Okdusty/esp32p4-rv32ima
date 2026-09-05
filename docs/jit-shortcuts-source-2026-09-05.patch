@@ -1,0 +1,220 @@
+--- main/rv32_native_jit.c.before-shortcuts
++++ main/rv32_native_jit.c
+@@ -221,6 +221,7 @@
+ 	uint8_t tag_register;
+ 	uint8_t bias_register;
+ 	uint8_t valid;
++	uint8_t alignment_invariant;
+ };
+ 
+ struct jit_loop_read_cache_stub {
+@@ -229,12 +230,13 @@
+ 	uint8_t memory_stub;
+ 	uint8_t tag_register;
+ 	uint8_t bias_register;
+-	uint8_t padding;
++	uint8_t alignment_mask;
+ };
+ 
+ struct jit_loop_write_cache {
+ 	uint8_t instruction_index;
+ 	uint8_t valid;
++	uint8_t alignment_invariant;
+ };
+ 
+ struct jit_loop_write_cache_stub {
+@@ -243,7 +245,7 @@
+ 	uint8_t memory_stub;
+ 	uint8_t funct3;
+ 	uint8_t width;
+-	uint8_t padding;
++	uint8_t alignment_mask;
+ };
+ 
+ struct jit_builder {
+@@ -1242,6 +1244,31 @@
+ 	return false;
+ }
+ 
++/* A local page tag starts invalid on every native entry. Once its refill
++ * validates alignment, a fixed-offset access stays aligned across back edges
++ * if every write to its base preserves the low address bits. Only accept
++ * self-ADDI by a multiple of the access width (or an unchanged base); arbitrary
++ * arithmetic, loads into the base and changes on any branch path retain the
++ * per-access check. This proof does not validate translation or permissions. */
++static bool jit_loop_preserves_alignment(
++	const uint32_t *instructions, const enum jit_instruction_kind *kinds,
++	uint32_t loop_start, uint32_t count, uint32_t base, uint32_t width)
++{
++	if (loop_start >= count || width <= 1u)
++		return false;
++	for (uint32_t i = loop_start; i < count; i++) {
++		uint32_t instruction = instructions[i];
++
++		if (!jit_instruction_writes_register(instruction, kinds[i], base))
++			continue;
++		if ((instruction & 0x707fu) != 0x13u ||
++		    ((instruction >> 15) & 0x1fu) != base ||
++		    ((uint32_t)jit_i_immediate(instruction) & (width - 1u)) != 0u)
++			return false;
++	}
++	return true;
++}
++
+ /* Keep one high-value, invariant-base memory stream translated in a4 for the
+  * duration of a straight-line region segment.  Other integer and single
+  * memory operations do not use a4, so accesses separated by useful work can
+@@ -1803,7 +1830,7 @@
+ static bool jit_defer_loop_read_cache(
+ 	struct jit_builder *builder, const struct jit_memory_stub *memory_stub,
+ 	uint32_t *miss_instruction, uint32_t *continuation,
+-	const struct jit_loop_read_cache *cache)
++	const struct jit_loop_read_cache *cache, uint32_t width)
+ {
+ 	struct jit_loop_read_cache_stub *stub;
+ 	ptrdiff_t memory_stub_index;
+@@ -1822,13 +1849,14 @@
+ 	stub->memory_stub = (uint8_t)memory_stub_index;
+ 	stub->tag_register = cache->tag_register;
+ 	stub->bias_register = cache->bias_register;
++	stub->alignment_mask = cache->alignment_invariant ? (uint8_t)(width - 1u) : 0u;
+ 	return true;
+ }
+ 
+ static bool jit_defer_loop_write_cache(
+ 	struct jit_builder *builder, const struct jit_memory_stub *memory_stub,
+ 	uint32_t *miss_instruction, uint32_t *continuation, uint32_t funct3,
+-	uint32_t width)
++	uint32_t width, bool alignment_invariant)
+ {
+ 	struct jit_loop_write_cache_stub *stub;
+ 	ptrdiff_t memory_stub_index;
+@@ -1847,9 +1875,27 @@
+ 	stub->memory_stub = (uint8_t)memory_stub_index;
+ 	stub->funct3 = (uint8_t)funct3;
+ 	stub->width = (uint8_t)width;
++	stub->alignment_mask = alignment_invariant ? (uint8_t)(width - 1u) : 0u;
+ 	return true;
+ }
+ 
++static bool jit_emit_refill_alignment_guard(
++	struct jit_builder *builder, struct jit_memory_stub *memory_stub,
++	uint32_t mask)
++{
++	uint32_t *miss;
++
++	if (mask == 0u)
++		return true;
++	/* Keep t0 (page), a1 (address) and a2 (store value) intact. The local tag
++	 * must not become valid until this and the shared translation check pass. */
++	jit_emit(builder, rv_i(0x13u, RV_T2, 7u, RV_A1, (int32_t)mask));
++	miss = builder->cursor;
++	jit_emit(builder, 0u);
++	return jit_defer_memory_guard(builder, memory_stub, miss,
++				      1u, RV_T2, RV_X0);
++}
++
+ /* A local tag miss need not leave native execution when the shared checked
+  * page cache already knows the mapping.  Keep this refresh path out of the
+  * repeated loop body; only a true shared-cache miss reaches the resolver. */
+@@ -1871,6 +1917,9 @@
+ 		if (!jit_patch_branch(stub->miss_instruction, refresh, 1u,
+ 				      RV_T0, stub->tag_register))
+ 			return false;
++		if (!jit_emit_refill_alignment_guard(builder, memory_stub,
++						     stub->alignment_mask))
++			return false;
+ 		/* t0 still contains the current virtual page from the hot guard. */
+ 		jit_emit(builder, rv_i(0x13u, RV_T1, 7u, RV_T0,
+ 				       RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u));
+@@ -2015,6 +2064,9 @@
+ 		if (!jit_patch_branch(stub->miss_instruction, refresh, 1u,
+ 				      RV_T0, JIT_LOOP_WRITE_TAG_REGISTER))
+ 			return false;
++		if (!jit_emit_refill_alignment_guard(builder, memory_stub,
++						     stub->alignment_mask))
++			return false;
+ 		/* t0 is the current virtual page; a1/a2 retain address and value. */
+ 		jit_emit(builder, rv_i(0x13u, RV_T1, 7u, RV_T0,
+ 				       RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u));
+@@ -2205,7 +2257,7 @@
+ 		uint32_t *local_miss_patch;
+ 		uint32_t *continuation;
+ 
+-		if (width > 1u) {
++		if (width > 1u && !loop_cache->alignment_invariant) {
+ 			jit_emit(builder, rv_i(0x13u, RV_T2, 7u, RV_A1,
+ 					       (int32_t)(width - 1u)));
+ 			alignment_miss_patch = builder->cursor;
+@@ -2220,7 +2272,7 @@
+ 		jit_emit(builder, rv_i(0x03u, destination, funct3, RV_T0, 0));
+ 		if (!jit_defer_loop_read_cache(builder, stub,
+ 					       local_miss_patch, continuation,
+-					       loop_cache) ||
++					       loop_cache, width) ||
+ 		    (alignment_miss_patch != NULL &&
+ 		     !jit_defer_memory_guard(builder, stub,
+ 					     alignment_miss_patch, 1u,
+@@ -2306,7 +2358,7 @@
+ 		uint32_t *local_miss_patch;
+ 		uint32_t *continuation;
+ 
+-		if (width > 1u) {
++		if (width > 1u && !loop_cache->alignment_invariant) {
+ 			jit_emit(builder, rv_i(0x13u, RV_T2, 7u, RV_A1,
+ 					       (int32_t)(width - 1u)));
+ 			alignment_miss_patch = builder->cursor;
+@@ -2321,7 +2373,7 @@
+ 		continuation = builder->cursor;
+ 		if (!jit_defer_loop_write_cache(
+ 			    builder, stub, local_miss_patch, continuation,
+-			    funct3, width) ||
++			    funct3, width, loop_cache->alignment_invariant) ||
+ 		    (alignment_miss_patch != NULL &&
+ 		     !jit_defer_memory_guard(builder, stub,
+ 					     alignment_miss_patch, 1u,
+@@ -3207,6 +3259,28 @@
+ 		loop_write_cache = jit_find_loop_write_cache(
+ 			instructions, kinds, leaders, count, &persistent_memory,
+ 			hoist_persistent_memory);
++		for (uint32_t i = 0; i < loop_read_cache_count; i++) {
++			struct jit_loop_read_cache *cache = &loop_read_caches[i];
++			uint32_t instruction = instructions[cache->instruction_index];
++
++			cache->alignment_invariant =
++				cache->instruction_index >= loop_target_index &&
++				jit_loop_preserves_alignment(instructions, kinds,
++					loop_target_index, count,
++					(instruction >> 15) & 0x1fu,
++					jit_memory_width((instruction >> 12) & 7u, true));
++		}
++		if (loop_write_cache.valid) {
++			uint32_t instruction =
++				instructions[loop_write_cache.instruction_index];
++
++			loop_write_cache.alignment_invariant =
++				loop_write_cache.instruction_index >= loop_target_index &&
++				jit_loop_preserves_alignment(instructions, kinds,
++					loop_target_index, count,
++					(instruction >> 15) & 0x1fu,
++					jit_memory_width((instruction >> 12) & 7u, false));
++		}
+ 	}
+ 	for (uint32_t i = 0; i < loop_read_cache_count; i++) {
+ 		chain_registers_clobbered |=
+@@ -5964,6 +6038,15 @@
+ 				break;
+ 			}
+ 			returned_entry = &jit_entries[returned_slot];
++			/* Direct native links bypass jit_dispatch_code(), so their targets
++			 * otherwise accumulate no internal-tier admission evidence. A normal
++			 * chain return identifies one target we actually executed. Account for
++			 * that endpoint at this existing C boundary, never with per-link stores
++			 * in generated code. Do not credit the entire chain to this region or
++			 * double-count a return to the original dispatched slot. Intermediate
++			 * linked regions remain unsampled by this deliberately bounded policy. */
++			if (returned_slot != slot && bailout == 0u)
++				(void)jit_dispatch_code(returned_slot, returned_entry);
+ 			/* A tail-linked target installs no C-side site pointer. Recover it
+ 			 * from the final slot before invoking the checked slow path. */
+ 			if (bailout != 0u) {

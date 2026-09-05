@@ -4,10 +4,16 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
 export TERM=linux
 
+# Empty directories are not guaranteed to survive every initramfs assembly
+# path.  Create all mount points before using them so a missing directory
+# cannot leave Linux without procfs, sysfs, devtmpfs, or a login home.
+mkdir -p /proc /sys /dev /dev/pts /root \
+  /tmp/run /tmp/lock /tmp/log /etc/dropbear
+
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
-mkdir -p /dev/pts /tmp/run /tmp/lock /tmp/log /etc/dropbear
+mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts -o mode=620,ptmxmode=666
 ln -sf pts/ptmx /dev/ptmx
 

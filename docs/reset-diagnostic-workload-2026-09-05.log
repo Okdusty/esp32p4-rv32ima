@@ -1,0 +1,43 @@
+mkdir -p /mnt/sd; mount /dev/vda /mnt/sd
+mkdir -p /mnt/sd; mount /dev/vda /mnt/sd
+root@esp32p4-openwrt:~# swapon /mnt/sd/.doom-swap
+swapon /mnt/sd/.doom-swap
+root@esp32p4-openwrt:~# cd /mnt/sd/opt/doom/save; sha256sum ../doom-bench-640
+cd /mnt/sd/opt/doom/save; sha256sum ../doom-bench-640
+66304de72f65948eaad46284cc3f0bf02ea74ed78387f5dea7ab8a398b532285  ../doom-bench-640
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ../doom-bench-640 -iwad ../freedoom1.wad \
+../doom-bench-640 -iwad ../freedoom1.wad \
+> -gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+-gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+> >/tmp/reset-diag-demo1.out 2>&1; rv32_bench_status=$?
+>/tmp/reset-diag-demo1.out 2>&1; rv32_bench_status=$?
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# printf 'benchmark_exit=%s\n' "$rv32_bench_status"
+printf 'benchmark_exit=%s\n' "$rv32_bench_stat
+us"
+benchmark_exit=0
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/doom-benchmark.log
+cat /tmp/doom-benchmark.log
+frames=100 elapsed_ms=31022 fps_x100=322 mode=present
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# pidof doom-bench-640; cat /proc/uptime
+pidof doom-bench-640; cat /proc/uptime
+578.71 480.83
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# dmesg | grep -Ei 'panic|oops|BUG:|out of memory'
+dmesg | grep -Ei 'panic|oops|BUG:|out of memor
+y'
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /proc/swaps; ping -c 3 -W 2 192.168.1.1; sync
+cat /proc/swaps; ping -c 3 -W 2 192.168.1.1; s
+ync
+Filename				Type		Size		Used		Priority
+/mnt/sd/.doom-swap                      file		16380		5536		-1
+PING 192.168.1.1 (192.168.1.1): 56 data bytes
+64 bytes from 192.168.1.1: seq=0 ttl=64 time=36.448 ms
+64 bytes from 192.168.1.1: seq=1 ttl=64 time=6.557 ms
+64 bytes from 192.168.1.1: seq=2 ttl=64 time=10.002 ms
+
+--- 192.168.1.1 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 6.557/17.669/36.448 ms
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /proc/uptime
+cat /proc/uptime
+652.35 551.75
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# 

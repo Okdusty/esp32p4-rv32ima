@@ -1,0 +1,216 @@
+UART open at 921600; DTR/RTS inactive. :boot, :baud NUMBER, :quit, or guest command.
+echo UART_OK
+echo UART_OK
+UART_OK
+root@esp32p4-openwrt:~# cat /proc/uptime; cat /proc/swaps
+cat /proc/uptime; cat /proc/swaps
+1178.47 1160.42
+Filename				Type		Size		Used		Priority
+root@esp32p4-openwrt:~# mount | grep /mnt/sd
+mount | grep /mnt/sd
+root@esp32p4-openwrt:~# cat /proc/partitions
+cat /proc/partitions
+major minor  #blocks  name
+
+ 254        0   61069312 vda
+root@esp32p4-openwrt:~# mkdir -p /mnt/sd; mount /dev/vda /mnt/sd
+mkdir -p /mnt/sd; mount /dev/vda /mnt/sd
+root@esp32p4-openwrt:~# ls -l /mnt/sd/.doom-swap
+ls -l /mnt/sd/.doom-swap
+-rw-------    1 root     root      16777216 Jan  1 00:18 [0;0m/mnt/sd/.doom-swap[m
+root@esp32p4-openwrt:~# 
+[UART observation: suppressed 2 non-ASCII/control bytes, rate-limited 0 printable bytes in 5.0s]
+swapon /mnt/sd/.doom-swap
+swapon /mnt/sd/.doom-swap
+root@esp32p4-openwrt:~# cd /mnt/sd/opt/doom/save; sha256sum ../doom-bench-640
+cd /mnt/sd/opt/doom/save; sha256sum ../doom-bench-640
+66304de72f65948eaad46284cc3f0bf02ea74ed78387f5dea7ab8a398b532285  ../doom-bench-640
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ../doom-bench-640 -iwad ../freedoom1.wad \
+../doom-bench-640 -iwad ../freedoom1.wad \
+> -gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+-gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+> >/tmp/tx-retry-demo1.out 2>&1; rv32_bench_status=$?
+>/tmp/tx-retry-demo1.out 2>&1; rv32_bench_status=$?
+Display diagnostic: terminal release at 1258699 ms
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# Display diagnostic: terminal takeover at 1340325 ms, input=44 bytes
+printf 'benchmark_exit=%s\n' "$rv32_bench_status"
+printf 'benchmark_exit=%s\n' "$rv32_bench_stat
+us"
+benchmark_exit=0
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/doom-benchmark.log
+cat /tmp/doom-benchmark.log
+frames=100 elapsed_ms=44292 fps_x100=225 mode=present
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ps; cat /proc/swaps; cat /proc/uptime
+ps; cat /proc/swaps; cat /proc/uptime
+  PID USER       VSZ STAT COMMAND
+    1 root      1052 S    /usr/sbin/display-shell
+    2 root         0 SW   [kthreadd]
+    3 root         0 SW   [pool_workqueue_]
+    4 root         0 IW<  [kworker/R-slub_]
+    5 root         0 IW   [kworker/0:0-eve]
+    6 root         0 IW<  [kworker/0:0H-kb]
+    7 root         0 IW   [kworker/0:1-eve]
+    8 root         0 IW   [kworker/u4:0-ev]
+    9 root         0 IW<  [kworker/R-mm_pe]
+   10 root         0 SW   [ksoftirqd/0]
+   11 root         0 SW   [kdevtmpfs]
+   12 root         0 IW<  [kworker/R-inet_]
+   13 root         0 SW   [oom_reaper]
+   14 root         0 IW<  [kworker/R-write]
+   15 root         0 IW<  [kworker/R-bio_c]
+   16 root         0 IW<  [kworker/R-kbloc]
+   17 root         0 IW   [kworker/u4:1-hv]
+   18 root         0 SW   [kswapd0]
+   19 root         0 IW   [kworker/u4:2-ev]
+   20 root         0 SW   [khvcd]
+   21 root         0 IW<  [kworker/0:1H-kb]
+   40 root      1280 S    /usr/sbin/dropbear -E -p 22 -r /etc/dropbear/dropbear_ed25519_
+   42 root      1492 S    -ash
+   61 root         0 SW   [jbd2/vda-8]
+   62 root         0 IW<  [kworker/R-ext4-]
+   69 root      1492 R    ps
+Filename				Type		Size		Used		Priority
+/mnt/sd/.doom-swap                      file		16380		5348		-1
+1425.67 1309.30
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/tx-retry-demo1.out
+cat /tmp/tx-retry-demo1.out
+No /dev/input directory: No such file or directory
+Warning: no compatible keyboard; rendering without input
+                           Doom Generic 0.1
+Z_Init: Init zone memory allocation daemon. 
+zone memory: 0x94fd0040, 600000 allocated for zone
+Using . for configuration and saves
+V_Init: allocate screens.
+M_LoadDefaults: Load system defaults.
+saving config in .default.cfg
+W_Init: Init WADfiles.
+ adding ../freedoom1.wad
+ adding demo1.lmp
+ couldn't open demo1.lmp
+Playing demo demo1.lmp.
+Using ./.savegame/ for savegames
+===========================================================================
+                           Freedoom: Phase 1
+===========================================================================
+ Doom Generic is free software, covered by the GNU General Public
+ License.  There is NO warranty; not even for MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. You are welcome to change and distribute
+ copies under certain conditions. See the source for more information.
+===========================================================================
+ WARNING: You are playing using one of the Freedoom IWAD
+ files, which might not work in this port. See this page
+ for more information on how to play using Freedoom:
+   http://www.chocolate-doom.org/wiki/index.php/Freedoomroot@esp32p4-openwrt:/mnt/sd/opt/doom/save# dmesg | grep -Ei 'panic|oops|BUG:|out of memory'
+dmesg | grep -Ei 'panic|oops|BUG:|out of memor
+y'
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# sha256sum ../doom
+sha256sum ../doom
+dbee4967912ebedc42e19b500fdd04b1128b09b271448f8f844f751e6d7b8369  ../doom
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# (
+(
+> rv32_diag_args='-gfxmode rgb565 -nosound -nomusic'
+rv32_diag_args='-gfxmode rgb565 -nosound -nomusic'
+> ../doom -iwad ../freedoom1.wad $rv32_diag_args \
+../doom -iwad ../freedoom1.wad $rv32_diag_args \
+> -timedemo demo1 &
+-timedemo demo1 &
+> rv32_diag_pid=$!
+rv32_diag_pid=$!
+> printf 'long_pid=%s\n' "$rv32_diag_pid"
+printf 'long_pid=%s\n' "$rv32_diag_pid"
+> (
+(
+> sleep 180
+sleep 180
+> printf 'limit=180s\n' >/tmp/display-diag-long.stop
+printf 'limit=180s\n' >/tmp/display-diag-long.stop
+> kill -TERM "$rv32_diag_pid" 2>/dev/null
+kill -TERM "$rv32_diag_pid" 2>/dev/null
+> ) &
+) &
+> rv32_diag_guard=$!
+rv32_diag_guard=$!
+> wait "$rv32_diag_pid"
+wait "$rv32_diag_pid"
+> rv32_diag_status=$?
+rv32_diag_status=$?
+> kill "$rv32_diag_guard" 2>/dev/null
+kill "$rv32_diag_guard" 2>/dev/null
+> printf 'long_exit=%s\n' "$rv32_diag_status"
+printf 'long_exit=%s\n' "$rv32_diag_status"
+> )
+)
+long_pid=77
+Display diagnostic: terminal release at 1609681 ms
+No /dev/input directory: No such file or directory
+Warning: no compatible keyboard; rendering without input
+Display diagnostic: terminal takeover at 1609756 ms, input=51 bytes
+                           Doom Generic 0.1
+Z_Init: Init zone memory allocation daemon. 
+zone memory: 0x94f05040, 600000 allocated for zone
+Using . for configuration and saves
+V_Init: allocate screens.
+M_LoadDefaults: Load system defaults.
+saving config in .default.cfg
+W_Init: Init WADfiles.
+ adding ../freedoom1.wad
+ adding demo1.lmp
+ couldn't open demo1.lmp
+Playing demo demo1.lmp.
+Using ./.savegame/ for savegames
+===========================================================================
+                           Freedoom: Phase 1
+===========================================================================
+ Doom Generic is free software, covered by the GNU General Public
+ License.  There is NO warranty; not even for MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. You are welcome to change and distribute
+ copies under certain conditions. See the source for more information.
+===========================================================================
+ WARNING: You are playing using one of the Freedoom IWAD
+ files, which might not work in this port. See this page
+ for more information on how to play using Freedoom:
+   http://www.chocolate-doom.org/wiki/index.php/Freedoom
+===========================================================================
+I_Init: Setting up machine state.
+M_Init: Init miscellaneous info.
+R_Init: Init DOOM refresh daemon - .......................................
+P_Init: Init Playloop state.
+S_Init: Setting up sound.
+D_CheckNetGame: Checking network game status.
+startskill 2  deathmatch: 0  startmap: 1  startepisode: 1
+player 1 of 1 (1 nodes)
+Emulating the behavior of the 'Ultimate Doom' executable.
+HU_Init: Setting up heads up display.
+ST_Init: Init status bar.
+Window Title: Freedoom: Phase 1
+I_InitGraphics: framebuffer: x_res: 640, y_res: 400, x_virtual: 640, y_virtual: 400, bpp: 16
+I_InitGraphics: framebuffer: RGBA: 5650, red_off: 11, green_off: 5, blue_off: 0, transp_off: 16
+I_InitGraphics: DOOM screen size: w x h: 320 x 200
+I_InitGraphics: Auto-scaling factor: 2
+Display diagnostic: terminal release at 1646885 ms
+Terminated
+Display diagnostic: terminal takeover at 1792792 ms, input=11 bytes
+long_exit=143
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/display-diag-long.stop
+cat /tmp/display-diag-long.stop
+limit=180s
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# pidof doom doom-bench-640; cat /proc/uptime
+pidof doom doom-bench-640; cat /proc/uptime
+1926.06 1620.85
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# dmesg | grep -Ei 'panic|oops|BUG:|out of memory'
+dmesg | grep -Ei 'panic|oops|BUG:|out of memor
+y'
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /proc/swaps; ping -c 3 -W 2 192.168.1.1; sync
+cat /proc/swaps; ping -c 3 -W 2 192.168.1.1; s
+ync
+Filename				Type		Size		Used		Priority
+/mnt/sd/.doom-swap                      file		16380		5924		-1
+PING 192.168.1.1 (192.168.1.1): 56 data bytes
+64 bytes from 192.168.1.1: seq=0 ttl=64 time=43.187 ms
+64 bytes from 192.168.1.1: seq=1 ttl=64 time=7.001 ms
+64 bytes from 192.168.1.1: seq=2 ttl=64 time=6.628 ms
+
+--- 192.168.1.1 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 6.628/18.938/43.187 ms
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# 

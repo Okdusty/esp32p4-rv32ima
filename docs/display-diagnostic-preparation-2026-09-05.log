@@ -1,0 +1,29 @@
+Display ownership diagnostic host check (exit 0):
+Display diagnostic: terminal takeover at 123 ms, input=0 bytes
+Display diagnostic: terminal release at 123 ms
+Display diagnostic: terminal takeover at 123 ms, input=4 bytes
+diagnostic ownership/state assertions passed; zero-byte hazard remains
+
+UART on earlier reset-only image, prior to requesting download mode:
+free
+free
+              total        used        free      shared  buff/cache   available
+Mem:          20372        3780        6952        1172        9640       13712
+Swap:         16380        5492       10888
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cd /; sync
+cd /; sync
+root@esp32p4-openwrt:/# swapoff /mnt/sd/.doom-swap
+swapoff /mnt/sd/.doom-swap
+root@esp32p4-openwrt:/# umount /mnt/sd
+umount /mnt/sd
+root@esp32p4-openwrt:/# cat /proc/swaps
+cat /proc/swaps
+Filename				Type		Size		Used		Priority
+root@esp32p4-openwrt:/# mount | grep ' /mnt/sd '
+mount | grep ' /mnt/sd '
+root@esp32p4-openwrt:/# cat /proc/uptime
+cat /proc/uptime
+2563.95 2461.66
+root@esp32p4-openwrt:/# 
+Espressif USB download interface absent; FTDI console remains present.
+

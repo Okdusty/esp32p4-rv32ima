@@ -1,2 +1,10 @@
-# Device nodes required before /init mounts devtmpfs.
+# Runtime directories and device nodes required before /init mounts the
+# virtual filesystems.  Listing the empty directories here keeps them in the
+# generated initramfs even if the staged OpenWrt tree has pruned them.
+dir /dev 0755 0 0
+dir /proc 0555 0 0
+dir /sys 0555 0 0
+dir /root 0700 0 0
+dir /tmp 01777 0 0
+dir /run 0755 0 0
 nod /dev/console 0600 0 0 c 5 1

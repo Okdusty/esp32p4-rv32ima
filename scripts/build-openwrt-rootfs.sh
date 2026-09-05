@@ -68,6 +68,13 @@ else
   exit 1
 fi
 
+# Do not let credentials supplied to an earlier build leak into a later one
+# after its environment override has been removed.  Tracked overlay files, if
+# present, are copied back immediately below.
+rm -f \
+  "$openwrt_dir/files/etc/dropbear/dropbear_ed25519_host_key" \
+  "$openwrt_dir/files/etc/dropbear/authorized_keys" \
+  "$openwrt_dir/files/root/.ssh/authorized_keys"
 cp -a "$repo_root/guest/openwrt/overlay/." "$openwrt_dir/"
 cp -a "$repo_root/guest/openwrt/files/." "$openwrt_dir/files/"
 install -d -m 0755 "$openwrt_dir/files/etc"
@@ -75,8 +82,26 @@ printf '%s\n' "$guest_console" >"$openwrt_dir/files/etc/rv32-console"
 printf '%s\n' "$guest_dropbear" >"$openwrt_dir/files/etc/rv32-dropbear"
 
 if [[ -n ${DROPBEAR_HOST_KEY:-} ]]; then
+  if [[ ! -r $DROPBEAR_HOST_KEY ]]; then
+    echo "error: DROPBEAR_HOST_KEY is not readable: $DROPBEAR_HOST_KEY" >&2
+    exit 1
+  fi
   install -D -m 0600 "$DROPBEAR_HOST_KEY" \
     "$openwrt_dir/files/etc/dropbear/dropbear_ed25519_host_key"
+fi
+
+if [[ -n ${DROPBEAR_AUTHORIZED_KEYS:-} ]]; then
+  if [[ ! -s $DROPBEAR_AUTHORIZED_KEYS ]]; then
+    echo "error: DROPBEAR_AUTHORIZED_KEYS is empty or unreadable: $DROPBEAR_AUTHORIZED_KEYS" >&2
+    exit 1
+  fi
+  # OpenWrt Dropbear uses /etc/dropbear/authorized_keys.  Also install the
+  # conventional root path so the same initramfs remains usable if Dropbear
+  # or another SSH server is built with the standard authorized-key lookup.
+  install -D -m 0600 "$DROPBEAR_AUTHORIZED_KEYS" \
+    "$openwrt_dir/files/etc/dropbear/authorized_keys"
+  install -D -m 0600 "$DROPBEAR_AUTHORIZED_KEYS" \
+    "$openwrt_dir/files/root/.ssh/authorized_keys"
 fi
 
 if [[ -x "$openwrt_dir/scripts/feeds" ]]; then

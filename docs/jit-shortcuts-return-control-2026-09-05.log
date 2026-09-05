@@ -1,0 +1,326 @@
+
+[UART observation: suppressed 396 non-ASCII/control bytes, rate-limited 0 printable bytes in 5.1s]
+I (25) boot: ESP-IDF v6.1-rc1 2nd stage bootloader
+I (26) boot: compile time Sep  4 2026 00:50:15
+I (26) boot: Multicore bootloader
+I (28) boot: chip revision: v1.0
+I (28) boot: efuse block revision: v0.3
+I (28) qio_mode: Enabling default flash chip QIO
+I (28) boot.esp32p4: SPI Speed      : 80MHz
+I (29) boot.esp32p4: SPI Mode       : QIO
+I (29) boot.esp32p4: SPI Flash Size : 16MB
+I (29) boot: Enabling RNG early entropy source...
+I (30) boot: Partition Table:
+I (30) boot: ## Label            Usage          Type ST Offset   Length
+I (31) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (31) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (32) boot:  2 factory          factory app      00 00 00010000 00100000
+I (33) boot:  3 kernel           Unknown data     01 58 00110000 00ee0000
+I (34) boot:  4 dtb              Unknown data     01 58 00ff0000 00010000
+I (36) boot: End of partition table
+I (36) esp_image: segment 0: paddr=00010020 vaddr=48060020 size=33554h (210260) map
+I (68) esp_image: segment 1: paddr=0004357c vaddr=30100000 size=000b4h (   180) load
+I (70) esp_image: segment 2: paddr=00043638 vaddr=4ff00000 size=0c9e0h ( 51680) load
+I (80) esp_image: segment 3: paddr=00050020 vaddr=48000020 size=506e0h (329440) map
+I (128) esp_image: segment 4: paddr=000a0708 vaddr=4ff0c9e0 size=1b724h (112420) load
+I (148) esp_image: segment 5: paddr=000bbe34 vaddr=4ff28180 size=01c38h (  7224) load
+I (151) esp_image: segment 6: paddr=000bda74 vaddr=4ff40000 size=050ech ( 20716) load
+I (156) esp_image: segment 7: paddr=000c2b68 vaddr=50108080 size=00024h (    36) load
+I (166) boot: Loaded app from partition at offset 0x10000
+I (166) boot: Disabling RNG early entropy source...
+I (170) hex_psram: vendor id    : 0x0d (AP)
+I (170) hex_psram: Latency      : 0x01 (Fixed)
+I (171) hex_psram: DriveStr.    : 0x00 (25 Ohm)
+I (171) hex_psram: dev id       : 0x03 (generation 4)
+I (171) hex_psram: density      : 0x07 (256 Mbit)
+I (172) hex_psram: good-die     : 0x06 (Pass)
+I (172) hex_psram: SRF          : 0x02 (Slow Refresh)
+I (173) hex_psram: BurstType    : 0x00 ( Wrap)
+I (173) hex_psram: BurstLen     : 0x03 (2048 Byte)
+I (174) hex_psram: BitMode      : 0x01 (X16 Mode)
+I (174) hex_psram: Readlatency  : 0x04 (14 cycles@Fixed)
+I (175) hex_psram: DriveStrength: 0x00 (1/1)
+I (175) MSPI Timing: Enter psram timing tuning
+I esp_psram: Found 32MB PSRAM device
+I esp_psram: Speed: 200MHz
+I (356) mmu_psram: .rodata xip on psram
+I (375) mmu_psram: .text xip on psram
+I (376) hex_psram: psram CS IO is dedicated
+I (376) cpu_start: Multicore app
+I (847) esp_psram: SPI SRAM memory test OK
+I (857) cpu_start: GPIO 38 and 37 are used as console UART I/O pins
+I (857) cpu_start: Pro cpu start user code
+I (857) cpu_start: cpu freq: 360000000 Hz
+I (857) app_init: Application information:
+I (858) app_init: Project name:     uc-rv32ima
+I (858) app_init: App version:      db92727-dirty
+I (859) app_init: Compile time:     Sep  4 2026 20:38:24
+I (859) app_init: ELF file SHA256:  9036b4c85...
+I (860) app_init: ESP-IDF:          v6.1-rc1
+I (860) efuse_init: Min chip rev:     v0.1
+I (861) efuse_init: Max chip rev:     v1.99 
+I (861) efuse_init: Chip rev:         v1.0
+I (862) heap_init: Initializing. RAM available for dynamic allocation:
+I (863) heap_init: At 4FF29E00 len 000111C0 (68 KiB): RETENT_RAM
+I (863) heap_init: At 4FF3AFC0 len 00004BF0 (18 KiB): RAM
+I (864) heap_init: At 4FF64260 len 0001BDA0 (111 KiB): RAM
+I (865) heap_init: At 501080A4 len 00007F5C (31 KiB): RTCRAM
+I (865) heap_init: At 301000B4 len 00001F4C (7 KiB): SPM
+I (866) esp_psram: Adding pool of 32128K of PSRAM memory to heap allocator
+I (867) esp_psram: Adding pool of 62K of PSRAM memory gap generated due to end address alignment of irom to the heap allocator
+I (868) esp_psram: Adding pool of 50K of PSRAM memory gap generated due to end address alignment of drom to the heap allocator
+I (870) spi_flash: detected chip: gd
+I (870) spi_flash: flash io: qio
+W (870) spi_flash: Detected size(32768k) larger than the size in the binary image header(16384k). Using the size in the binary image header.
+I (872) host_init: ESP Hosted : Host chip_ip[18]
+I (872) H_API: ESP-Hosted starting. Hosted_Tasks: prio:23, stack: 5120 RPC_task_stack: 5120
+I (873) H_API: ** add_esp_wifi_remote_channels **
+W (874) os_wrapper_esp: CONFIG_FREERTOS_HZ is 100, ESP-Hosted recommended 1000, to avoid bus level jitters
+I (875) SD_HOST: src_freq_hz: 160000000
+I (877) sleep_clock: System sleep clock ICG setting initialization
+I (877) main_task: Started on CPU0
+I I( (877) H_SDIO_DRV: sdi9o_data_to_rx1_buf_task sta7rted
+) esp_psram: Reserving pool of 32K of internal memory for DMA/internal allocations
+I (917) main_task: Calling app_main()
+psram init
+Available PSRAM: 32922516 bytes (31.40 MB)
+Largest PSRAM block: 32505856 bytes (31.00 MB)
+Attempting to allocate 31457280 bytes (30.00 MB)...
+SUCCESS: PSRAM allocated at 0x480a0a08, size: 31457280 bytes (30.00 MB)
+Identity-mapped Linux DMA RAM: 0x48400000-0x49dfffff
+PSRAM guest aperture reserved successfully!
+Reserved host PSRAM auxiliary pool: 128 KiB
+Display bulk storage: 88 KiB reserved PSRAM
+
+=== Initializing RGB565 display backend ===
+I (917) st7703: version: 2.0.0
+Display buffering: Linux-reserved PSRAM render surface 0x49d02000 -> live scanout 0x49ea0a80 (1036800 bytes, 128-byte alignment)
+Display acceleration ready: RGB565 staging 131072 bytes, PPA scale=yes fill=yes
+Waveshare ST7703 MIPI-DSI ready: 720x720 packed RGB565 at 59 Hz, render 0x49d02000 -> scanout 0x49ea0a80 mapped at guest 0x11800000 (1036800 bytes), VSYNC cache-clean delay 0 ms, async FIFO 16 commands + 2 x 32768-byte payloads, service on CPU1
+DWC2 passthrough ready: registers 0x50000000, core 0x4f54400a, limit=high-speed, port=disconnected
+USB ownership: Linux DWC2 (ESP-IDF USB Host and TinyUSB are not installed)
+USB 2.0 UTMI PHY: dedicated DM=49 DP=50; connector role and VBUS sourcing are provided by board hardware
+I (1377) rv32-net: starting C6 over SDIO4 GPIO14-19, reset GPIO54
+I (1377) H_API: ESP-Hosted Try to communicate with ESP-Hosted slave
+
+I (1377) transport: Attempt connection with slave: retry[0]
+W (1377) H_SDIO_DRV: Reset slave using GPIO[54]
+I (1377) os_wrapper_esp: GPIO [54] configured
+UART0 bridge: 921600 baud, interrupt-buffered RX; TX 921 bytes/tick at priority 2 on CPU1
+virtio-console: standard hvc transport at 0x12100000, PLIC source 4
+I (1377) sdmmc_periph: SDMMC host controller already created, returning existing handle
+virtio-blk: 700 KiB host-PSRAM read cache, 175 x 4096-byte lines
+Name: SD
+Type: SDHC
+Speed: 40.00 MHz (limit: 40.00 MHz)
+Size: 59638MB
+CSD: ver=2, sector_size=512, capacity=122138624 read_bl_len=9
+SSR: bus_width=4
+virtio-blk: microSD 59638 MiB at 0x12200000, PLIC source 5; I/O worker on CPU1
+Native RV32 JIT ready: self-tested, 2048 two-way region tags in a 2048 KiB adaptive executable L2 arena + 16 KiB internal hot tier; ready-region chaining, one shared ABI frame
+
+Loading kernel from flash...
+
+=== Loading Kernel from Flash ===
+Kernel text offset: 0x400000
+Kernel image size:   10993576 bytes
+Kernel flash payload: 10861732 bytes
+Found kernel partition:
+  Label: kernel
+  Address: 0x110000
+  Size: 10861732 bytes (10.36 MB)
+
+Loading kernel from flash to PSRAM...
+This will take a moment...
+I (2897) sdio_wrapper: SDIO master: Slot 1, Data-Lines: 4-bit Freq(KHz)[40000 KHz]
+I (2897) sdio_wrapper: GPIOs: CLK[18] CMD[19] D0[14] D1[15] D2[16] D3[17] Slave_Reset[54]
+I (2897) sdio_wrapper: Queues: Tx[20] Rx[20] SDIO-Rx-Mode[1]
+I (2937) sdio_wrapper: Function 0 Blocksize: 512
+I (2937) sdio_wrapper: Function 1 Blocksize: 512
+I (3037) H_SDIO_DRV: Card init success, TRANSPORT_RX_ACTIVE
+I (3037) transport: set_transport_state: 1
+I (3037) transport: Waiting for esp_hosted slave to be ready
+I (3077) H_SDIO_DRV: Starting SDIO process rx task
+I (3077) H_SDIO_DRV: SDIO Host operating in STREAMING MODE
+I (3077) H_SDIO_DRV: Open data path at slave
+I (3087) H_SDIO_DRV: Received ESP_PRIV_IF type message
+I (3087) transport: Received INIT event from ESP32 peripheral
+I (3087) transport: EVENT: 12
+I (3087) transport: Identified slave [esp32c6]
+I (3097) transport: EVENT: 11
+I (3097) transport: capabilities: 0xd
+I (3097) transport: Features supported are:
+I (3097) transport: 	 * WLAN
+I (3097) transport: 	   - HCI over SDIO
+I (3097) transport: 	   - BLE only
+I (3097) transport: EVENT: 13
+W (3097) transport: Version mismatch: Host [2.12.0] > Co-proc [0.0.0] ==> Upgrade co-proc to avoid RPC timeouts
+I (3107) transport: ESP board type is : 13 
+
+I (3107) transport: Base transport is set-up, TRANSPORT_TX_ACTIVE
+I (3107) H_API: Transport active
+I (3107) transport: Slave chip Id[12]
+I (3107) transport: raw_tp_dir[-], flow_ctrl: low[60] high[80]
+I (3107) transport: transport_delayed_init
+I (3107) hci_stub_drv: Host BT Support: Disabled
+I (3107) H_SDIO_DRV: Received INIT event
+I (3117) H_SDIO_DRV: Event type: 0x22
+I (3117) H_SDIO_DRV: Write thread started
+I (3237) transport: Attempt connection with slave: retry[0]
+I (3237) transport: Transport is already up
+
+Kernel loaded successfully from flash!
+Total loaded: 10861732 bytes (10.36 MB)
+
+=== Loading DTB from Flash ===
+DTB size: 3600 bytes
+Seeded Linux CRNG with 64 bytes of fresh P4 hardware entropy
+DTB loaded at guest address 0x49d00000
+
+=== Verifying Kernel Header ===
+First 64 bytes of loaded kernel:
+6f 00 40 0d 00 00 00 00 00 00 40 00 00 00 00 00 
+a8 bf a7 00 00 00 00 00 00 00 00 00 00 00 00 00 
+02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+52 49 53 43 56 00 00 00 52 53 43 05 00 00 00 00 
+
+First instruction: 0x0d40006f
+Verified RISCV magic header
+L2 next-line prefetch: host [0x48400000, 0x49e00000)
+RV32IMA starting
+Initial PC: 0x48400000
+Linux version 7.2.0-11658-g26260251022f-dirty (dusty@dusty-got-laptop) (riscv32-openwrt-linux-musl-gcc (OpenWrt GCC 14.3.0 r33051-f5dae5ece4) 14.3.0, GNU ld (GNU Binutils) 2.44) #60 PREEMPT Fri Sep  4 15:51:10 -00 2026
+random: crng init done
+OF: fdt: Ignoring memory range 0x48000000 - 0x48400000
+Machine model: riscv-minimal-nommu,qemu
+SBI specification v0.2 detected
+SBI implementation ID=0x0 Version=0x1
+SBI TIME extension detected
+earlycon: uart8250 at MMIO 0x10000000 (options '16550a')
+printk: legacy bootconsole [uart8250] enabled
+USB DWC2 state: linux=not-probed mode=host power=0 connected=0 enabled=0 line=SE0(0) speed=high-speed(0) hprt=00000000 gahbcfg=00000021 gintmsk=20000000 gintsts=1400002d irq=0
+I (3877) RPC_WRAP: Coprocessor Boot-up
+I (3997) esp_
+[UART observation: suppressed 691 non-ASCII/control bytes, rate-limited 0 printable bytes in 5.0s]
+wifi_remote: esp_wifi_internal_reg_rxcb: sta: 0x48024cbe
+I (4017) rv32-net: C6 modem power saving disabled
+I (4027) rv32-net: C6 HT40 bandwidth enabled when supported by AP
+I (4137) rv32-net: virtio-net MAC cc:ba:97:f0:1b:f4
+I (4137) rv32-net: C6 SDIO transport is up
+I (4137) RPC_WRAP: ESP Event: wifi station started
+I (4147) H_API: esp_wifi_remote_connect
+I (7097) RPC_WRAP: ESP Event: Station mode: Connected
+I (7097) esp_wifi_remote: esp_wifi_internal_reg_rxcb: sta: 0x48024cbe
+I (7137) rv32-net: associated BSSID c0:b1:01:07:f2:82 channel 4
+I (7137) rv32-net: C6 associated; Linux eth0 carrier on
+USB DWC2 state: linux=probed/configured mode=host power=1 connected=0 enabled=0 line=SE0(0) speed=high-speed(0) hprt=00001000 gahbcfg=00000023 gintmsk=f3000806 gintsts=04000021 irq=0
+I (8557) rv32-net: packet path active: rx=1 tx=0 rx_drop=0 tx_error=0
+USB DWC2 has enabled root-port power, but the PHY still sees no device pull-up; check connector VBUS, CC role resistors, and the dedicated DM/DP path
+
+
+BusyBox v1.37.0 (2026-06-29 12:59:20 UTC) built-in shell (ash)
+
+  _______                     ________        __
+ |       |.-----.-----.-----.|  |  |  |.----.|  |_
+ |   -   ||  _  |  -__|     ||  |  |  ||   _||   _|
+ |_______||   __|_____|__|__||________||__|  |____|
+          |__| W I R E L E S S   F R E E D O M
+ -----------------------------------------------------
+ OpenWrt 25.12.5, r33051-f5dae5ece4 Dave's Guitar
+ -----------------------------------------------------
+
+ OpenWrt recently switched to the "apk" package manager!
+
+ OPKG Command           APK Equivalent      Description
+ ------------------------------------------------------------------
+ opkg install <pkg>     apk add <pkg>       Install a package
+ opkg remove <pkg>      apk del <pkg>       Remove a package
+ opkg upgrade           apk upgrade         Upgrade all packages
+ opkg files <pkg>       apk info -L <pkg>   List package contents
+ opkg list-installed    apk info            List installed packages
+ opkg update            apk update          Update package lists
+ opkg search <pkg>      apk search <pkg>    Search for packages
+ ------------------------------------------------------------------
+
+For more information visit:
+https://openwrt.org/docs/guide-user/additional-software/opkg-to-apk-cheatsheet
+
+root@esp32p4-openwrt:~# mount | grep -E 'vda|mmc|/mnt/sd'; cat /proc/swaps
+mount | grep -E 'vda|mmc|/mnt/sd'; cat /proc/swaps
+Filename				Type		Size		Used		Priority
+root@esp32p4-openwrt:~# mkdir -p /mnt/sd; mount /dev/vda /mnt/sd
+mkdir -p /mnt/sd; mount /dev/vda /mnt/sd
+root@esp32p4-openwrt:~# swapon /mnt/sd/.doom-swap
+swapon /mnt/sd/.doom-swap
+root@esp32p4-openwrt:~# cd /mnt/sd/opt/doom/save; sha256sum ../doom-bench-640
+cd /mnt/sd/opt/doom/save; sha256sum ../doom-bench-640
+66304de72f65948eaad46284cc3f0bf02ea74ed78387f5dea7ab8a398b532285  ../doom-bench-640
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ../doom-bench-640 -iwad ../freedoom1.wad \
+../doom-bench-640 -iwad ../freedoom1.wad \
+> -gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+-gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+> >/tmp/doom-shortcuts-A1.out 2>&1; rv32_bench_status=$?
+>/tmp/doom-shortcuts-A1.out 2>&1; rv32_bench_status=$?
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# printf 'benchmark_exit=%s\n' "$rv32_bench_status"
+printf 'benchmark_exit=%s\n' "$rv32_bench_stat
+us"
+benchmark_exit=0
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/doom-benchmark.log
+cat /tmp/doom-benchmark.log
+frames=100 elapsed_ms=31847 fps_x100=314 mode=present
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ../doom-bench-640 -iwad ../freedoom1.wad \
+../doom-bench-640 -iwad ../freedoom1.wad \
+> -gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+-gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+> >/tmp/doom-shortcuts-A2.out 2>&1; rv32_bench_status=$?
+>/tmp/doom-shortcuts-A2.out 2>&1; rv32_bench_status=$?
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# printf 'benchmark_exit=%s\n' "$rv32_bench_status"
+printf 'benchmark_exit=%s\n' "$rv32_bench_stat
+us"
+benchmark_exit=0
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/doom-benchmark.log
+cat /tmp/doom-benchmark.log
+frames=100 elapsed_ms=31166 fps_x100=320 mode=present
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ../doom-bench-640 -iwad ../freedoom1.wad \
+../doom-bench-640 -iwad ../freedoom1.wad \
+> -gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+-gfxmode rgb565 -nosound -nomusic -timedemo demo1 \
+> >/tmp/doom-shortcuts-A3.out 2>&1; rv32_bench_status=$?
+>/tmp/doom-shortcuts-A3.out 2>&1; rv32_bench_status=$?
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# printf 'benchmark_exit=%s\n' "$rv32_bench_status"
+printf 'benchmark_exit=%s\n' "$rv32_bench_stat
+us"
+benchmark_exit=0
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/doom-benchmark.log
+cat /tmp/doom-benchmark.log
+frames=100 elapsed_ms=37022 fps_x100=270 mode=present
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# pidof doom-bench-640; cat /proc/swaps
+pidof doom-bench-640; cat /proc/swaps
+Filename				Type		Size		Used		Priority
+/mnt/sd/.doom-swap                      file		16380		6108		-1
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# dmesg | grep -Ei 'panic|oops|BUG:|out of memory|underrun'
+dmesg | grep -Ei 'panic|oops|BUG:|out of memor
+y|underrun'
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# ping -c 3 -W 2 192.168.1.1; sync
+ping -c 3 -W 2 192.168.1.1; sync
+PING 192.168.1.1 (192.168.1.1): 56 data bytes
+64 bytes from 192.168.1.1: seq=0 ttl=64 time=76.476 ms
+64 bytes from 192.168.1.1: seq=1 ttl=64 time=7.347 ms
+64 bytes from 192.168.1.1: seq=2 ttl=64 time=11.939 ms
+
+--- 192.168.1.1 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max = 7.347/31.920/76.476 ms
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# grep -E 'zone memory:|Playing demo' \
+grep -E 'zone memory:|Playing demo' \
+> /tmp/doom-shortcuts-A1.out /tmp/doom-shortcuts-A2.out \
+/tmp/doom-shortcuts-A1.out /tmp/doom-shortcuts-A2.out \
+> /tmp/doom-shortcuts-A3.out
+/tmp/doom-shortcuts-A3.out
+/tmp/doom-shortcuts-A1.out:zone memory: 0x94fb5040, 600000 allocated for zone
+/tmp/doom-shortcuts-A1.out:Playing demo demo1.lmp.
+/tmp/doom-shortcuts-A2.out:zone memory: 0x94f40040, 600000 allocated for zone
+/tmp/doom-shortcuts-A2.out:Playing demo demo1.lmp.
+/tmp/doom-shortcuts-A3.out:zone memory: 0x94f9a040, 600000 allocated for zone
+/tmp/doom-shortcuts-A3.out:Playing demo demo1.lmp.
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# 

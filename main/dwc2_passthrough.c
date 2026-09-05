@@ -1,12 +1,11 @@
 /*
- * NOT USED!! 
- *
  * ESP32-P4 high-speed DWC2 hardware passthrough.
  *
  * Linux owns the controller registers and all USB protocol state.  ESP-IDF
  * only keeps the UTMI PHY clocked and reflects the physical interrupt into
  * the guest PLIC.  Transfer descriptors and payloads contain identity-mapped
- * PSRAM addresses, so the DWC2 data path never passes through this file.
+ * PSRAM addresses, so the DWC2 payload path never passes through this file.
+ * Only controller register accesses and interrupt delivery cross the emulator.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -15,6 +14,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+#include "sdkconfig.h"
 #include "esp_err.h"
 #include "esp_intr_alloc.h"
 #include "esp_private/usb_phy.h"
@@ -23,6 +23,15 @@
 #include "soc/usb_dwc_struct.h"
 
 #include "dwc2_passthrough.h"
+
+#if defined(CONFIG_RV32_USB_FULL_SPEED_ONLY) && \
+	CONFIG_RV32_USB_FULL_SPEED_ONLY
+#define DWC2_PHY_SPEED_LIMIT USB_PHY_SPEED_FULL
+#define DWC2_PHY_SPEED_LIMIT_NAME "full-speed"
+#else
+#define DWC2_PHY_SPEED_LIMIT USB_PHY_SPEED_HIGH
+#define DWC2_PHY_SPEED_LIMIT_NAME "high-speed"
+#endif
 
 static usb_phy_handle_t usb_phy;
 static usb_dwc_hal_context_t usb_hal;
@@ -40,6 +49,36 @@ static uint32_t last_gintmsk;
 static bool last_guest_read_seen;
 static bool last_guest_write_seen;
 static bool initialized;
+
+static const char *dwc2_port_speed_name(uint32_t speed)
+{
+	switch (speed) {
+	case USB_DWC_SPEED_HIGH:
+		return "high-speed";
+	case USB_DWC_SPEED_FULL:
+		return "full-speed";
+	case USB_DWC_SPEED_LOW:
+		return "low-speed";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *dwc2_line_state_name(uint32_t line_state)
+{
+	switch (line_state) {
+	case 0:
+		return "SE0";
+	case 1:
+		return "D+";
+	case 2:
+		return "D-";
+	case 3:
+		return "SE1-invalid";
+	default:
+		return "unknown";
+	}
+}
 
 static void dwc2_physical_isr(void *argument)
 {
@@ -83,7 +122,7 @@ int dwc2_passthrough_init(void)
 		.controller = USB_PHY_CTRL_OTG,
 		.target = USB_PHY_TARGET_UTMI,
 		.otg_mode = USB_OTG_MODE_HOST,
-		.otg_speed = USB_PHY_SPEED_HIGH,
+		.otg_speed = DWC2_PHY_SPEED_LIMIT,
 		.ext_io_conf = NULL,
 		.otg_io_conf = NULL,
 	};
@@ -115,14 +154,15 @@ int dwc2_passthrough_init(void)
 	}
 
 	initialized = true;
-	printf("DWC2 HS passthrough ready: registers 0x%08x, core 0x%08lx, "
-	       "port=%s\n",
+	printf("DWC2 passthrough ready: registers 0x%08x, core 0x%08lx, "
+	       "limit=%s, port=%s\n",
 	       DWC2_GUEST_BASE, (unsigned long)USB_DWC_HS.gsnpsid_reg.val,
+	       DWC2_PHY_SPEED_LIMIT_NAME,
 	       USB_DWC_HS.hprt_reg.prtconnsts ? "connected" : "disconnected");
 	printf("USB ownership: Linux DWC2 (ESP-IDF USB Host and TinyUSB are "
 	       "not installed)\n");
-	printf("WARNING: board H2 is wired as a Type-C sink (CC1/CC2 Rd); "
-	       "native host needs DFP/Rp and a protected VBUS source\n");
+	printf("USB 2.0 UTMI PHY: dedicated DM=49 DP=50; connector role and "
+	       "VBUS sourcing are provided by board hardware\n");
 	return 0;
 }
 
@@ -148,7 +188,7 @@ void dwc2_passthrough_service(void)
 
 	if (changed) {
 		printf("USB DWC2 state: linux=%s%s mode=%s power=%u "
-		       "connected=%u enabled=%u line=%lu speed=%lu "
+		       "connected=%u enabled=%u line=%s(%lu) speed=%s(%lu) "
 		       "hprt=%08lx gahbcfg=%08lx gintmsk=%08lx "
 		       "gintsts=%08lx irq=%u\n",
 		       guest_read_seen ? "probed" : "not-probed",
@@ -157,7 +197,9 @@ void dwc2_passthrough_service(void)
 		       USB_DWC_HS.hprt_reg.prtpwr,
 		       USB_DWC_HS.hprt_reg.prtconnsts,
 		       USB_DWC_HS.hprt_reg.prtena,
+		       dwc2_line_state_name(USB_DWC_HS.hprt_reg.prtlnsts),
 		       (unsigned long)USB_DWC_HS.hprt_reg.prtlnsts,
+		       dwc2_port_speed_name(USB_DWC_HS.hprt_reg.prtspd),
 		       (unsigned long)USB_DWC_HS.hprt_reg.prtspd,
 		       (unsigned long)hprt, (unsigned long)gahbcfg,
 		       (unsigned long)gintmsk, (unsigned long)gintsts,
@@ -178,8 +220,8 @@ void dwc2_passthrough_service(void)
 			powered_no_link_polls++;
 		if (powered_no_link_polls == 10 && !no_link_warning_printed) {
 			printf("USB DWC2 has enabled root-port power, but the PHY "
-			       "still sees no device pull-up; check H2 VBUS and "
-			       "Type-C DFP/Rp hardware\n");
+			       "still sees no device pull-up; check connector VBUS, "
+			       "CC role resistors, and the dedicated DM/DP path\n");
 			no_link_warning_printed = true;
 		}
 	} else {

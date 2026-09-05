@@ -1,11 +1,12 @@
 /*
  * Backend-neutral paravirtual RGB565 framebuffer bridge.
  *
- * Linux sees the DPI driver's scanout allocation as a simple-framebuffer at
- * DISPLAY_FB_GUEST_BASE.  Guest reads and writes are redirected to the real
- * ESP-IDF framebuffer by the emulator's MMIO callbacks.  A separate generic
- * RGB565 staging aperture can ask the ESP32-P4 PPA to scale and center a
- * smaller packed surface without changing tty0's native scanout geometry.
+ * Linux sees a logical RGB565 simple-framebuffer at DISPLAY_FB_GUEST_BASE.
+ * Guest reads and writes are redirected by the emulator's MMIO callbacks.
+ * Backends with continuously scanned memory use a host-owned render surface
+ * and publish it with the ESP32-P4 PPA; other backends render directly.  A
+ * separate generic staging aperture can also scale and center smaller packed
+ * surfaces without changing tty0's native geometry.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -27,8 +28,10 @@
 #include "esp_private/esp_cache_private.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
+#include "psram.h"
 
 /*
  * Dirty framebuffer writes accumulate until the panel's VSYNC interrupt. The
@@ -48,7 +51,11 @@
 #define DISPLAY_PV_PAYLOAD_BLOCK_COUNT CONFIG_RV32_DISPLAY_PAYLOAD_BLOCK_COUNT
 #define DISPLAY_PV_INLINE_PAYLOAD_SIZE 128u
 #define DISPLAY_TILE_MAX_COUNT 256u
-#define DISPLAY_TILE_FONT_SIZE DISPLAY_PV_PAYLOAD_SIZE
+/* Keep the font cache independent from the streaming-write transfer size.
+ * A 16 KiB cache preserves the previous maximum font payload while allowing
+ * larger bulk blocks to reduce guest/host mailbox traffic without reserving
+ * otherwise unused font storage. */
+#define DISPLAY_TILE_FONT_SIZE (16u * 1024u)
 #define DISPLAY_TERMINAL_TILE_WIDTH 8u
 #if DISPLAY_FB_HEIGHT < 400u
 /* Linux get_default_font() prefers VGA8x8 whenever yres is below 400. Keep
@@ -65,6 +72,9 @@
 #define DISPLAY_TERMINAL_SERVICE_BYTES DISPLAY_TERMINAL_STREAM_SIZE
 #define DISPLAY_TERMINAL_READ_CHUNK 512u
 #define DISPLAY_TERMINAL_PARAM_COUNT 16u
+#define DISPLAY_HOST_BULK_STORAGE_SIZE                                  \
+  (DISPLAY_PV_PAYLOAD_SIZE * DISPLAY_PV_PAYLOAD_BLOCK_COUNT +          \
+   DISPLAY_TILE_FONT_SIZE + DISPLAY_TERMINAL_STREAM_SIZE)
 /*
  * One cache writeback command has a much larger fixed cost than scanning the
  * stride gap between adjacent glyph rows. Merge at most one maximum-height
@@ -73,11 +83,14 @@
  */
 #define DISPLAY_CACHE_MSYNC_MERGE_GAP DISPLAY_FB_STRIDE
 #define DISPLAY_CACHE_MSYNC_MAX_ROWS 32u
+#define DISPLAY_GPU_STAGE_SIZE (64u * 1024u)
 
 _Static_assert(DISPLAY_PV_PAYLOAD_SIZE <= DISPLAY_ACCEL_STAGE_SIZE,
                "FIFO payload must fit in the guest staging aperture");
 _Static_assert(DISPLAY_PV_INLINE_PAYLOAD_SIZE <= DISPLAY_PV_PAYLOAD_SIZE,
                "inline FIFO payload must fit in a payload block");
+_Static_assert(DISPLAY_TILE_FONT_SIZE <= DISPLAY_PV_PAYLOAD_SIZE,
+               "tile font cache must fit in one payload block");
 _Static_assert(DISPLAY_PV_PAYLOAD_SIZE *
                        (DISPLAY_PV_PAYLOAD_BLOCK_COUNT + 1u) <=
                    160u * 1024u,
@@ -149,23 +162,46 @@ typedef struct {
   display_terminal_parse_state_t parse_state;
 } display_terminal_state_t;
 
+/* Rendering targets a host-only staging surface when the backend exposes a
+ * live scanout allocation. scanout_framebuffer remains owned by the backend;
+ * framebuffer is the logical surface mapped into the guest. */
 static uint8_t *framebuffer;
-/* CPU0 owns the producer range; CPU1 only touches the pending range. */
+static uint8_t *scanout_framebuffer;
+static bool framebuffer_present_pending;
+static uint16_t framebuffer_present_first_column = DISPLAY_FB_WIDTH;
+static uint16_t framebuffer_present_last_column;
+static uint16_t framebuffer_present_first_row = DISPLAY_FB_HEIGHT;
+static uint16_t framebuffer_present_last_row;
+/* CPU0 owns the uncommitted producer range; CPU1 only touches the pending
+ * range. The mutex is uncontended unless CPU1 is taking a coherent snapshot
+ * of the logical render surface. */
 static bool producer_dirty;
+/* Direct mmap writers can span many emulator execution slices. Linux timer
+ * interrupts and task switches create store-free slices inside a scanline
+ * copy, so a slice boundary is not an end-of-frame signal. Legacy clients
+ * which do not issue the explicit fence are published only after a bounded
+ * wall-clock quiet period. */
+static int64_t producer_last_write_us;
 static size_t producer_dirty_start = DISPLAY_FB_SIZE;
 static size_t producer_dirty_end;
 static bool pending_dirty;
 static size_t pending_dirty_start = DISPLAY_FB_SIZE;
 static size_t pending_dirty_end;
+static StaticSemaphore_t framebuffer_mutex_storage;
+static SemaphoreHandle_t framebuffer_mutex;
 static uint8_t *ppa_staging;
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+static uint8_t *gpu_staging;
+static StaticSemaphore_t scanout_mutex_storage;
+static SemaphoreHandle_t scanout_mutex;
+#endif
 static ppa_client_handle_t ppa_srm;
 static ppa_client_handle_t ppa_fill;
 static bool ppa_ready;
 static bool ppa_fill_ready;
-/* A PPA fill reaches scanout memory immediately. If the same command adds
- * CPU-drawn pixels, publish those pixels before the panel can show only the
- * PPA-written background. */
-static bool ppa_fill_touched_scanout;
+/* A PPA fill reaches the logical framebuffer immediately. If the same
+ * command adds CPU-drawn pixels, publish those pixels as one composite. */
+static bool ppa_fill_touched_framebuffer;
 static bool ppa_frame_pending;
 static bool ppa_stop_pending;
 static bool ppa_accel_active;
@@ -180,9 +216,13 @@ static display_pv_command_t pv_registers;
 static display_pv_queue_entry_t pv_queue_entries[DISPLAY_PV_FIFO_DEPTH];
 /* Payload blocks are independent of command descriptors.  Control-only work
  * can still enter the FIFO while bitmap producers are applying backpressure. */
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+static uint8_t (*pv_payload_blocks)[DISPLAY_PV_PAYLOAD_SIZE];
+#else
 static uint8_t pv_payload_blocks[DISPLAY_PV_PAYLOAD_BLOCK_COUNT]
                                 [DISPLAY_PV_PAYLOAD_SIZE]
     __attribute__((aligned(CONFIG_CACHE_L2_CACHE_LINE_SIZE)));
+#endif
 /* CPU0 is the only producer and CPU1 is the only consumer. Monotonic indices
  * therefore provide a bounded SPSC ring without the three FreeRTOS queues and
  * their cross-core locks on every framebuffer command. Keep independently
@@ -203,7 +243,11 @@ static uint8_t *guest_memory_host;
 static uint32_t guest_memory_base;
 static size_t guest_memory_size;
 static uint32_t pv_shared_command_address;
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+static uint8_t *tile_font;
+#else
 static uint8_t tile_font[DISPLAY_TILE_FONT_SIZE];
+#endif
 static uint16_t tile_width;
 static uint16_t tile_height;
 static uint16_t tile_count;
@@ -230,11 +274,20 @@ static portMUX_TYPE dirty_lock = portMUX_INITIALIZER_UNLOCKED;
 static int display_init_result = -1;
 static TaskHandle_t display_task_handle;
 static StaticStreamBuffer_t terminal_stream_control;
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+static uint8_t *terminal_stream_storage;
+#else
 static uint8_t terminal_stream_storage[DISPLAY_TERMINAL_STREAM_SIZE];
+#endif
 static StreamBufferHandle_t terminal_stream;
 static display_terminal_state_t terminal;
 static uint32_t terminal_cursor_vsyncs;
 static uint32_t terminal_cursor_period_frames = 30u;
+/* The accelerated terminal and ordinary /dev/fb0 mmap both target the same
+ * logical render surface. CPU0 only requests an ownership change; CPU1
+ * applies it without waiting for either core. */
+static bool raw_framebuffer_claim_pending;
+static bool terminal_owns_framebuffer;
 
 #if CONFIG_RV32_HOST_PERF_STATS
 static struct display_bridge_perf_stats display_perf;
@@ -379,6 +432,25 @@ static bool display_pv_queue_init(void) {
   return true;
 }
 
+static bool display_bulk_storage_init(void) {
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+  uint8_t *storage = psram_host_aux_alloc(
+      DISPLAY_HOST_BULK_STORAGE_SIZE, CONFIG_CACHE_L2_CACHE_LINE_SIZE);
+
+  if (storage == NULL)
+    return false;
+  pv_payload_blocks =
+      (uint8_t (*)[DISPLAY_PV_PAYLOAD_SIZE])(void *)storage;
+  storage += DISPLAY_PV_PAYLOAD_SIZE * DISPLAY_PV_PAYLOAD_BLOCK_COUNT;
+  tile_font = storage;
+  storage += DISPLAY_TILE_FONT_SIZE;
+  terminal_stream_storage = storage;
+  printf("Display bulk storage: %u KiB reserved PSRAM\n",
+         (unsigned int)(DISPLAY_HOST_BULK_STORAGE_SIZE / 1024u));
+#endif
+  return true;
+}
+
 static bool display_terminal_init(uint32_t refresh_hz);
 
 static esp_err_t display_ppa_init(void) {
@@ -425,9 +497,20 @@ static esp_err_t display_ppa_init(void) {
   return ESP_OK;
 }
 
+static esp_err_t display_gpu_import_init(void) {
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+  gpu_staging = heap_caps_aligned_calloc(
+      64u, 1u, DISPLAY_GPU_STAGE_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+  if (gpu_staging == NULL)
+    return ESP_ERR_NO_MEM;
+#endif
+  return ESP_OK;
+}
+
 static int display_hardware_init(void) {
   display_backend_surface_t surface = { 0 };
   esp_err_t err;
+  size_t framebuffer_alignment = CONFIG_CACHE_L2_CACHE_LINE_SIZE;
 
   printf("\n=== Initializing RGB565 display backend ===\n");
   err = display_backend_init(display_vsync_callback, NULL, &surface);
@@ -441,16 +524,58 @@ static int display_hardware_init(void) {
     err = ESP_ERR_INVALID_SIZE;
     goto fail;
   }
-  framebuffer = surface.framebuffer;
+  scanout_framebuffer = surface.framebuffer;
+  framebuffer = scanout_framebuffer;
+  if (surface.framebuffer_is_live_scanout) {
+    const char *render_surface_source = "host-cache PSRAM";
+    void *reserved_surface = NULL;
+    size_t reserved_surface_size = 0u;
+    size_t required_alignment;
+
+    err = esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &required_alignment);
+    if (err == ESP_OK && required_alignment != 0u)
+      framebuffer_alignment = required_alignment;
+    if (psram_get_host_display_region(&reserved_surface,
+                                      &reserved_surface_size) &&
+        reserved_surface_size >= DISPLAY_FB_SIZE &&
+        (uintptr_t)reserved_surface % framebuffer_alignment == 0u) {
+      framebuffer = reserved_surface;
+      render_surface_source = "Linux-reserved PSRAM";
+    } else {
+      framebuffer = psram_host_cache_alloc(DISPLAY_FB_SIZE,
+                                           framebuffer_alignment);
+    }
+    if (framebuffer == NULL) {
+      framebuffer = scanout_framebuffer;
+      printf("WARNING: Host render surface unavailable; guest writes will "
+             "target live scanout\n");
+    } else {
+      printf("Display buffering: %s render surface %p -> live scanout %p "
+             "(%u bytes, %u-byte alignment)\n",
+             render_surface_source, framebuffer, scanout_framebuffer,
+             (unsigned int)DISPLAY_FB_SIZE,
+             (unsigned int)framebuffer_alignment);
+    }
+  }
 
   memset(framebuffer, 0, DISPLAY_FB_SIZE);
   err = display_cache_clean(framebuffer, DISPLAY_FB_SIZE);
   if (err != ESP_OK)
     goto fail;
+  if (scanout_framebuffer != framebuffer) {
+    memset(scanout_framebuffer, 0, DISPLAY_FB_SIZE);
+    err = display_cache_clean(scanout_framebuffer, DISPLAY_FB_SIZE);
+    if (err != ESP_OK)
+      goto fail;
+  }
 
   err = display_ppa_init();
   if (err != ESP_OK)
     printf("WARNING: PPA display acceleration unavailable: %s\n",
+           esp_err_to_name(err));
+  err = display_gpu_import_init();
+  if (err != ESP_OK)
+    printf("WARNING: virtio-gpu scanout staging unavailable: %s\n",
            esp_err_to_name(err));
   if (!display_terminal_init(surface.refresh_hz))
     printf("WARNING: CPU1 terminal renderer unavailable\n");
@@ -460,13 +585,13 @@ static int display_hardware_init(void) {
     goto fail;
 
   printf("%s ready: %ux%u packed RGB565 at %u Hz, "
-         "framebuffer %p mapped at guest 0x%08x (%u bytes), "
+         "render %p -> scanout %p mapped at guest 0x%08x (%u bytes), "
          "VSYNC cache-clean delay %d ms, async FIFO %u commands + "
          "%u x %u-byte payloads, "
          "service on CPU%d\n",
          surface.name != NULL ? surface.name : "Display backend",
          DISPLAY_FB_WIDTH, DISPLAY_FB_HEIGHT,
-         (unsigned int)surface.refresh_hz, framebuffer,
+         (unsigned int)surface.refresh_hz, framebuffer, scanout_framebuffer,
          DISPLAY_FB_GUEST_BASE, (unsigned int)DISPLAY_FB_SIZE,
          CONFIG_RV32_DISPLAY_FLUSH_INTERVAL_MS,
          DISPLAY_PV_FIFO_DEPTH, DISPLAY_PV_PAYLOAD_BLOCK_COUNT,
@@ -478,6 +603,7 @@ fail:
          "serial console only\n",
          esp_err_to_name(err));
   framebuffer = NULL;
+  scanout_framebuffer = NULL;
   return -1;
 }
 
@@ -493,6 +619,22 @@ static const uint8_t *display_guest_pointer(uint32_t address, size_t length) {
   if (offset > guest_memory_size || length > guest_memory_size - offset)
     return NULL;
   return guest_memory_host + offset;
+}
+
+static void display_mark_present_rect(uint32_t x, uint32_t y,
+                                      uint32_t width, uint32_t height) {
+  if (framebuffer == scanout_framebuffer ||
+      !display_rect_valid(x, y, width, height))
+    return;
+  if (x < framebuffer_present_first_column)
+    framebuffer_present_first_column = x;
+  if (x + width > framebuffer_present_last_column)
+    framebuffer_present_last_column = x + width;
+  if (y < framebuffer_present_first_row)
+    framebuffer_present_first_row = y;
+  if (y + height > framebuffer_present_last_row)
+    framebuffer_present_last_row = y + height;
+  framebuffer_present_pending = true;
 }
 
 static bool display_flush_dirty(void) {
@@ -515,7 +657,30 @@ static bool display_flush_dirty(void) {
   if (start >= end || end > DISPLAY_FB_SIZE)
     return true;
 
-  esp_err_t err = display_cache_clean(framebuffer + start, end - start);
+  esp_err_t err = ESP_OK;
+
+  if (framebuffer != scanout_framebuffer) {
+    size_t first_pixel = start / sizeof(uint16_t);
+    size_t last_pixel = (end - 1u) / sizeof(uint16_t);
+    uint32_t first_row = first_pixel / DISPLAY_FB_WIDTH;
+    uint32_t last_row = last_pixel / DISPLAY_FB_WIDTH;
+
+    if (first_row == last_row) {
+      uint32_t first_column = first_pixel % DISPLAY_FB_WIDTH;
+      uint32_t last_column = last_pixel % DISPLAY_FB_WIDTH + 1u;
+
+      display_mark_present_rect(first_column, first_row,
+                                last_column - first_column, 1u);
+    } else {
+      /* A contiguous byte range crossing a row boundary touches the right
+       * edge of its first row and the left edge of its last. Its rectangular
+       * union is therefore full-width; intermediate rows are full as well. */
+      display_mark_present_rect(0u, first_row, DISPLAY_FB_WIDTH,
+                                last_row - first_row + 1u);
+    }
+  } else {
+    err = display_cache_clean(framebuffer + start, end - start);
+  }
 
   if (err != ESP_OK) {
     /* Preserve the range so a transient synchronization failure retries. */
@@ -528,6 +693,8 @@ static bool display_flush_dirty(void) {
     portEXIT_CRITICAL(&dirty_lock);
     return false;
   }
+  DISPLAY_PERF_ADD(framebuffer_publish_events, 1u);
+  DISPLAY_PERF_ADD(framebuffer_publish_bytes, end - start);
   return true;
 }
 
@@ -541,41 +708,57 @@ static bool display_flush_accel_dirty(void) {
   if (accel_dirty_first >= DISPLAY_FB_HEIGHT)
     return true;
 
-  for (uint32_t row = accel_dirty_first; row <= accel_dirty_last; row++) {
-    uint32_t first = accel_dirty_start[row];
-    uint32_t last = accel_dirty_end[row];
-    size_t start;
-    size_t end;
+  if (framebuffer == scanout_framebuffer) {
+    for (uint32_t row = accel_dirty_first; row <= accel_dirty_last; row++) {
+      uint32_t first = accel_dirty_start[row];
+      uint32_t last = accel_dirty_end[row];
+      size_t start;
+      size_t end;
 
-    if (first >= last)
-      continue;
-    start = ((size_t)row * DISPLAY_FB_WIDTH + first) * sizeof(uint16_t);
-    end = ((size_t)row * DISPLAY_FB_WIDTH + last) * sizeof(uint16_t);
-    /* Full-width rectangles are contiguous in memory and can be published by
-     * one cache operation regardless of height. Keep the row bound only when
-     * merging across untouched stride gaps in narrow glyph updates. */
-    if (have_run &&
-        (start <= run_end ||
-         (row - run_first_row < DISPLAY_CACHE_MSYNC_MAX_ROWS &&
-          start <= run_end + DISPLAY_CACHE_MSYNC_MERGE_GAP))) {
+      if (first >= last)
+        continue;
+      start = ((size_t)row * DISPLAY_FB_WIDTH + first) * sizeof(uint16_t);
+      end = ((size_t)row * DISPLAY_FB_WIDTH + last) * sizeof(uint16_t);
+      /* Full-width rectangles are contiguous in memory and can be published
+       * by one cache operation regardless of height. Keep the row bound only
+       * when merging across untouched stride gaps in narrow glyph updates. */
+      if (have_run &&
+          (start <= run_end ||
+           (row - run_first_row < DISPLAY_CACHE_MSYNC_MAX_ROWS &&
+            start <= run_end + DISPLAY_CACHE_MSYNC_MERGE_GAP))) {
+        run_end = end;
+        continue;
+      }
+      if (have_run) {
+        err = display_cache_clean(framebuffer + run_start,
+                                  run_end - run_start);
+        if (err != ESP_OK)
+          return false;
+      }
+      run_start = start;
       run_end = end;
-      continue;
+      run_first_row = row;
+      have_run = true;
     }
-    if (have_run) {
-      err = display_cache_clean(framebuffer + run_start,
-                                run_end - run_start);
-      if (err != ESP_OK)
-        return false;
+    if (have_run)
+      err = display_cache_clean(framebuffer + run_start, run_end - run_start);
+    if (err != ESP_OK)
+      return false;
+  } else {
+    uint32_t first_column = DISPLAY_FB_WIDTH;
+    uint32_t last_column = 0u;
+
+    for (uint32_t row = accel_dirty_first; row <= accel_dirty_last; row++) {
+      if (accel_dirty_start[row] < first_column)
+        first_column = accel_dirty_start[row];
+      if (accel_dirty_end[row] > last_column)
+        last_column = accel_dirty_end[row];
     }
-    run_start = start;
-    run_end = end;
-    run_first_row = row;
-    have_run = true;
+    if (first_column < last_column)
+      display_mark_present_rect(first_column, accel_dirty_first,
+                                last_column - first_column,
+                                accel_dirty_last - accel_dirty_first + 1u);
   }
-  if (have_run)
-    err = display_cache_clean(framebuffer + run_start, run_end - run_start);
-  if (err != ESP_OK)
-    return false;
 
   for (uint32_t row = accel_dirty_first; row <= accel_dirty_last; row++) {
     accel_dirty_start[row] = DISPLAY_FB_WIDTH;
@@ -600,6 +783,31 @@ static void display_mark_accel_rect(uint32_t x, uint32_t y, uint32_t width,
       accel_dirty_start[row] = x;
     if (x + width > accel_dirty_end[row])
       accel_dirty_end[row] = x + width;
+  }
+}
+
+static void display_mark_accel_byte_range(size_t start, size_t length) {
+  size_t first_pixel;
+  size_t last_pixel;
+  uint32_t first_row;
+  uint32_t last_row;
+
+  if (length == 0u || start >= DISPLAY_FB_SIZE ||
+      length > DISPLAY_FB_SIZE - start)
+    return;
+  first_pixel = start / sizeof(uint16_t);
+  last_pixel = (start + length - 1u) / sizeof(uint16_t);
+  first_row = first_pixel / DISPLAY_FB_WIDTH;
+  last_row = last_pixel / DISPLAY_FB_WIDTH;
+  for (uint32_t row = first_row; row <= last_row; row++) {
+    uint32_t first = row == first_row
+                         ? first_pixel % DISPLAY_FB_WIDTH
+                         : 0u;
+    uint32_t last = row == last_row
+                        ? last_pixel % DISPLAY_FB_WIDTH + 1u
+                        : DISPLAY_FB_WIDTH;
+
+    display_mark_accel_rect(first, row, last - first, 1u);
   }
 }
 
@@ -659,8 +867,10 @@ static bool display_ppa_fill_rect(uint32_t x, uint32_t y, uint32_t width,
     DISPLAY_PERF_ADD(ppa_fill_pixels, (uint64_t)width * height);
   }
   #endif
-  if (err == ESP_OK)
-    ppa_fill_touched_scanout = true;
+  if (err == ESP_OK) {
+    ppa_fill_touched_framebuffer = true;
+    display_mark_present_rect(x, y, width, height);
+  }
   return err == ESP_OK;
 }
 
@@ -1182,8 +1392,24 @@ static void display_terminal_hide_cursor(void) {
     display_toggle_tile_cursor();
 }
 
+static void display_terminal_release_framebuffer(void) {
+  bool released_terminal = terminal_owns_framebuffer;
+
+  /* A raw writer may already have replaced the pixels below the XOR cursor.
+   * Do not XOR them a second time: forget the overlay and let the raw frame
+   * replace it.  The next terminal byte forces a complete clean redraw. */
+  tile_cursor_active = false;
+  tile_cursor_drawn = false;
+  terminal.pixels_valid = false;
+  terminal_owns_framebuffer = false;
+  if (released_terminal)
+    printf("Display diagnostic: terminal release at %u ms\n",
+           (unsigned int)(esp_timer_get_time() / 1000));
+}
+
 static void display_terminal_apply_cursor(void) {
-  if (!terminal.active || !terminal.cursor_visible ||
+  if (!terminal_owns_framebuffer || !terminal.active ||
+      !terminal.cursor_visible ||
       !terminal.pixels_valid ||
       !__atomic_load_n(&tile_font_valid, __ATOMIC_ACQUIRE)) {
     tile_cursor_active = false;
@@ -1848,11 +2074,14 @@ static void display_terminal_parse_byte(uint8_t byte) {
 static bool display_terminal_process_stream(void) {
   uint8_t buffer[DISPLAY_TERMINAL_READ_CHUNK];
   size_t processed = 0;
+  bool claimed_terminal = false;
 
   if (terminal_stream == NULL || terminal.cells == NULL)
     return false;
-  if (!terminal.active) {
+  if (!terminal.active || !terminal_owns_framebuffer) {
+    claimed_terminal = true;
     terminal.active = true;
+    terminal_owns_framebuffer = true;
     terminal.pixels_valid = false;
     display_terminal_mark_rows(0, DISPLAY_TERMINAL_ROWS - 1u);
   }
@@ -1871,8 +2100,15 @@ static bool display_terminal_process_stream(void) {
     processed += length;
   }
   (void)display_terminal_flush_dirty(true);
-  if (ppa_fill_touched_scanout && display_flush_accel_dirty())
-    ppa_fill_touched_scanout = false;
+  if (ppa_fill_touched_framebuffer && display_flush_accel_dirty())
+    ppa_fill_touched_framebuffer = false;
+  /* Event-only instrumentation preserves the existing ownership decisions.
+   * A zero-byte takeover distinguishes the reproduced empty-wake hazard from
+   * genuine terminal output; neither event alone diagnoses an MCU reset. */
+  if (claimed_terminal)
+    printf("Display diagnostic: terminal takeover at %u ms, input=%u bytes\n",
+           (unsigned int)(esp_timer_get_time() / 1000),
+           (unsigned int)processed);
   return xStreamBufferBytesAvailable(terminal_stream) != 0u;
 }
 
@@ -1883,7 +2119,7 @@ static bool display_terminal_init(uint32_t refresh_hz) {
   if (terminal.cells == NULL)
     return false;
   terminal_stream = xStreamBufferCreateStatic(
-      sizeof(terminal_stream_storage), 1u, terminal_stream_storage,
+      DISPLAY_TERMINAL_STREAM_SIZE, 1u, terminal_stream_storage,
       &terminal_stream_control);
   if (terminal_stream == NULL)
     return false;
@@ -2147,6 +2383,23 @@ static bool display_image1(const display_pv_command_t *command,
   return true;
 }
 
+static bool display_bulk_write(const display_pv_command_t *command,
+                               const uint8_t *payload,
+                               uint32_t payload_length) {
+  uint32_t offset = command->args[0];
+
+  if (payload == NULL || payload_length == 0u ||
+      command->args[1] != payload_length || offset >= DISPLAY_FB_SIZE ||
+      payload_length > DISPLAY_FB_SIZE - offset)
+    return false;
+
+  display_terminal_release_framebuffer();
+  memcpy(framebuffer + offset, payload, payload_length);
+  display_mark_accel_byte_range(offset, payload_length);
+  DISPLAY_PERF_ADD(bulk_write_bytes, payload_length);
+  return true;
+}
+
 static void display_pv_record_fifo_error(void) {
   (void)__atomic_add_fetch(&pv_fifo_errors, 1u, __ATOMIC_RELAXED);
 }
@@ -2228,6 +2481,11 @@ static bool display_process_pv_commands(void) {
       success = display_image1(command, entry->payload,
                                entry->payload_length);
       break;
+    case DISPLAY_PV_OP_BULK_WRITE:
+      DISPLAY_PERF_ADD(bulk_write_commands, 1u);
+      success = display_bulk_write(command, entry->payload,
+                                   entry->payload_length);
+      break;
     case DISPLAY_PV_OP_SET_TILE:
       DISPLAY_PERF_ADD(tile_commands, 1u);
       DISPLAY_PERF_ADD(tile_set_commands, 1u);
@@ -2281,6 +2539,9 @@ static bool display_process_pv_commands(void) {
     case DISPLAY_PV_OP_IMAGE1:
       DISPLAY_PERF_ADD(image1_cycles, command_cycles);
       break;
+    case DISPLAY_PV_OP_BULK_WRITE:
+      DISPLAY_PERF_ADD(bulk_write_cycles, command_cycles);
+      break;
     case DISPLAY_PV_OP_SET_TILE:
       DISPLAY_PERF_ADD(tile_set_cycles, command_cycles);
       break;
@@ -2326,8 +2587,8 @@ static bool display_process_pv_commands(void) {
 
   /* A slice may contain several PPA backgrounds and CPU-expanded glyph runs.
    * Publish their merged dirty rows once, as one completed composite. */
-  if (ppa_fill_touched_scanout && display_flush_accel_dirty())
-    ppa_fill_touched_scanout = false;
+  if (ppa_fill_touched_framebuffer && display_flush_accel_dirty())
+    ppa_fill_touched_framebuffer = false;
 
   if (processed != 0)
     DISPLAY_PERF_ADD(fifo_slices, 1u);
@@ -2338,7 +2599,17 @@ static bool display_process_pv_commands(void) {
   return false;
 }
 
-static void display_process_ppa_command(void) {
+static void display_retry_ppa_frame(uint32_t width, uint32_t height) {
+  portENTER_CRITICAL(&dirty_lock);
+  if (!ppa_frame_pending && !ppa_stop_pending) {
+    ppa_pending_width = width;
+    ppa_pending_height = height;
+    ppa_frame_pending = true;
+  }
+  portEXIT_CRITICAL(&dirty_lock);
+}
+
+static bool display_process_ppa_command(void) {
   bool frame_pending;
   bool stop_pending;
   uint32_t source_width;
@@ -2360,17 +2631,25 @@ static void display_process_ppa_command(void) {
 
   if (stop_pending) {
     ppa_accel_active = false;
-    return;
+    return true;
   }
   if (!frame_pending || !ppa_ready)
-    return;
+    return !frame_pending;
 
   if (!ppa_accel_active || source_width != ppa_active_width ||
       source_height != ppa_active_height) {
     memset(framebuffer, 0, DISPLAY_FB_SIZE);
-    err = display_cache_clean(framebuffer, DISPLAY_FB_SIZE);
-    if (err != ESP_OK)
-      return;
+    if (framebuffer != scanout_framebuffer) {
+      display_mark_present_rect(0u, 0u, DISPLAY_FB_WIDTH,
+                                DISPLAY_FB_HEIGHT);
+      err = ESP_OK;
+    } else {
+      err = display_cache_clean(framebuffer, DISPLAY_FB_SIZE);
+    }
+    if (err != ESP_OK) {
+      display_retry_ppa_frame(source_width, source_height);
+      return false;
+    }
     ppa_accel_active = true;
     ppa_active_width = source_width;
     ppa_active_height = source_height;
@@ -2384,8 +2663,10 @@ static void display_process_ppa_command(void) {
     scale_sixteenths = vertical_scale;
   if (scale_sixteenths > 4095u)
     scale_sixteenths = 4095u;
-  if (scale_sixteenths == 0)
-    return;
+  if (scale_sixteenths == 0) {
+    display_retry_ppa_frame(source_width, source_height);
+    return false;
+  }
   output_width = source_width * scale_sixteenths / 16u;
   output_height = source_height * scale_sixteenths / 16u;
 
@@ -2428,8 +2709,135 @@ static void display_process_ppa_command(void) {
     printf("WARNING: PPA display blit failed: %s\n", esp_err_to_name(err));
     error_reported = true;
   } else if (err == ESP_OK) {
+    uint32_t output_x = (DISPLAY_FB_WIDTH - output_width) / 2u;
+    uint32_t output_y = (DISPLAY_FB_HEIGHT - output_height) / 2u;
+
     error_reported = false;
+    display_mark_present_rect(output_x, output_y, output_width,
+                              output_height);
   }
+  if (err != ESP_OK)
+    display_retry_ppa_frame(source_width, source_height);
+  return err == ESP_OK;
+}
+
+static esp_err_t display_present_render_surface(void) {
+  static bool ppa_error_reported;
+  esp_err_t err = ESP_ERR_NOT_SUPPORTED;
+  bool used_ppa = false;
+  uint32_t first_column;
+  uint32_t last_column;
+  uint32_t column_count;
+  uint32_t first_row;
+  uint32_t last_row;
+  uint32_t row_count;
+  size_t row_bytes;
+  size_t present_offset;
+  size_t present_end;
+#if CONFIG_RV32_HOST_PERF_STATS
+  int64_t started;
+#endif
+
+  if (framebuffer == NULL || scanout_framebuffer == NULL)
+    return ESP_ERR_INVALID_STATE;
+  if (framebuffer == scanout_framebuffer || !framebuffer_present_pending)
+    return ESP_OK;
+
+  first_column = framebuffer_present_first_column;
+  last_column = framebuffer_present_last_column;
+  first_row = framebuffer_present_first_row;
+  last_row = framebuffer_present_last_row;
+  if (first_column >= last_column || last_column > DISPLAY_FB_WIDTH ||
+      first_row >= last_row || last_row > DISPLAY_FB_HEIGHT)
+    return ESP_ERR_INVALID_STATE;
+  column_count = last_column - first_column;
+  row_count = last_row - first_row;
+  row_bytes = (size_t)column_count * sizeof(uint16_t);
+  present_offset = (size_t)first_row * DISPLAY_FB_STRIDE +
+                   (size_t)first_column * sizeof(uint16_t);
+  present_end = (size_t)(last_row - 1u) * DISPLAY_FB_STRIDE +
+                (size_t)last_column * sizeof(uint16_t);
+
+#if CONFIG_RV32_HOST_PERF_STATS
+  started = esp_timer_get_time();
+#endif
+  if (ppa_ready) {
+    const ppa_srm_oper_config_t operation = {
+        .in =
+            {
+                .buffer = framebuffer,
+                .pic_w = DISPLAY_FB_WIDTH,
+                .pic_h = DISPLAY_FB_HEIGHT,
+                .block_w = column_count,
+                .block_h = row_count,
+                .block_offset_x = first_column,
+                .block_offset_y = first_row,
+                .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            },
+        .out =
+            {
+                .buffer = scanout_framebuffer,
+                .buffer_size = DISPLAY_FB_SIZE,
+                .pic_w = DISPLAY_FB_WIDTH,
+                .pic_h = DISPLAY_FB_HEIGHT,
+                .block_offset_x = first_column,
+                .block_offset_y = first_row,
+                .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            },
+        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+        .scale_x = 1.0f,
+        .scale_y = 1.0f,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+
+    err = ppa_do_scale_rotate_mirror(ppa_srm, &operation);
+    used_ppa = err == ESP_OK;
+    if (used_ppa) {
+      ppa_error_reported = false;
+      DISPLAY_PERF_ADD(ppa_blits, 1u);
+    } else if (!ppa_error_reported) {
+      printf("WARNING: PPA render-surface present failed (%s); using CPU1 "
+             "copy fallback\n",
+             esp_err_to_name(err));
+      ppa_error_reported = true;
+    }
+  }
+
+  if (!used_ppa) {
+    for (uint32_t row = first_row; row < last_row; row++) {
+      size_t row_offset = (size_t)row * DISPLAY_FB_STRIDE +
+                          (size_t)first_column * sizeof(uint16_t);
+
+      memcpy(scanout_framebuffer + row_offset,
+             framebuffer + row_offset, row_bytes);
+    }
+    /* One enclosing cache operation avoids a costly call per row. It may
+     * publish unchanged stride gaps, but CPU copying and the reported
+     * presentation-byte count remain limited to the damaged rectangle. */
+    err = display_cache_clean(scanout_framebuffer + present_offset,
+                              present_end - present_offset);
+    DISPLAY_PERF_ADD(framebuffer_present_cpu_copies, 1u);
+  }
+
+#if CONFIG_RV32_HOST_PERF_STATS
+  uint32_t elapsed = (uint32_t)(esp_timer_get_time() - started);
+
+  DISPLAY_PERF_ADD(framebuffer_present_us, elapsed);
+  if (used_ppa)
+    DISPLAY_PERF_ADD(ppa_us, elapsed);
+#endif
+  if (err != ESP_OK)
+    return err;
+
+  framebuffer_present_pending = false;
+  framebuffer_present_first_column = DISPLAY_FB_WIDTH;
+  framebuffer_present_last_column = 0u;
+  framebuffer_present_first_row = DISPLAY_FB_HEIGHT;
+  framebuffer_present_last_row = 0u;
+  DISPLAY_PERF_ADD(framebuffer_present_events, 1u);
+  DISPLAY_PERF_ADD(framebuffer_present_bytes,
+                   (size_t)row_count * row_bytes);
+  return ESP_OK;
 }
 
 static void display_service_task(void *argument) {
@@ -2450,6 +2858,7 @@ static void display_service_task(void *argument) {
     uint32_t sync_target;
     bool frame_ready;
     bool frame_changed;
+    bool surface_locked = false;
     bool commands_pending = false;
     bool terminal_pending = false;
 
@@ -2457,7 +2866,13 @@ static void display_service_task(void *argument) {
 #if CONFIG_RV32_HOST_PERF_STATS
     int64_t service_started = esp_timer_get_time();
 #endif
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+    xSemaphoreTake(scanout_mutex, portMAX_DELAY);
+#endif
     DISPLAY_PERF_ADD(service_wakes, 1u);
+    if (__atomic_exchange_n(&raw_framebuffer_claim_pending, false,
+                            __ATOMIC_ACQUIRE))
+      display_terminal_release_framebuffer();
     /* A bounded slice prevents an always-full producer FIFO from hiding a
      * VSYNC bit behind an unbounded drain loop. */
     if ((events & LCD_NOTIFY_PV_COMMAND) ||
@@ -2473,7 +2888,36 @@ static void display_service_task(void *argument) {
       portEXIT_CRITICAL(&dirty_lock);
       frame_changed = frame_changed ||
                       accel_dirty_first < DISPLAY_FB_HEIGHT ||
-                      ppa_fill_touched_scanout;
+                      ppa_fill_touched_framebuffer ||
+                      framebuffer_present_pending;
+      /* Take every live-scanout VSYNC. A producer can finish between the
+       * preliminary dirty check and display_flush_dirty(); conditional locking
+       * would allow that newly committed range to be copied concurrently with
+       * the next emulator slice. The unchanged-frame critical section is only
+       * a few flag checks, while a changed frame holds it for the PPA copy. */
+      if (framebuffer != scanout_framebuffer) {
+#if CONFIG_RV32_HOST_PERF_STATS
+        int64_t snapshot_wait_started = esp_timer_get_time();
+#endif
+        xSemaphoreTake(framebuffer_mutex, portMAX_DELAY);
+#if CONFIG_RV32_HOST_PERF_STATS
+        uint32_t snapshot_wait_us =
+            (uint32_t)(esp_timer_get_time() - snapshot_wait_started);
+
+        DISPLAY_PERF_ADD(framebuffer_snapshot_wait_us, snapshot_wait_us);
+        display_perf_update_max(&display_perf.framebuffer_snapshot_wait_max_us,
+                                snapshot_wait_us);
+#endif
+        surface_locked = true;
+        portENTER_CRITICAL(&dirty_lock);
+        frame_changed = frame_changed || pending_dirty || ppa_frame_pending ||
+                        ppa_stop_pending;
+        portEXIT_CRITICAL(&dirty_lock);
+        frame_changed = frame_changed ||
+                        accel_dirty_first < DISPLAY_FB_HEIGHT ||
+                        ppa_fill_touched_framebuffer ||
+                        framebuffer_present_pending;
+      }
 #if CONFIG_RV32_HOST_PERF_STATS
       int64_t frame_started = esp_timer_get_time();
 #endif
@@ -2488,7 +2932,8 @@ static void display_service_task(void *argument) {
       sync_target = frame_sync_requested;
       portEXIT_CRITICAL(&dirty_lock);
       frame_ready = display_flush_dirty();
-      if (terminal.active && tile_cursor_active &&
+      if (terminal_owns_framebuffer && terminal.active &&
+          tile_cursor_active &&
           ++terminal_cursor_vsyncs >= terminal_cursor_period_frames) {
         display_toggle_tile_cursor();
         frame_changed = true;
@@ -2497,10 +2942,26 @@ static void display_service_task(void *argument) {
       if (!display_flush_accel_dirty()) {
         frame_ready = false;
       } else {
-        ppa_fill_touched_scanout = false;
+        ppa_fill_touched_framebuffer = false;
       }
-      display_process_ppa_command();
-      esp_err_t present_err = display_backend_present(frame_changed);
+      if (!display_process_ppa_command())
+        frame_ready = false;
+      bool producer_active =
+          framebuffer != scanout_framebuffer &&
+          __atomic_load_n(&producer_dirty, __ATOMIC_ACQUIRE);
+      bool present_deferred = false;
+      esp_err_t present_err = ESP_OK;
+
+      if (producer_active) {
+        frame_ready = false;
+        present_deferred = framebuffer_present_pending;
+        if (present_deferred)
+          DISPLAY_PERF_ADD(framebuffer_present_deferred, 1u);
+      } else {
+        present_err = display_present_render_surface();
+      }
+      if (!present_deferred && present_err == ESP_OK)
+        present_err = display_backend_present(frame_changed);
       if (present_err != ESP_OK) {
         frame_ready = false;
         if (!present_error_reported) {
@@ -2521,6 +2982,8 @@ static void display_service_task(void *argument) {
         display_perf_record_frame(
             (uint32_t)(esp_timer_get_time() - frame_started));
 #endif
+      if (surface_locked)
+        xSemaphoreGive(framebuffer_mutex);
     }
     if (commands_pending &&
         xTaskNotify(display_task_handle, LCD_NOTIFY_PV_COMMAND, eSetBits) !=
@@ -2528,6 +2991,9 @@ static void display_service_task(void *argument) {
       display_pv_record_fifo_error();
     if (terminal_pending)
       (void)xTaskNotify(display_task_handle, LCD_NOTIFY_TERMINAL, eSetBits);
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+    xSemaphoreGive(scanout_mutex);
+#endif
 #if CONFIG_RV32_HOST_PERF_STATS
     DISPLAY_PERF_ADD(service_us, esp_timer_get_time() - service_started);
 #endif
@@ -2541,6 +3007,26 @@ int display_bridge_init(void) {
           ? ((xPortGetCoreID() + 1) % CONFIG_FREERTOS_NUMBER_OF_CORES)
           : xPortGetCoreID();
   BaseType_t created;
+
+  framebuffer_mutex =
+      xSemaphoreCreateMutexStatic(&framebuffer_mutex_storage);
+  if (framebuffer_mutex == NULL) {
+    printf("WARNING: Failed to create framebuffer snapshot mutex\n");
+    return -1;
+  }
+
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+  scanout_mutex = xSemaphoreCreateMutexStatic(&scanout_mutex_storage);
+  if (scanout_mutex == NULL) {
+    printf("WARNING: Failed to create display scanout mutex\n");
+    return -1;
+  }
+#endif
+
+  if (!display_bulk_storage_init()) {
+    printf("WARNING: Failed to allocate display bulk storage\n");
+    return -1;
+  }
 
   if (!display_pv_queue_init()) {
     printf("WARNING: Failed to create LCD command FIFO\n");
@@ -2567,8 +3053,32 @@ void display_bridge_set_guest_memory(void *host_base, uint32_t guest_base,
   guest_memory_size = size;
 }
 
+void *display_bridge_framebuffer_host(void) {
+  return framebuffer;
+}
+
+void display_bridge_mark_framebuffer_dirty(size_t start, size_t end,
+                                           uint32_t store_calls,
+                                           uint32_t store_bytes) {
+  if (framebuffer == NULL || start >= end || end > DISPLAY_FB_SIZE)
+    return;
+
+  if (start < producer_dirty_start)
+    producer_dirty_start = start;
+  if (end > producer_dirty_end)
+    producer_dirty_end = end;
+  producer_last_write_us = esp_timer_get_time();
+  __atomic_store_n(&producer_dirty, true, __ATOMIC_RELEASE);
+  /* Stop the terminal renderer as soon as a raw producer claims the logical
+   * surface.  Presentation remains deferred until the completed-frame
+   * boundary below. */
+  __atomic_store_n(&raw_framebuffer_claim_pending, true, __ATOMIC_RELEASE);
+  DISPLAY_PERF_ADD(framebuffer_store_calls, store_calls);
+  DISPLAY_PERF_ADD(framebuffer_store_bytes, store_bytes);
+}
+
 void display_bridge_commit(void) {
-  if (!producer_dirty)
+  if (!__atomic_load_n(&producer_dirty, __ATOMIC_ACQUIRE))
     return;
 
   portENTER_CRITICAL(&dirty_lock);
@@ -2579,9 +3089,47 @@ void display_bridge_commit(void) {
   pending_dirty = true;
   portEXIT_CRITICAL(&dirty_lock);
 
-  producer_dirty = false;
+  DISPLAY_PERF_ADD(framebuffer_commit_events, 1u);
+  DISPLAY_PERF_ADD(framebuffer_commit_bytes,
+                   producer_dirty_end - producer_dirty_start);
+
+  __atomic_store_n(&producer_dirty, false, __ATOMIC_RELEASE);
+  producer_last_write_us = 0;
   producer_dirty_start = DISPLAY_FB_SIZE;
   producer_dirty_end = 0;
+}
+
+void display_bridge_guest_slice_begin(void) {
+  if (framebuffer_mutex != NULL && framebuffer != NULL &&
+      framebuffer != scanout_framebuffer) {
+#if CONFIG_RV32_HOST_PERF_STATS
+    int64_t wait_started = esp_timer_get_time();
+#endif
+    xSemaphoreTake(framebuffer_mutex, portMAX_DELAY);
+#if CONFIG_RV32_HOST_PERF_STATS
+    uint32_t wait_us = (uint32_t)(esp_timer_get_time() - wait_started);
+
+    DISPLAY_PERF_ADD(framebuffer_guest_slices, 1u);
+    DISPLAY_PERF_ADD(framebuffer_guest_wait_us, wait_us);
+    display_perf_update_max(&display_perf.framebuffer_guest_wait_max_us,
+                            wait_us);
+#endif
+  }
+}
+
+void display_bridge_guest_slice_end(void) {
+  /* Explicit fence writes call display_bridge_commit() immediately.  For an
+   * unfenced mmap producer, require sustained quiet rather than one clean
+   * execution slice: Linux's timer IRQ alone creates a clean slice every
+   * 10 ms and used to expose partially copied scanlines. */
+  if (__atomic_load_n(&producer_dirty, __ATOMIC_ACQUIRE) &&
+      producer_last_write_us != 0 &&
+      esp_timer_get_time() - producer_last_write_us >=
+          (int64_t)CONFIG_RV32_DISPLAY_LEGACY_QUIET_MS * 1000)
+    display_bridge_commit();
+  if (framebuffer_mutex != NULL && framebuffer != NULL &&
+      framebuffer != scanout_framebuffer)
+    xSemaphoreGive(framebuffer_mutex);
 }
 
 void *display_bridge_accel_buffer(size_t *capacity) {
@@ -2611,6 +3159,143 @@ void display_bridge_accel_stop(void) {
   portEXIT_CRITICAL(&dirty_lock);
 }
 
+bool display_bridge_xrgb8888_available(void) {
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+  return framebuffer != NULL && gpu_staging != NULL && scanout_mutex != NULL;
+#else
+  return false;
+#endif
+}
+
+bool display_bridge_xrgb8888_update(display_bridge_resource_reader_t reader,
+                                    void *context, uint64_t source_offset,
+                                    uint32_t source_stride,
+                                    uint32_t destination_x,
+                                    uint32_t destination_y, uint32_t width,
+                                    uint32_t height) {
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+  size_t input_row_bytes;
+  uint32_t rows_per_chunk;
+  bool success = true;
+
+  if (reader == NULL || !display_bridge_xrgb8888_available() ||
+      !display_rect_valid(destination_x, destination_y, width, height) ||
+      width > SIZE_MAX / sizeof(uint32_t))
+    return false;
+  input_row_bytes = (size_t)width * sizeof(uint32_t);
+  if (source_stride < input_row_bytes ||
+      source_offset > UINT64_MAX - (uint64_t)(height - 1u) * source_stride)
+    return false;
+  rows_per_chunk = DISPLAY_GPU_STAGE_SIZE / input_row_bytes;
+  if (rows_per_chunk == 0u)
+    return false;
+
+  xSemaphoreTake(scanout_mutex, portMAX_DELAY);
+  display_terminal_release_framebuffer();
+  portENTER_CRITICAL(&dirty_lock);
+  ppa_frame_pending = false;
+  ppa_stop_pending = false;
+  portEXIT_CRITICAL(&dirty_lock);
+  ppa_accel_active = false;
+
+  for (uint32_t first_row = 0; first_row < height;) {
+    uint32_t chunk_rows = height - first_row;
+    bool ppa_converted = false;
+
+    if (chunk_rows > rows_per_chunk)
+      chunk_rows = rows_per_chunk;
+    for (uint32_t row = 0; row < chunk_rows; row++) {
+      if (!reader(context,
+                  source_offset + (uint64_t)(first_row + row) * source_stride,
+                  gpu_staging + (size_t)row * input_row_bytes,
+                  input_row_bytes)) {
+        success = false;
+        goto out;
+      }
+    }
+
+    if (ppa_ready) {
+      const ppa_srm_oper_config_t operation = {
+          .in =
+              {
+                  .buffer = gpu_staging,
+                  .pic_w = width,
+                  .pic_h = chunk_rows,
+                  .block_w = width,
+                  .block_h = chunk_rows,
+                  .srm_cm = PPA_SRM_COLOR_MODE_ARGB8888,
+              },
+          .out =
+              {
+                  .buffer = framebuffer,
+                  .buffer_size = DISPLAY_FB_SIZE,
+                  .pic_w = DISPLAY_FB_WIDTH,
+                  .pic_h = DISPLAY_FB_HEIGHT,
+                  .block_offset_x = destination_x,
+                  .block_offset_y = destination_y + first_row,
+                  .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+              },
+          .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
+          .scale_x = 1.0f,
+          .scale_y = 1.0f,
+          .mode = PPA_TRANS_MODE_BLOCKING,
+      };
+
+      ppa_converted =
+          ppa_do_scale_rotate_mirror(ppa_srm, &operation) == ESP_OK;
+      if (ppa_converted) {
+        ppa_fill_touched_framebuffer = true;
+        display_mark_present_rect(destination_x,
+                                  destination_y + first_row,
+                                  width, chunk_rows);
+        DISPLAY_PERF_ADD(ppa_blits, 1u);
+      }
+    }
+
+    if (!ppa_converted) {
+      for (uint32_t row = 0; row < chunk_rows; row++) {
+        const uint32_t *source =
+            (const uint32_t *)(gpu_staging + (size_t)row * input_row_bytes);
+        uint16_t *destination = (uint16_t *)(framebuffer +
+            ((size_t)(destination_y + first_row + row) * DISPLAY_FB_WIDTH +
+             destination_x) * sizeof(uint16_t));
+
+        for (uint32_t column = 0; column < width; column++) {
+          uint32_t pixel = source[column];
+          destination[column] = (uint16_t)(((pixel >> 8) & 0xf800u) |
+                                           ((pixel >> 5) & 0x07e0u) |
+                                           ((pixel >> 3) & 0x001fu));
+        }
+      }
+      display_mark_accel_rect(destination_x, destination_y + first_row,
+                              width, chunk_rows);
+    }
+    first_row += chunk_rows;
+  }
+
+out:
+  xSemaphoreGive(scanout_mutex);
+  return success;
+#else
+  (void)reader;
+  (void)context;
+  (void)source_offset;
+  (void)source_stride;
+  (void)destination_x;
+  (void)destination_y;
+  (void)width;
+  (void)height;
+  return false;
+#endif
+}
+
+void display_bridge_xrgb8888_flush(void) {
+#if defined(CONFIG_RV32_VIRTIO_GPU) && CONFIG_RV32_VIRTIO_GPU
+  if (display_task_handle != NULL)
+    (void)xTaskNotify(display_task_handle, LCD_NOTIFY_VSYNC, eSetBits);
+#endif
+}
+
 bool display_bridge_terminal_write(const void *buffer, size_t length) {
   if (length == 0)
     return true;
@@ -2621,7 +3306,7 @@ bool display_bridge_terminal_write(const void *buffer, size_t length) {
   if (framebuffer == NULL || terminal_stream == NULL ||
       display_task_handle == NULL)
     return true;
-  if (length > sizeof(terminal_stream_storage) ||
+  if (length > DISPLAY_TERMINAL_STREAM_SIZE ||
       xStreamBufferSpacesAvailable(terminal_stream) < length)
     return false;
   if (xStreamBufferSend(terminal_stream, buffer, length, 0) != length)
@@ -2709,11 +3394,14 @@ uint32_t display_bridge_load(uint32_t address, size_t width) {
                      DISPLAY_PV_FEATURE_SHARED_RESULT;
       if (pv_fifo_ready) {
         synthetic |= DISPLAY_PV_FEATURE_ASYNC_FIFO;
-        if (ppa_staging != NULL)
+        if (ppa_staging != NULL) {
           synthetic |= DISPLAY_PV_FEATURE_IMAGE1 | DISPLAY_PV_FEATURE_TILE |
                        DISPLAY_PV_FEATURE_PAYLOAD_POOL |
                        DISPLAY_PV_FEATURE_TILE_BATCH |
                        DISPLAY_PV_FEATURE_TEXT_RUN16;
+          if (guest_memory_host != NULL)
+            synthetic |= DISPLAY_PV_FEATURE_BULK_WRITE;
+        }
       }
       break;
     case DISPLAY_PV_REG_COMPLETED:
@@ -2844,6 +3532,12 @@ static uint32_t display_pv_enqueue(const display_pv_command_t *command,
       return DISPLAY_PV_STATUS_INVALID;
     break;
   }
+  case DISPLAY_PV_OP_BULK_WRITE:
+    payload_length = command->args[1];
+    if (payload_length == 0u || command->args[0] >= DISPLAY_FB_SIZE ||
+        payload_length > DISPLAY_FB_SIZE - command->args[0])
+      return DISPLAY_PV_STATUS_INVALID;
+    break;
   case DISPLAY_PV_OP_SET_TILE:
     payload_length = command->args[4];
     if (!display_tile_description_valid(command, payload_length))
@@ -3162,11 +3856,7 @@ void display_bridge_store(uint32_t address, uint32_t value, size_t width) {
   if (offset >= DISPLAY_FB_SIZE)
     return;
 
-  if (offset < producer_dirty_start)
-    producer_dirty_start = offset;
-  if (offset + width > producer_dirty_end)
-    producer_dirty_end = offset + width;
-  producer_dirty = true;
+  display_bridge_mark_framebuffer_dirty(offset, offset + width, 1u, width);
 }
 
 void display_bridge_perf_read_and_reset(
@@ -3194,6 +3884,9 @@ void display_bridge_perf_read_and_reset(
   DISPLAY_PERF_TAKE(copy_cycles);
   DISPLAY_PERF_TAKE(image1_commands);
   DISPLAY_PERF_TAKE(image1_cycles);
+  DISPLAY_PERF_TAKE(bulk_write_commands);
+  DISPLAY_PERF_TAKE(bulk_write_cycles);
+  DISPLAY_PERF_TAKE(bulk_write_bytes);
   DISPLAY_PERF_TAKE(tile_commands);
   DISPLAY_PERF_TAKE(tile_set_commands);
   DISPLAY_PERF_TAKE(tile_set_cycles);
@@ -3220,6 +3913,22 @@ void display_bridge_perf_read_and_reset(
   DISPLAY_PERF_TAKE(cache_syncs);
   DISPLAY_PERF_TAKE(cache_bytes);
   DISPLAY_PERF_TAKE(cache_us);
+  DISPLAY_PERF_TAKE(framebuffer_store_calls);
+  DISPLAY_PERF_TAKE(framebuffer_store_bytes);
+  DISPLAY_PERF_TAKE(framebuffer_commit_events);
+  DISPLAY_PERF_TAKE(framebuffer_commit_bytes);
+  DISPLAY_PERF_TAKE(framebuffer_publish_events);
+  DISPLAY_PERF_TAKE(framebuffer_publish_bytes);
+  DISPLAY_PERF_TAKE(framebuffer_present_events);
+  DISPLAY_PERF_TAKE(framebuffer_present_bytes);
+  DISPLAY_PERF_TAKE(framebuffer_present_us);
+  DISPLAY_PERF_TAKE(framebuffer_present_cpu_copies);
+  DISPLAY_PERF_TAKE(framebuffer_present_deferred);
+  DISPLAY_PERF_TAKE(framebuffer_guest_slices);
+  DISPLAY_PERF_TAKE(framebuffer_guest_wait_us);
+  DISPLAY_PERF_TAKE(framebuffer_guest_wait_max_us);
+  DISPLAY_PERF_TAKE(framebuffer_snapshot_wait_us);
+  DISPLAY_PERF_TAKE(framebuffer_snapshot_wait_max_us);
   DISPLAY_PERF_TAKE(fifo_busy);
   DISPLAY_PERF_TAKE(fifo_high_water);
   DISPLAY_PERF_TAKE(fifo_slices);

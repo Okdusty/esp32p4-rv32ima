@@ -19,6 +19,23 @@ config RV32_DECODED_BLOCK_CACHE
 	  normal ESP32-P4 path because guest instruction fetches already benefit
 	  from the hardware cache. Leave it disabled for production builds.
 
+config RV32_NATIVE_JIT
+	bool "Enable experimental native RV32 hot-block JIT"
+	depends on IDF_TARGET_ESP32P4 && !ESP_SYSTEM_MEMPROT
+	default n
+	help
+	  Translate frequently repeated RV32 user-mode integer basic blocks into native
+	  ESP32-P4 RV32 code stored in a bounded PSRAM arena and internal hot tier.
+	  Loads and stores validate new pages through checked callbacks, then reuse
+	  small tagged host-pointer caches for aligned accesses. Sv32 permissions,
+	  uncached DMA pages and MMIO faults retain normal emulator semantics.
+	  Kernel, atomic and privileged operations continue through the interpreter.
+
+	  ESP-IDF memory protection intentionally prevents writable executable
+	  allocations. Disable Component config -> ESP System Settings -> Memory
+	  protection before enabling this experimental option. Leave it disabled
+	  when writable executable memory is not acceptable.
+
 config RV32_EMULATOR_PERF_STATS
 	bool "Enable RV32 emulator performance counters"
 	default n
@@ -35,6 +52,20 @@ config RV32_EMULATOR_PERF_INTERVAL_MS
 	help
 	  Time between emulator performance reports on the host UART.
 
+config RV32_CACHE_PERF_STATS
+	bool "Sample hardware caches and SD traffic without instruction counters"
+	depends on IDF_TARGET_ESP32P4 && !RV32_EMULATOR_PERF_STATS
+	default n
+	help
+	  Sample the L1/L2 instruction and data bus counters for both host cores
+	  once per second, together with block-cache requests and bytes. This does
+	  not enable emulator instruction, JIT-entry or display-operation profiling.
+	  Raw hardware counts are not a calibrated stall-cycle or bandwidth metric. Reports
+	  include their time window and the preceding report's cost; UART reporting
+	  is excluded from the next cache window but still affects application FPS.
+	  The hardware counters are shared diagnostic resources: do not run another
+	  cache-counter reader/resetter concurrently. Disable after profiling.
+
 config RV32_HOST_PERF_STATS
 	bool "Enable host core and display performance counters"
 	default n
@@ -46,9 +77,33 @@ config RV32_HOST_PERF_STATS
 	  counters, but should still be disabled in normal builds after profiling is
 	  complete.
 
+config RV32_HOST_BULK_BUFFERS_PSRAM
+	bool "Place bulk host queues in reserved PSRAM"
+	depends on SPIRAM
+	default y if CACHE_L2_CACHE_256KB || CACHE_L2_CACHE_512KB
+	default n
+	help
+	  Reserve 128 KiB below the native-JIT arena in Linux's unused Image-header
+	  prefix and use it for the display payload pool, terminal byte stream,
+	  glyph storage, and asynchronous UART TX stream. Their control structures
+	  and all hot emulator/JIT lookup state remain in internal RAM.
+
+	  This trades a small portion of the virtio-block read cache for internal
+	  RAM headroom. It is enabled automatically with the larger ESP32-P4 L2
+	  sizes; disable it only for controlled 128 KiB comparison builds.
+
 endmenu
 
 menu "RV32 Linux hardware bridges"
+
+config RV32_USB_FULL_SPEED_ONLY
+	bool "Limit native USB host to full-speed (compatibility test)"
+	default n
+	help
+	  Limit the ESP32-P4 UTMI host and Linux DWC2 controller to USB
+	  full-speed (12 Mbit/s). This is useful for diagnosing marginal cables,
+	  connectors, or board modifications that cannot sustain high-speed
+	  signaling. Leave this disabled for the normal 480 Mbit/s path.
 
 config RV32_DISPLAY_ACCEL
 	bool
@@ -56,6 +111,18 @@ config RV32_DISPLAY_ACCEL
 	  Internal switch for the backend-neutral paravirtual framebuffer command
 	  transport. Display backends select this when they provide a packed RGB565
 	  scanout surface and a CPU1 service task.
+
+config RV32_VIRTIO_GPU
+	bool "Enable standard virtio-gpu 2D device (experimental)"
+	depends on RV32_DISPLAY_ACCEL
+	default n
+	help
+	  Expose a standard virtio-mmio GPU at 0x12300000. Linux uses its upstream
+	  virtio_gpu DRM driver; no board-specific guest driver is required. Guest
+	  XRGB8888 resources are gathered and converted to the backend-neutral
+	  RGB565 scanout with the ESP32-P4 PPA on CPU1. This is a 2D/KMS transport,
+	  not a virgl or OpenGL accelerator. The existing framebuffer and terminal
+	  path remain available as a fallback.
 
 choice RV32_DISPLAY_BACKEND
 	prompt "Display backend"
@@ -103,6 +170,18 @@ config RV32_ST7703_REFRESH_HZ
 	  Target panel refresh rate. The display bridge derives the MIPI-DPI
 	  pixel clock from this value and the Waveshare 720x720 porch timings.
 	  59 Hz is close to the panel vendor configuration's 59.22 Hz.
+
+config RV32_ST7703_DSI_DMA_QOS
+	int "ST7703 scanout DMA AXI priority"
+	depends on RV32_ST7703_DISPLAY
+	range 0 15
+	default 15
+	help
+	  Priority of the continuous MIPI-DPI framebuffer reads on the ESP32-P4
+	  AXI interconnect. The scanout deadline is real-time, so the default gives
+	  it precedence over bursty CPU, USB and SDIO traffic. Lower this only when
+	  measuring memory-bus arbitration; too little service can cause a DSI
+	  underrun and a blue or briefly blank display.
 
 choice RV32_ST7789_SPI_HOST
 	prompt "ST7789 SPI controller"
@@ -317,6 +396,19 @@ config RV32_DISPLAY_FLUSH_INTERVAL_MS
 	  blanking window. A non-zero value is available only for bandwidth and
 	  timing experiments and increases visible latency.
 
+config RV32_DISPLAY_LEGACY_QUIET_MS
+	int "Legacy mmap framebuffer quiet period (ms)"
+	depends on RV32_DISPLAY_ACCEL
+	range 1 100
+	default 30
+	help
+	  Direct mmap clients have no portable end-of-frame notification. Hold their
+	  accumulated writes until this much wall-clock time passes without another
+	  framebuffer store. This filters scheduler and 100 Hz timer-interrupt gaps
+	  inside a slow scanline copy, preventing partially painted frames from being
+	  published. Drivers which issue the paravirtual framebuffer fence are not
+	  delayed by this setting.
+
 config RV32_DISPLAY_COMMAND_FIFO_DEPTH
 	int "Asynchronous framebuffer command FIFO depth"
 	depends on RV32_DISPLAY_ACCEL
@@ -341,21 +433,25 @@ config RV32_DISPLAY_PAYLOAD_BLOCK_SIZE
 	int "Framebuffer FIFO payload block size (bytes)"
 	depends on RV32_DISPLAY_ACCEL
 	range 2048 32768
-	default 16384
+	default 32768
 	help
 	  Maximum bitmap, tile-index, or font payload accepted in one command.
 	  Payload capacity is reported to Linux through the PFB3 mailbox, allowing
-	  the same driver to adapt to displays with different resolutions.
+	  the same driver to adapt to displays with different resolutions. The
+	  32 KiB default halves mailbox submissions for large streamed writes while
+	  remaining small enough for a reliable contiguous Linux allocation.
 
 config RV32_DISPLAY_PAYLOAD_BLOCK_COUNT
 	int "Framebuffer FIFO payload block count"
 	depends on RV32_DISPLAY_ACCEL
 	range 2 4
-	default 4
+	default 2
 	help
 	  Number of payload-bearing commands that can be outstanding at once.
 	  Blocks are shared by all payload operations instead of being embedded in
-	  every command descriptor. The defaults reserve 64 KiB of internal RAM.
+	  every command descriptor. The defaults retain 64 KiB of aggregate payload
+	  capacity; two larger blocks reduce command overhead without increasing
+	  the reserved-memory or cache footprint.
 
 choice RV32_GUEST_CONSOLE
 	prompt "OpenWrt interactive console supervisor"

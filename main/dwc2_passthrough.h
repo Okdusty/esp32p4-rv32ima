@@ -1,4 +1,3 @@
-// DEAD CODE
 #ifndef DWC2_PASSTHROUGH_H
 #define DWC2_PASSTHROUGH_H
 

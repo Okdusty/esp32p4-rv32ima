@@ -31,6 +31,8 @@ build_one()
 		st7703)
 			cpp_flags+=(
 				-DRV32_DISPLAY_ENABLED=1
+				-DRV32_HOST_DISPLAY_REGION_BASE=0x49d02000
+				-DRV32_HOST_DISPLAY_REGION_SIZE=0x000fe000
 				-DRV32_DISPLAY_WIDTH=720
 				-DRV32_DISPLAY_HEIGHT=720
 				-DRV32_DISPLAY_STRIDE=1440
@@ -80,6 +82,14 @@ build_one()
 	esac
 	cpp "${cpp_flags[@]}" "$repo_root/main/uc.dts" "$preprocessed"
 	"$dtc" -I dts -O dtb -o "$output" "$preprocessed"
+	if [[ "$display" == st7703 ]]; then
+		local dtb_size
+		dtb_size=$(wc -c < "$output")
+		if ((dtb_size > 0x2000)); then
+			echo "error: ST7703 DTB is $dtb_size bytes; only 8192 bytes are available before the reserved display surface" >&2
+			return 1
+		fi
+	fi
 }
 
 case ${1:-all} in

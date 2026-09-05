@@ -1,0 +1,23 @@
+Final frozen-script harness (exit 0):
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.FWcB8M/production-shortcuts.elf has a LOAD segment with RWX permissions
+Native JIT production self-tests and 36 memory cases passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.FWcB8M/production-lifetime.elf has a LOAD segment with RWX permissions
+Native JIT production lifetime: 256 hot pairs, 64 cold-reuse cycles, rejection/flush passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.FWcB8M/profile-shortcuts.elf has a LOAD segment with RWX permissions
+Native JIT profile self-tests and 36 memory cases passed
+/opt/riscv32ima/riscv32-unknown-linux-gnu/bin/ld: warning: /tmp/rv32-native-jit.FWcB8M/profile-lifetime.elf has a LOAD segment with RWX permissions
+Native JIT profile lifetime: 256 hot pairs, 64 cold-reuse cycles, rejection/flush passed
+Standalone artifacts: /tmp/rv32-native-jit.FWcB8M
+
+Negative control: suppressed jit_retarget_links in a temporary source copy; simulator exit 20 (expected).
+
+Separate emulator test:
+./scripts/test-emulator.sh
+mini-rv32ima page-cache tests passed
+
+Verified source hashes:
+3a450f809f1b6f2841e6cc721f5c902fb0ee026e2a11254e15120ba99d9a9d31  scripts/test-native-jit.sh
+7a753e6d27102323b251c18bd9173872435f7fcb11918104c8fb2aa07218b07c  tests/rv32-native-jit-lifetime.c
+8651a1924f74edf293162b70efa619f32bd211f816708e45f1cf5348b5c9ae1d  main/rv32_native_jit.c
+732323bdca39032ac4a1e39e1ea82652336f314bdbc31982f2225cd43f58db16  main/uc-rv32ima.c
+

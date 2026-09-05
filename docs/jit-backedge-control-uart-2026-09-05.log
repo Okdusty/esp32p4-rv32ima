@@ -1,0 +1,47 @@
+pidof doom doom-bench-640
+pidof doom doom-bench-640
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# rv32_bc="../doom-bench-640 -iwad ../freedoom1.wad"
+rv32_bc="../doom-bench-640 -iwad ../freedoom1.
+wad"
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# rv32_bc="$rv32_bc -gfxmode rgb565 -nosound -nomusic"
+rv32_bc="$rv32_bc -gfxmode rgb565 -nosound -no
+music"
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# rv32_bc="$rv32_bc -timedemo demo1"
+rv32_bc="$rv32_bc -timedemo demo1"
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# $rv32_bc >/tmp/be-ctl.out 2>&1; rv32_bs=$?
+$rv32_bc >/tmp/be-ctl.out 2>&1; rv32_bs=$?
+Display diagnostic: terminal release at 3514114 ms
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# Display diagnostic: terminal takeover at 3579076 ms, input=44 bytes
+echo control_exit=$rv32_bs
+echo control_exit=$rv32_bs
+control_exit=0
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# grep -E 'frames=|fps|elapsed' /tmp/be-ctl.out
+grep -E 'frames=|fps|elapsed' /tmp/be-ctl.out
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# pidof doom doom-bench-640
+pidof doom doom-bench-640
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /proc/uptime
+cat /proc/uptime
+3630.92 3260.57
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# tail -n 12 /tmp/be-ctl.out
+tail -n 12 /tmp/be-ctl.out
+===========================================================================
+                           Freedoom: Phase 1
+===========================================================================
+ Doom Generic is free software, covered by the GNU General Public
+ License.  There is NO warranty; not even for MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. You are welcome to change and distribute
+ copies under certain conditions. See the source for more information.
+===========================================================================
+ WARNING: You are playing using one of the Freedoom IWAD
+ files, which might not work in this port. See this page
+ for more information on how to play using Freedoom:
+   http://www.chocolate-doom.org/wiki/index.php/Freedoomroot@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /tmp/doom-benchmark.log
+cat /tmp/doom-benchmark.log
+frames=100 elapsed_ms=37457 fps_x100=266 mode=present
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# sha256sum ../doom-bench-640
+sha256sum ../doom-bench-640
+66304de72f65948eaad46284cc3f0bf02ea74ed78387f5dea7ab8a398b532285  ../doom-bench-640
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# dmesg | grep -Ei 'panic|oops|BUG:|out of memory'
+dmesg | grep -Ei 'panic|oops|BUG:|out of memor
+y'
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save#

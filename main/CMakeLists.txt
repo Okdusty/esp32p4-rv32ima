@@ -7,13 +7,28 @@ set(RV32_SOURCES
 	"cache.c"
 	"dwc2_passthrough.c"
 	"port-esp.c"
+	"virtio_blk_bridge.c"
 	"virtio_console_bridge.c")
+
+if(CONFIG_RV32_NATIVE_JIT)
+	list(APPEND RV32_SOURCES
+		"rv32_native_jit.c"
+		"rv32_native_jit_enter.S")
+endif()
+
+if(CONFIG_RV32_CACHE_PERF_STATS)
+	list(APPEND RV32_SOURCES "host_cache_profile.c")
+endif()
 
 set(RV32_LINKER_FRAGMENTS "link.lf")
 
 if(CONFIG_RV32_DISPLAY_ACCEL)
 	list(APPEND RV32_SOURCES "display_bridge.c")
 	list(APPEND RV32_LINKER_FRAGMENTS "link-display.lf")
+endif()
+
+if(CONFIG_RV32_VIRTIO_GPU)
+	list(APPEND RV32_SOURCES "virtio_gpu_bridge.c")
 endif()
 
 if(CONFIG_RV32_ST7703_DISPLAY)
@@ -33,6 +48,7 @@ idf_component_register(SRCS ${RV32_SOURCES}
 		       INCLUDE_DIRS "."
 		       PRIV_REQUIRES esp_lcd esp_driver_gpio esp_driver_ledc
 		                     esp_driver_i2c esp_driver_spi
+		                     esp_driver_sdmmc esp_driver_dma esp_hal_dma sdmmc
 		                     esp_driver_ppa
 		                     esp_hw_support esp_mm esp_timer soc
 		                     bootloader_support

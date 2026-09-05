@@ -9,7 +9,7 @@
  * size, accelerator command, and framebuffer commit/fence.  After completing
  * a direct framebuffer update, read the final word, write
  * DISPLAY_FB_COMMIT_SYNC to it, and wait for its value to change.  The returned
- * sequence advances only after a physical VSYNC cache-cleaned the update.
+ * sequence advances only after a physical VSYNC published the update.
  */
 #define DISPLAY_ACCEL_MAX_WIDTH          256u
 #define DISPLAY_ACCEL_MAX_HEIGHT         256u
@@ -35,10 +35,12 @@
  * descriptor and payload directly from guest RAM. The doorbell copies both
  * while still running on CPU0, avoiding repeated emulated MMIO stores. The
  * optional shared-result feature writes acceptance back into that descriptor,
- * replacing two emulated MMIO reads with ordinary guest-RAM loads.
+ * replacing two emulated MMIO reads with ordinary guest-RAM loads. Version 5
+ * adds bounded RGB565 byte-range writes, allowing normal fbdev write() calls
+ * to avoid a pixel loop through the emulated MMIO aperture.
  */
 #define DISPLAY_PV_MAGIC                 0x31424650u /* "PFB1" */
-#define DISPLAY_PV_VERSION               4u
+#define DISPLAY_PV_VERSION               5u
 #define DISPLAY_PV_SUBMIT                0x54494d53u /* "SMIT" */
 #define DISPLAY_PV_SHARED_COMMAND_MAGIC  0x34444d43u /* "CMD4" */
 #define DISPLAY_PV_SHARED_RESULT_MAGIC   0x35444d43u /* "CMD5" */
@@ -55,6 +57,7 @@
 #define DISPLAY_PV_FEATURE_SHARED_RESULT  (1u << 9)
 #define DISPLAY_PV_FEATURE_TILE_BATCH     (1u << 10)
 #define DISPLAY_PV_FEATURE_TEXT_RUN16     (1u << 11)
+#define DISPLAY_PV_FEATURE_BULK_WRITE     (1u << 12)
 
 #define DISPLAY_PV_FORMAT_RGB565         1u
 
@@ -67,6 +70,7 @@
 #define DISPLAY_PV_OP_TILE_CURSOR        7u
 #define DISPLAY_PV_OP_TILE_BATCH         8u
 #define DISPLAY_PV_OP_TEXT_RUN16         9u
+#define DISPLAY_PV_OP_BULK_WRITE         10u
 
 #define DISPLAY_PV_ROP_COPY              0u
 #define DISPLAY_PV_ROP_XOR               1u

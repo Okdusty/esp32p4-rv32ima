@@ -1,0 +1,10 @@
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /proc/uptime
+cat /proc/uptime
+790.31 689.72
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /proc/uptime
+cat /proc/uptime
+1541.61 1442.87
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# cat /proc/uptime
+cat /proc/uptime
+1745.28 1646.81
+root@esp32p4-openwrt:/mnt/sd/opt/doom/save# 

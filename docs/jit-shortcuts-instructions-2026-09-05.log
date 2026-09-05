@@ -1,0 +1,158 @@
+BEFORE: emitted code from unchanged JIT
+
+Connected to the simulator.
+Loading section .text, size 0xcb74 lma 10000
+Loading section .iram1, size 0x80 lma 1cb74
+Loading section .rodata, size 0xec lma 1cbf4
+Loading section .srodata, size 0x6 lma 1cce0
+Start address 10000
+Transfer rate: 419632 bits in <1 sec.
+Breakpoint 1 at 0x1cb74: file main/rv32_native_jit_enter.S, line 15.
+
+Breakpoint 1, rv32_native_jit_enter () at main/rv32_native_jit_enter.S:15
+15	    addi    sp, sp, -64
+
+/tmp/jit-shortcuts-before.code:     file format binary
+
+
+Disassembly of section .data:
+
+00000000 <.data>:
+   0:	00050f93          	mv	t6,a0
+   4:	028faf03          	lw	t5,40(t6)
+   8:	050fad03          	lw	s10,80(t6)
+   c:	04cfad83          	lw	s11,76(t6)
+  10:	fff00c93          	li	s9,-1
+  14:	010f2e03          	lw	t3,16(t5)
+  18:	008f2903          	lw	s2,8(t5)
+  1c:	00cf2983          	lw	s3,12(t5)
+  20:	044fa803          	lw	a6,68(t6)
+  24:	00000893          	li	a7,0
+  28:	000e0593          	mv	a1,t3
+  2c:	00098613          	mv	a2,s3
+  30:	0015f393          	andi	t2,a1,1
+  34:	08039463          	bnez	t2,0xbc
+  38:	00c5d293          	srli	t0,a1,0xc
+  3c:	03929e63          	bne	t0,s9,0x78
+  40:	00f582b3          	add	t0,a1,a5
+  44:	00c29023          	sh	a2,0(t0)
+  48:	002e0e13          	addi	t3,t3,2
+  4c:	00388893          	addi	a7,a7,3
+  50:	000405b7          	lui	a1,0x40
+  54:	00c58593          	addi	a1,a1,12 # 0x4000c
+  58:	012e7a63          	bgeu	t3,s2,0x6c
+  5c:	fff80813          	addi	a6,a6,-1
+  60:	00080463          	beqz	a6,0x68
+  64:	fc0002e3          	beqz	zero,0x28
+  68:	000405b7          	lui	a1,0x40
+  6c:	00000513          	li	a0,0
+  70:	011d0d33          	add	s10,s10,a7
+  74:	06000e63          	beqz	zero,0xf0
+  78:	03f2f313          	andi	t1,t0,63
+  7c:	00531313          	slli	t1,t1,0x5
+  80:	006f8333          	add	t1,t6,t1
+  84:	25c32383          	lw	t2,604(t1)
+  88:	02729a63          	bne	t0,t2,0xbc
+  8c:	26032783          	lw	a5,608(t1)
+  90:	00028c93          	mv	s9,t0
+  94:	00f582b3          	add	t0,a1,a5
+  98:	00c29023          	sh	a2,0(t0)
+  9c:	26432283          	lw	t0,612(t1)
+
+
+AFTER: emitted code from candidate JIT
+
+Connected to the simulator.
+Loading section .text, size 0xd08c lma 10000
+Loading section .iram1, size 0x80 lma 1d08c
+Loading section .rodata, size 0xec lma 1d10c
+Loading section .srodata, size 0x6 lma 1d1f8
+Start address 10000
+Transfer rate: 430064 bits in <1 sec.
+Breakpoint 1 at 0x1d08c: file main/rv32_native_jit_enter.S, line 15.
+
+Breakpoint 1, rv32_native_jit_enter () at main/rv32_native_jit_enter.S:15
+15	    addi    sp, sp, -64
+
+/tmp/jit-shortcuts-after.code:     file format binary
+
+
+Disassembly of section .data:
+
+00000000 <.data>:
+   0:	00050f93          	mv	t6,a0
+   4:	028faf03          	lw	t5,40(t6)
+   8:	050fad03          	lw	s10,80(t6)
+   c:	04cfad83          	lw	s11,76(t6)
+  10:	fff00c93          	li	s9,-1
+  14:	010f2e03          	lw	t3,16(t5)
+  18:	008f2903          	lw	s2,8(t5)
+  1c:	00cf2983          	lw	s3,12(t5)
+  20:	044fa803          	lw	a6,68(t6)
+  24:	00000893          	li	a7,0
+  28:	000e0593          	mv	a1,t3
+  2c:	00098613          	mv	a2,s3
+  30:	00c5d293          	srli	t0,a1,0xc
+  34:	03929e63          	bne	t0,s9,0x70
+  38:	00f582b3          	add	t0,a1,a5
+  3c:	00c29023          	sh	a2,0(t0)
+  40:	002e0e13          	addi	t3,t3,2
+  44:	00388893          	addi	a7,a7,3
+  48:	000405b7          	lui	a1,0x40
+  4c:	00c58593          	addi	a1,a1,12 # 0x4000c
+  50:	012e7a63          	bgeu	t3,s2,0x64
+  54:	fff80813          	addi	a6,a6,-1
+  58:	00080463          	beqz	a6,0x60
+  5c:	fc0006e3          	beqz	zero,0x28
+  60:	000405b7          	lui	a1,0x40
+  64:	00000513          	li	a0,0
+  68:	011d0d33          	add	s10,s10,a7
+  6c:	08000263          	beqz	zero,0xf0
+  70:	0015f393          	andi	t2,a1,1
+  74:	04039463          	bnez	t2,0xbc
+  78:	03f2f313          	andi	t1,t0,63
+  7c:	00531313          	slli	t1,t1,0x5
+  80:	006f8333          	add	t1,t6,t1
+  84:	25c32383          	lw	t2,604(t1)
+  88:	02729a63          	bne	t0,t2,0xbc
+  8c:	26032783          	lw	a5,608(t1)
+  90:	00028c93          	mv	s9,t0
+  94:	00f582b3          	add	t0,a1,a5
+  98:	00c29023          	sh	a2,0(t0)
+  9c:	26432283          	lw	t0,612(t1)
+
+
+BEFORE: simulator CORE statistics (not ESP32-P4 cycles)
+
+Summary profiling results:
+
+CORE Statistics
+
+  Total:  35,235,447 accesses
+
+      read:     8,246: 
+     write: 1,130,035: *
+      exec:34,097,166: ****************************************
+
+Simulator Execution Speed
+
+  Total execution time   : 1.78 seconds
+riscv32-unknown-linux-gnu-run /tmp/rv32-jit-selftest/jit-memory-bench-before
+
+
+AFTER: simulator CORE statistics (not ESP32-P4 cycles)
+
+Summary profiling results:
+
+CORE Statistics
+
+  Total:  31,043,361 accesses
+
+      read:     8,251: 
+     write: 1,130,030: *
+      exec:29,905,080: ****************************************
+
+Simulator Execution Speed
+
+  Total execution time   : 1.59 seconds
+riscv32-unknown-linux-gnu-run /tmp/rv32-jit-selftest/jit-memory-bench-after

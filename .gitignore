@@ -1,5 +1,7 @@
 .guest-work/
 __pycache__/
+/build/
+/build-*/
+/.cache/
 /sdkconfig
 /sdkconfig.old
-guest/openwrt/files/init

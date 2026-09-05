@@ -1,0 +1,9 @@
+2026-09-05T11:08:19+00:00 dusty-got-laptop kernel: PM: suspend entry (s2idle)
+2026-09-05T11:15:34+00:00 dusty-got-laptop kernel: printk: Suspending console(s) (use no_console_suspend to debug)
+2026-09-05T11:15:34+00:00 dusty-got-laptop kernel: PM: suspend devices took 0.390 seconds
+2026-09-05T11:15:34+00:00 dusty-got-laptop kernel: amdgpu 0000:c4:00.0: SMU is resumed successfully!
+2026-09-05T11:15:34+00:00 dusty-got-laptop kernel: PM: resume devices took 2.514 seconds
+2026-09-05T11:15:34+00:00 dusty-got-laptop kernel: usb 1-2: USB disconnect, device number 17
+2026-09-05T11:15:34+00:00 dusty-got-laptop kernel: ftdi_sio ttyUSB1: FTDI USB Serial Device converter now disconnected from ttyUSB1
+2026-09-05T11:15:34+00:00 dusty-got-laptop kernel: ftdi_sio 1-2:1.0: device disconnected
+2026-09-05T11:15:35+00:00 dusty-got-laptop kernel: PM: suspend exit

@@ -60,7 +60,11 @@ _Static_assert(HOST_UART_TX_TICK_BUDGET <= HOST_UART_TX_CHUNK_SIZE,
                "UART tick quota exceeds the TX worker buffer");
 
 static StaticStreamBuffer_t host_uart_tx_stream_control;
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+static uint8_t *host_uart_tx_stream_storage;
+#else
 static uint8_t host_uart_tx_stream_storage[HOST_UART_TX_QUEUE_SIZE];
+#endif
 static StreamBufferHandle_t host_uart_tx_stream;
 static uint32_t host_uart_tx_dropped;
 static bool host_uart_driver_ready;
@@ -104,6 +108,8 @@ void HostEnableGuestRamPrefetch(const void *base, size_t size)
   printf("L2 next-line prefetch: host [%p, %p)\n", (void *)start,
          (void *)end);
 #else
+  Cache_Disable_L2_Cache_Autoload();
+  printf("L2 next-line prefetch: disabled\n");
   (void)base;
   (void)size;
 #endif
@@ -138,7 +144,7 @@ void HostCacheStatsReadAndReset(struct host_cache_stats *stats)
 #endif
 }
 
-static bool seed_linux_rng(uint8_t *dtb, size_t dtb_size)
+static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
 {
   uint32_t struct_offset;
   uint32_t strings_offset;
@@ -146,6 +152,10 @@ static bool seed_linux_rng(uint8_t *dtb, size_t dtb_size)
   uint32_t strings_size;
   size_t cursor;
   size_t struct_end;
+  bool rng_seeded = false;
+#if CONFIG_RV32_USB_FULL_SPEED_ONLY
+  bool usb_speed_limited = false;
+#endif
 
   if (dtb_size < 40 || read_be32(dtb) != 0xd00dfeedu)
     return false;
@@ -198,8 +208,16 @@ static bool seed_linux_rng(uint8_t *dtb, size_t dtb_size)
         bootloader_random_disable();
         printf("Seeded Linux CRNG with %" PRIu32
                " bytes of fresh P4 hardware entropy\n", length);
-        return true;
+        rng_seeded = true;
       }
+#if CONFIG_RV32_USB_FULL_SPEED_ONLY
+      if (strcmp(name, "maximum-speed") == 0 &&
+          length >= sizeof("full-speed")) {
+        memset(dtb + cursor, 0, length);
+        memcpy(dtb + cursor, "full-speed", sizeof("full-speed"));
+        usb_speed_limited = true;
+      }
+#endif
       cursor = (cursor + length + 3u) & ~3u;
     } else if (token == FDT_END_NODE || token == FDT_NOP) {
       continue;
@@ -210,7 +228,14 @@ static bool seed_linux_rng(uint8_t *dtb, size_t dtb_size)
     }
   }
 
-  return false;
+#if CONFIG_RV32_USB_FULL_SPEED_ONLY
+  if (usb_speed_limited)
+    printf("Linux DWC2 maximum-speed limited to full-speed (12 Mbit/s)\n");
+  else
+    printf("WARNING: USB full-speed limit requested, but the DTB has no "
+           "maximum-speed property\n");
+#endif
+  return rng_seeded;
 }
 
 int HostInputInit(void) {
@@ -305,8 +330,16 @@ int HostConsoleInit(void)
 {
   BaseType_t uart_core = CONFIG_FREERTOS_NUMBER_OF_CORES > 1 ? 1 : 0;
 
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+  host_uart_tx_stream_storage = psram_host_aux_alloc(
+      HOST_UART_TX_QUEUE_SIZE, CONFIG_CACHE_L2_CACHE_LINE_SIZE);
+  if (host_uart_tx_stream_storage == NULL) {
+    printf("WARNING: Failed to allocate UART TX stream in reserved PSRAM\n");
+    return -1;
+  }
+#endif
   host_uart_tx_stream = xStreamBufferCreateStatic(
-      sizeof(host_uart_tx_stream_storage), 1u,
+      HOST_UART_TX_QUEUE_SIZE, 1u,
       host_uart_tx_stream_storage, &host_uart_tx_stream_control);
   if (host_uart_tx_stream == NULL)
     return -1;
@@ -376,6 +409,11 @@ int IsKBHit(void) {
 static uint8_t *psram_allocation = NULL;
 static uint8_t *psram_base = NULL;
 static size_t psram_size = 0;
+static size_t psram_host_cache_reserved;
+static bool psram_host_cache_exported;
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+static size_t psram_host_aux_used;
+#endif
 
 int psram_init(void) {
   /*
@@ -460,6 +498,10 @@ int psram_init(void) {
    * also leaves more memory bandwidth for LCD initialization.
    */
   printf("PSRAM guest aperture reserved successfully!\n");
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+  printf("Reserved host PSRAM auxiliary pool: %u KiB\n",
+         (unsigned int)(HOST_AUXILIARY_SIZE / 1024u));
+#endif
 
   return 0;
 }
@@ -501,6 +543,214 @@ int psram_write(uint32_t addr, void *buf, int len) {
 void *psram_get_base(void) { return psram_base; }
 
 size_t psram_get_size(void) { return psram_size; }
+
+static bool psram_get_host_cache_bounds(uintptr_t *region_start,
+                                        uintptr_t *region_end) {
+  const uintptr_t alignment = 64u;
+  uintptr_t start;
+  uintptr_t end = GUEST_DMA_BASE;
+
+  if (region_start == NULL || region_end == NULL || psram_allocation == NULL)
+    return false;
+
+  start = ((uintptr_t)psram_allocation + alignment - 1u) &
+          ~(alignment - 1u);
+#if CONFIG_RV32_NATIVE_JIT
+  if (start >= end ||
+      end - start <= HOST_JIT_CODE_SIZE + HOST_JIT_METADATA_SIZE)
+    return false;
+  end -= HOST_JIT_CODE_SIZE + HOST_JIT_METADATA_SIZE;
+#endif
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+  if (start >= end || end - start <= HOST_AUXILIARY_SIZE)
+    return false;
+  end -= HOST_AUXILIARY_SIZE;
+#endif
+  if (start >= end) {
+    return false;
+  }
+
+  *region_start = start;
+  *region_end = end;
+  return true;
+}
+
+bool psram_get_host_cache_region(void **base, size_t *size) {
+  uintptr_t start;
+  uintptr_t end;
+
+  if (base == NULL || size == NULL ||
+      !psram_get_host_cache_bounds(&start, &end) ||
+      psram_host_cache_reserved > end - start) {
+    if (base != NULL)
+      *base = NULL;
+    if (size != NULL)
+      *size = 0;
+    return false;
+  }
+  end -= psram_host_cache_reserved;
+  if (start >= end) {
+    *base = NULL;
+    *size = 0;
+    return false;
+  }
+
+  psram_host_cache_exported = true;
+  *base = (void *)start;
+  *size = end - start;
+  return true;
+}
+
+void *psram_host_cache_alloc(size_t size, size_t alignment) {
+  uintptr_t start;
+  uintptr_t end;
+  uintptr_t reservation_end;
+  uintptr_t reservation_start;
+
+  if (size == 0u || alignment == 0u ||
+      (alignment & (alignment - 1u)) != 0u ||
+      psram_host_cache_exported ||
+      !psram_get_host_cache_bounds(&start, &end) ||
+      psram_host_cache_reserved > end - start)
+    return NULL;
+
+  reservation_end = end - psram_host_cache_reserved;
+  if (size > reservation_end - start)
+    return NULL;
+  reservation_start = (reservation_end - size) & ~(uintptr_t)(alignment - 1u);
+  if (reservation_start < start)
+    return NULL;
+
+  psram_host_cache_reserved = end - reservation_start;
+  return (void *)reservation_start;
+}
+
+bool psram_get_host_display_region(void **base, size_t *size) {
+#if defined(CONFIG_RV32_ST7703_DISPLAY) && CONFIG_RV32_ST7703_DISPLAY
+  const uintptr_t start = HOST_DISPLAY_RESERVED_BASE;
+  const uintptr_t end = start + HOST_DISPLAY_RESERVED_SIZE;
+  uintptr_t allocation_start;
+  uintptr_t allocation_end;
+
+  if (base == NULL || size == NULL || psram_allocation == NULL)
+    return false;
+  allocation_start = (uintptr_t)psram_allocation;
+  allocation_end = allocation_start + psram_size;
+  if (start < allocation_start || end < start || end > allocation_end ||
+      end > GUEST_PHYS_END ||
+      !esp_ptr_dma_ext_capable((void *)start) ||
+      !esp_ptr_dma_ext_capable((void *)(end - 1u))) {
+    *base = NULL;
+    *size = 0u;
+    return false;
+  }
+
+  *base = (void *)start;
+  *size = end - start;
+  return true;
+#else
+  if (base != NULL)
+    *base = NULL;
+  if (size != NULL)
+    *size = 0u;
+  return false;
+#endif
+}
+
+bool psram_get_host_jit_region(void **base, size_t *size) {
+#if CONFIG_RV32_NATIVE_JIT
+  const uintptr_t alignment = 128u;
+  uintptr_t allocation_start;
+  uintptr_t end = GUEST_DMA_BASE;
+  uintptr_t start = end - HOST_JIT_CODE_SIZE;
+
+  if (base == NULL || size == NULL || psram_allocation == NULL)
+    return false;
+  allocation_start = ((uintptr_t)psram_allocation + alignment - 1u) &
+                     ~(alignment - 1u);
+  if ((start & (alignment - 1u)) != 0u || start < allocation_start) {
+    *base = NULL;
+    *size = 0;
+    return false;
+  }
+  *base = (void *)start;
+  *size = HOST_JIT_CODE_SIZE;
+  return true;
+#else
+  if (base != NULL)
+    *base = NULL;
+  if (size != NULL)
+    *size = 0;
+  return false;
+#endif
+}
+
+bool psram_get_host_jit_metadata_region(void **base, size_t *size) {
+#if CONFIG_RV32_NATIVE_JIT
+  const uintptr_t alignment = 128u;
+  uintptr_t allocation_start;
+  uintptr_t end = GUEST_DMA_BASE - HOST_JIT_CODE_SIZE;
+  uintptr_t start = end - HOST_JIT_METADATA_SIZE;
+
+  if (base == NULL || size == NULL || psram_allocation == NULL)
+    return false;
+  allocation_start = ((uintptr_t)psram_allocation + alignment - 1u) &
+                     ~(alignment - 1u);
+  if ((start & (alignment - 1u)) != 0u || start < allocation_start) {
+    *base = NULL;
+    *size = 0;
+    return false;
+  }
+  *base = (void *)start;
+  *size = HOST_JIT_METADATA_SIZE;
+  return true;
+#else
+  if (base != NULL)
+    *base = NULL;
+  if (size != NULL)
+    *size = 0;
+  return false;
+#endif
+}
+
+void *psram_host_aux_alloc(size_t size, size_t alignment) {
+#if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
+  uintptr_t allocation_start;
+  uintptr_t pool_end = GUEST_DMA_BASE;
+  uintptr_t pool_start;
+  uintptr_t current;
+  uintptr_t aligned;
+
+  if (psram_allocation == NULL || size == 0u || alignment == 0u ||
+      (alignment & (alignment - 1u)) != 0u)
+    return NULL;
+#if CONFIG_RV32_NATIVE_JIT
+  if (pool_end < HOST_JIT_CODE_SIZE + HOST_JIT_METADATA_SIZE)
+    return NULL;
+  pool_end -= HOST_JIT_CODE_SIZE + HOST_JIT_METADATA_SIZE;
+#endif
+  if (pool_end < HOST_AUXILIARY_SIZE)
+    return NULL;
+  pool_start = pool_end - HOST_AUXILIARY_SIZE;
+  allocation_start = (uintptr_t)psram_allocation;
+  if (pool_start < allocation_start || psram_host_aux_used > HOST_AUXILIARY_SIZE)
+    return NULL;
+
+  current = pool_start + psram_host_aux_used;
+  if (current > UINTPTR_MAX - (alignment - 1u))
+    return NULL;
+  aligned = (current + alignment - 1u) & ~(uintptr_t)(alignment - 1u);
+  if (aligned < pool_start || aligned > pool_end || size > pool_end - aligned)
+    return NULL;
+
+  psram_host_aux_used = (size_t)(aligned - pool_start) + size;
+  return (void *)aligned;
+#else
+  (void)size;
+  (void)alignment;
+  return NULL;
+#endif
+}
 
 int HostDmaCacheSync(uint32_t guest_physical_address, size_t length,
                      enum host_dma_sync_op operation) {
@@ -694,6 +944,14 @@ int load_images(int ram_size, int *kern_len) {
     printf("ERROR: Invalid DTB size: %zu bytes\n", dtb_size);
     return -1;
   }
+#if defined(CONFIG_RV32_ST7703_DISPLAY) && CONFIG_RV32_ST7703_DISPLAY
+  if (dtb_size > HOST_DISPLAY_DTB_GAP) {
+    printf("ERROR: DTB requires %zu bytes, exceeding the %u-byte gap before "
+           "the reserved display surface\n",
+           dtb_size, (unsigned int)HOST_DISPLAY_DTB_GAP);
+    return -1;
+  }
+#endif
 
   printf("DTB size: %zu bytes\n", dtb_size);
 
@@ -728,7 +986,7 @@ int load_images(int ram_size, int *kern_len) {
     remaining -= chunk;
   }
 
-  if (!seed_linux_rng(psram_base + DTB_LOAD_OFFSET, dtb_size)) {
+  if (!prepare_linux_dtb(psram_base + DTB_LOAD_OFFSET, dtb_size)) {
     printf("ERROR: DTB has no valid 64-byte /chosen/rng-seed property\n");
     return -1;
   }

@@ -51,6 +51,20 @@
 		reg = <0x00 0x48000000 0x00 0x01e00000>;
 	};
 
+#if defined(RV32_HOST_DISPLAY_REGION_BASE)
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		display-shadow@49d02000 {
+			reg = <0x00 RV32_HOST_DISPLAY_REGION_BASE
+			       0x00 RV32_HOST_DISPLAY_REGION_SIZE>;
+			no-map;
+		};
+	};
+#endif
+
 	usb_clk: usb-clock {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -103,8 +117,8 @@
 			reg = <0x00 0x0c000000 0x00 0x00400000>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-			/* UART, USB, optional virtio-net, and virtio-console. */
-			riscv,ndev = <4>;
+			/* UART, USB, net, console, SD and optional GPU sources. */
+			riscv,ndev = <6>;
 			interrupts-extended = <&cpu_intc 9>;
 		};
 
@@ -124,9 +138,27 @@
 			interrupts = <4>;
 		};
 
+		virtio_block: virtio@12200000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x12200000 0x00 0x00000200>;
+			interrupt-parent = <&plic>;
+			interrupts = <5>;
+		};
+
+		/* When the host-side option is off this standards-compliant MMIO
+		 * transport reports virtio device ID 0, so Linux simply ignores it. */
+		virtio_gpu: virtio@12300000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x12300000 0x00 0x00000200>;
+			interrupt-parent = <&plic>;
+			interrupts = <6>;
+		};
+
 		usb@50000000 {
 			compatible = "snps,dwc2";
 			reg = <0x00 0x50000000 0x00 0x00040000>;
+			/* The P4 DWC2 DMA master bypasses the host CPU data cache. */
+			dma-noncoherent;
 			interrupt-parent = <&plic>;
 			interrupts = <2>;
 			clocks = <&usb_clk>;

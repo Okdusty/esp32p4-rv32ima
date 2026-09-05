@@ -1,24 +1,23 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 # Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
-# ESP32-P4 with 32MB flash:
+# 16 MiB flash layout (also usable on the board's 32 MiB flash):
 # 0x0000000 - 0x0002000 : Second stage bootloader
 # 0x0002000 - 0x0009000 : Partition table
 # 0x0009000 - 0x000F000 : NVS
 # 0x000F000 - 0x0010000 : PHY init
 # 0x0010000 - 0x0110000 : Application (1MB)
-# 0x0110000 - 0x1F10000 : Kernel Image (30MB)
-# 0x1F10000 - 0x1F20000 : DTB (64KB)
-# 0x1F20000 - 0x2000000 : Reserved (896KB)
+# 0x0110000 - 0x0FF0000 : Kernel Image (14.875MB)
+# 0x0FF0000 - 0x1000000 : DTB (64KB)
 
 #nvs,      data, nvs,     0x9000,    0x6000,
 #phy_init, data, phy,     0xf000,    0x1000,
 #factory,  app,  factory, 0x10000,   1M,
-#kernel,   data, 0x58,    0x110000,  30M,
+#kernel,   data, 0x58,    0x110000,  0x1E00000,
 #dtb,      data, 0x58,    0x1F10000, 0x10000,
 
 # Name,   Type, SubType, Offset,   Size,      Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 factory,  app,  factory, 0x10000,  0x100000,
-kernel,   data, 0x58,    0x110000, 0x1E00000,
-dtb,      data, 0x58,    0x1F10000, 0x10000,
+kernel,   data, 0x58,    0x110000, 0xEE0000,
+dtb,      data, 0x58,    0xFF0000, 0x10000,

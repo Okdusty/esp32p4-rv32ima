@@ -55,6 +55,16 @@ else
   echo "error: Linux fbcon tile-cursor patch is neither applicable nor already applied" >&2
   exit 1
 fi
+
+dwc2_fifo_patch="$repo_root/linux-dwc2-bounded-host-fifo.patch"
+if git -C "$linux_dir" apply --reverse --check "$dwc2_fifo_patch" >/dev/null 2>&1; then
+  :
+elif git -C "$linux_dir" apply --check "$dwc2_fifo_patch"; then
+  git -C "$linux_dir" apply "$dwc2_fifo_patch"
+else
+  echo "error: Linux DWC2 FIFO patch is neither applicable nor already applied" >&2
+  exit 1
+fi
 cp "$repo_root/guest/linux/rv32-pvfb.c" \
   "$linux_dir/drivers/video/fbdev/rv32-pvfb.c"
 
@@ -109,7 +119,69 @@ config="$linux_dir/scripts/config"
 "$config" --file "$linux_dir/.config" --enable FB_TILEBLITTING
 "$config" --file "$linux_dir/.config" --enable FRAMEBUFFER_CONSOLE_LEGACY_ACCELERATION
 
+# Build Linux's upstream virtio-gpu 2D/KMS driver into every guest Image. The
+# ESP firmware menu option decides whether a device is exposed; when disabled
+# the virtio-mmio slot reports device ID zero and this driver remains dormant.
+# Keep DRM fbdev emulation off so the existing simplefb/accelerated tty stays
+# the fallback console instead of allocating a second full-size shadow fb.
+"$config" --file "$linux_dir/.config" --enable DRM
+"$config" --file "$linux_dir/.config" --enable DRM_KMS_HELPER
+"$config" --file "$linux_dir/.config" --enable DRM_VIRTIO_GPU
+"$config" --file "$linux_dir/.config" --enable DRM_VIRTIO_GPU_KMS
+"$config" --file "$linux_dir/.config" --disable DRM_FBDEV_EMULATION
+
+# The Nano USB-A connector is wired directly to the ESP32-P4 USB 2.0 HS
+# controller. Keep the complete host path built into the Image: DWC2 owns the
+# bus, SCSI exposes inserted memory sticks, and the common removable-media
+# filesystems make the result useful without loading modules from the rootfs.
+"$config" --file "$linux_dir/.config" --enable BLOCK
+"$config" --file "$linux_dir/.config" --enable VIRTIO_BLK
+"$config" --file "$linux_dir/.config" --enable MSDOS_PARTITION
+"$config" --file "$linux_dir/.config" --enable EFI_PARTITION
+"$config" --file "$linux_dir/.config" --enable SCSI
+"$config" --file "$linux_dir/.config" --disable SCSI_PROC_FS
+"$config" --file "$linux_dir/.config" --enable BLK_DEV_SD
+"$config" --file "$linux_dir/.config" --enable USB_SUPPORT
+"$config" --file "$linux_dir/.config" --enable USB
+"$config" --file "$linux_dir/.config" --enable USB_ANNOUNCE_NEW_DEVICES
+"$config" --file "$linux_dir/.config" --enable USB_DEFAULT_PERSIST
+"$config" --file "$linux_dir/.config" --enable USB_DWC2
+"$config" --file "$linux_dir/.config" --enable USB_DWC2_HOST
+"$config" --file "$linux_dir/.config" --disable USB_DWC2_PERIPHERAL
+"$config" --file "$linux_dir/.config" --disable USB_DWC2_DUAL_ROLE
+"$config" --file "$linux_dir/.config" --disable USB_DWC2_DEBUG
+"$config" --file "$linux_dir/.config" --enable USB_STORAGE
+"$config" --file "$linux_dir/.config" --enable HID_SUPPORT
+"$config" --file "$linux_dir/.config" --enable HID
+"$config" --file "$linux_dir/.config" --enable HID_GENERIC
+"$config" --file "$linux_dir/.config" --enable USB_HID
+"$config" --file "$linux_dir/.config" --enable VFAT_FS
+"$config" --file "$linux_dir/.config" --enable EXFAT_FS
+"$config" --file "$linux_dir/.config" --enable EXT4_FS
+"$config" --file "$linux_dir/.config" --enable NLS_CODEPAGE_437
+"$config" --file "$linux_dir/.config" --enable NLS_ISO8859_1
+"$config" --file "$linux_dir/.config" --enable NLS_UTF8
+
 make -C "$linux_dir" ARCH=riscv CROSS_COMPILE="$cross_prefix" olddefconfig
+
+# scripts/config records requests even when a symbol's dependencies are not
+# met.  Fail here instead of producing an Image that silently lacks the
+# standard guest driver expected by CONFIG_RV32_VIRTIO_GPU firmware.
+for required in \
+  CONFIG_DRM=y \
+  CONFIG_DRM_VIRTIO_GPU=y \
+  CONFIG_DRM_VIRTIO_GPU_KMS=y; do
+  if ! grep -qx "$required" "$linux_dir/.config"; then
+    echo "error: Linux configuration did not retain $required" >&2
+    exit 1
+  fi
+done
+if ! grep -qx '# CONFIG_DRM_FBDEV_EMULATION is not set' \
+  "$linux_dir/.config"; then
+  echo "error: DRM fbdev emulation must remain disabled" >&2
+  exit 1
+fi
+
 make -C "$linux_dir" -j"$jobs" ARCH=riscv CROSS_COMPILE="$cross_prefix" Image
 
 image="$linux_dir/arch/riscv/boot/Image"

@@ -10,6 +10,8 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_st7703.h"
 #include "esp_ldo_regulator.h"
+#include "hal/axi_icm_ll.h"
+#include "hal/dw_gdma_ll.h"
 
 #define LCD_RESET_GPIO GPIO_NUM_27
 #define LCD_BACKLIGHT_GPIO GPIO_NUM_26
@@ -161,6 +163,13 @@ esp_err_t display_backend_init(display_backend_vsync_callback_t vsync_callback,
   err = esp_lcd_new_panel_st7703(panel_io, &panel_config, &panel);
   if (err != ESP_OK)
     return err;
+
+  /* The DPI engine continuously reads its RGB565 scanout from PSRAM through
+   * DW-GDMA memory master 1. Give those reads real-time precedence over
+   * bursty CPU, USB and SDIO traffic. ESP-IDF cannot recover a DSI underrun
+   * after the panel has already consumed an incomplete line. */
+  axi_icm_ll_set_dw_gdma_qos_arbiter_prio(
+      DW_GDMA_LL_MASTER_PORT_MEMORY, 0, CONFIG_RV32_ST7703_DSI_DMA_QOS);
   err = esp_lcd_panel_reset(panel);
   if (err != ESP_OK)
     return err;
@@ -191,6 +200,7 @@ esp_err_t display_backend_init(display_backend_vsync_callback_t vsync_callback,
       .format = DISPLAY_BACKEND_FORMAT_RGB565,
       .refresh_hz = CONFIG_RV32_ST7703_REFRESH_HZ,
       .name = "Waveshare ST7703 MIPI-DSI",
+      .framebuffer_is_live_scanout = true,
   };
   return ESP_OK;
 }

@@ -5,3 +5,4 @@ entries:
     cache (noflash)
     dwc2_passthrough (noflash)
     port-esp (noflash)
+    rv32_native_jit (noflash)

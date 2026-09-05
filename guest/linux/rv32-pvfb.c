@@ -16,13 +16,16 @@
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 #define RV32PV_MAGIC                  0x31424650u /* "PFB1" */
-#define RV32PV_VERSION                4u
+#define RV32PV_VERSION                5u
 #define RV32PV_SUBMIT                 0x54494d53u /* "SMIT" */
 #define RV32PV_SHARED_COMMAND_MAGIC   0x34444d43u /* "CMD4" */
 #define RV32PV_SHARED_RESULT_MAGIC    0x35444d43u /* "CMD5" */
@@ -39,6 +42,7 @@
 #define RV32PV_FEATURE_SHARED_RESULT  BIT(9)
 #define RV32PV_FEATURE_TILE_BATCH     BIT(10)
 #define RV32PV_FEATURE_TEXT_RUN16     BIT(11)
+#define RV32PV_FEATURE_BULK_WRITE     BIT(12)
 
 #define RV32PV_FORMAT_RGB565          1u
 
@@ -51,6 +55,7 @@
 #define RV32PV_OP_TILE_CURSOR         7u
 #define RV32PV_OP_TILE_BATCH          8u
 #define RV32PV_OP_TEXT_RUN16          9u
+#define RV32PV_OP_BULK_WRITE          10u
 
 #define RV32PV_ROP_COPY               0u
 #define RV32PV_ROP_XOR                1u
@@ -86,6 +91,7 @@
 #define RV32PV_COMMAND_TIMEOUT_NS      (100ull * NSEC_PER_MSEC)
 #define RV32PV_LEGACY_PAYLOAD_LIMIT    2048u
 #define RV32PV_BATCH_CAPACITY_MAX      (16u * 1024u)
+#define RV32PV_WRITE_FLUSH_MS           16u
 
 struct rv32pvfb_par {
 	u32 palette[16];
@@ -103,10 +109,18 @@ struct rv32pvfb_par {
 	u32 tile_width;
 	u32 tile_height;
 	u8 *batch;
+	u8 *write_buffer;
 	u32 batch_capacity;
+	u32 write_capacity;
+	u32 write_offset;
+	u32 write_length;
 	u32 batch_length;
 	u32 batch_records;
 	bool batch_active;
+	bool write_stopping;
+	struct fb_info *info;
+	struct mutex write_lock;
+	struct delayed_work write_flush_work;
 	unsigned long command_busy;
 };
 
@@ -329,6 +343,71 @@ static bool rv32pvfb_submit(struct fb_info *info, u32 operation,
 	return success;
 }
 
+static bool rv32pvfb_flush_write_locked(struct fb_info *info,
+					bool software_fallback)
+{
+	struct rv32pvfb_par *par = info->par;
+	u32 arguments[8] = { par->write_offset, par->write_length };
+
+	if (!par->write_length)
+		return true;
+	if (rv32pvfb_submit(info, RV32PV_OP_BULK_WRITE, arguments,
+			    par->write_buffer, par->write_length)) {
+		par->write_length = 0;
+		return true;
+	}
+	if (!software_fallback)
+		return false;
+
+	/* Preserve ordering and pixels if a concurrent emergency-console command
+	 * temporarily owns the mailbox. This slow path is exceptional; normal
+	 * writes use one shared-memory command per full payload block.
+	 */
+	memcpy_toio((u8 __iomem *)info->screen_base + par->write_offset,
+		    par->write_buffer, par->write_length);
+	par->write_length = 0;
+	return true;
+}
+
+static void rv32pvfb_write_flush_work(struct work_struct *work)
+{
+	struct rv32pvfb_par *par = container_of(to_delayed_work(work),
+						struct rv32pvfb_par,
+						write_flush_work);
+	bool retry;
+
+	mutex_lock(&par->write_lock);
+	retry = !par->write_stopping && par->write_length &&
+		!rv32pvfb_flush_write_locked(par->info, false);
+	mutex_unlock(&par->write_lock);
+
+	if (retry)
+		mod_delayed_work(system_wq, &par->write_flush_work,
+				 msecs_to_jiffies(RV32PV_WRITE_FLUSH_MS));
+}
+
+static bool rv32pvfb_flush_write(struct fb_info *info,
+				 bool software_fallback)
+{
+	struct rv32pvfb_par *par = info->par;
+	bool success;
+
+	/* Keep the overwhelmingly common mmap/fbcon path free of workqueue and
+	 * mutex traffic when no streamed write is waiting to be published.
+	 */
+	if (!READ_ONCE(par->write_length))
+		return true;
+	/* The mutex makes a running worker harmless: either it drains first or it
+	 * observes an empty buffer after this caller drains.  A non-synchronous
+	 * cancellation avoids waiting for an unrelated system-workqueue dispatch
+	 * on every ordering boundary. */
+	cancel_delayed_work(&par->write_flush_work);
+	mutex_lock(&par->write_lock);
+	success = rv32pvfb_flush_write_locked(info, software_fallback);
+	mutex_unlock(&par->write_lock);
+	return success;
+}
+
 static bool rv32pvfb_flush_batch(struct fb_info *info)
 {
 	struct rv32pvfb_par *par = info->par;
@@ -424,6 +503,8 @@ static bool rv32pvfb_submit_tile(struct fb_info *info, u32 operation,
 {
 	struct rv32pvfb_par *par = info->par;
 
+	if (!rv32pvfb_flush_write(info, true))
+		return false;
 	if (par->batch_active &&
 	    rv32pvfb_append_batch(info, operation, arguments, payload,
 				   payload_length))
@@ -442,6 +523,7 @@ static void rv32pvfb_fillrect(struct fb_info *info,
 		rect->rop == ROP_XOR ? RV32PV_ROP_XOR : RV32PV_ROP_COPY,
 	};
 
+	(void)rv32pvfb_flush_write(info, true);
 	(void)rv32pvfb_flush_batch(info);
 	if (!(par->features & RV32PV_FEATURE_FILL) ||
 	    !rv32pvfb_submit(info, RV32PV_OP_FILL, arguments, NULL, 0))
@@ -457,6 +539,7 @@ static void rv32pvfb_copyarea(struct fb_info *info,
 		area->width, area->height,
 	};
 
+	(void)rv32pvfb_flush_write(info, true);
 	(void)rv32pvfb_flush_batch(info);
 	if (!(par->features & RV32PV_FEATURE_COPY) ||
 	    !rv32pvfb_submit(info, RV32PV_OP_COPY, arguments, NULL, 0))
@@ -471,6 +554,7 @@ static void rv32pvfb_imageblit(struct fb_info *info,
 	size_t data_length;
 	u32 arguments[8];
 
+	(void)rv32pvfb_flush_write(info, true);
 	(void)rv32pvfb_flush_batch(info);
 	if (!(par->features & RV32PV_FEATURE_IMAGE1) || image->depth != 1)
 		goto software;
@@ -506,6 +590,8 @@ static int rv32pvfb_sync(struct fb_info *info)
 	unsigned int iteration = 0;
 	int ret;
 
+	if (!rv32pvfb_flush_write(info, true))
+		return -EIO;
 	if (!rv32pvfb_flush_batch(info))
 		return -EIO;
 
@@ -534,6 +620,93 @@ static int rv32pvfb_sync(struct fb_info *info)
 	return -ETIMEDOUT;
 }
 
+static ssize_t rv32pvfb_write(struct fb_info *info, const char __user *buf,
+			      size_t count, loff_t *ppos)
+{
+	struct rv32pvfb_par *par = info->par;
+	unsigned long position = *ppos;
+	unsigned long total_size = info->screen_size;
+	size_t remaining = count;
+	ssize_t written = 0;
+	int error = 0;
+
+	if (!(par->features & RV32PV_FEATURE_BULK_WRITE) ||
+	    !par->write_buffer || !par->write_capacity)
+		return fb_io_write(info, buf, count, ppos);
+	if (!total_size)
+		total_size = (unsigned long)info->fix.line_length *
+			     info->var.yres;
+	if (position > total_size)
+		return -EFBIG;
+	if (remaining > total_size) {
+		error = -EFBIG;
+		remaining = total_size;
+	}
+	if (remaining > total_size - position) {
+		if (!error)
+			error = -ENOSPC;
+		remaining = total_size - position;
+	}
+	if (!remaining)
+		return error;
+	if (!rv32pvfb_flush_batch(info))
+		return -EIO;
+
+	mutex_lock(&par->write_lock);
+	while (remaining) {
+		size_t capacity;
+		size_t chunk;
+		size_t trailing;
+		size_t copied;
+
+		if (par->write_length &&
+		    (position != (unsigned long)par->write_offset +
+				 par->write_length ||
+		     par->write_length == par->write_capacity) &&
+		    !rv32pvfb_flush_write_locked(info, true)) {
+			error = -EIO;
+			break;
+		}
+		if (!par->write_length)
+			par->write_offset = position;
+		capacity = par->write_capacity - par->write_length;
+		chunk = min_t(size_t, remaining, capacity);
+		trailing = copy_from_user(par->write_buffer + par->write_length,
+					  buf, chunk);
+		copied = chunk - trailing;
+
+		if (!copied) {
+			error = -EFAULT;
+			break;
+		}
+		par->write_length += copied;
+		position += copied;
+		*ppos += copied;
+		buf += copied;
+		remaining -= copied;
+		written += copied;
+		/* Sequential row-sized writes share a payload block. Acceptance
+		 * transfers a full block into host-owned storage, so it can then be
+		 * reused immediately without waiting for a physical VSYNC.
+		 */
+		if (par->write_length == par->write_capacity &&
+		    !rv32pvfb_flush_write_locked(info, true)) {
+			error = -EIO;
+			break;
+		}
+		if (trailing) {
+			error = -EFAULT;
+			break;
+		}
+	}
+	if (par->write_length && !par->write_stopping)
+		mod_delayed_work(system_wq, &par->write_flush_work,
+				 msecs_to_jiffies(RV32PV_WRITE_FLUSH_MS));
+	mutex_unlock(&par->write_lock);
+
+	return written ? written : error;
+}
+
 #ifdef CONFIG_FB_TILEBLITTING
 static void rv32pvfb_settile(struct fb_info *info, struct fb_tilemap *map)
 {
@@ -545,6 +718,8 @@ static void rv32pvfb_settile(struct fb_info *info, struct fb_tilemap *map)
 
 	if (!(par->features & RV32PV_FEATURE_TILE) || map->depth != 1 ||
 	    !map->width || !map->height || !map->length)
+		return;
+	if (!rv32pvfb_flush_write(info, true))
 		return;
 	if (!rv32pvfb_flush_batch(info))
 		return;
@@ -665,6 +840,8 @@ static void rv32pvfb_tilecursor(struct fb_info *info,
 		rv32pvfb_color(info, cursor->bg),
 	};
 
+	if (!rv32pvfb_flush_write(info, true))
+		return;
 	if (!cursor->mode) {
 		/* fbcon hides its cursor immediately before modifying the screen.
 		 * Keep that visual transition immediate, then collect the drawing
@@ -716,11 +893,31 @@ static struct fb_tile_ops rv32pvfb_text_tile_ops = {
 };
 #endif
 
+static int rv32pvfb_release(struct fb_info *info, int user)
+{
+	(void)user;
+	return rv32pvfb_flush_write(info, true) ? 0 : -EIO;
+}
+
+static int rv32pvfb_mmap(struct fb_info *info, struct vm_area_struct *vma)
+{
+	if (!rv32pvfb_flush_write(info, true))
+		return -EIO;
+	return fb_io_mmap(info, vma);
+}
+
 static void rv32pvfb_destroy(struct fb_info *info)
 {
 	struct rv32pvfb_par *par = info->par;
 	struct resource *mem = par->mem;
 
+	mutex_lock(&par->write_lock);
+	par->write_stopping = true;
+	mutex_unlock(&par->write_lock);
+	cancel_delayed_work_sync(&par->write_flush_work);
+	mutex_lock(&par->write_lock);
+	(void)rv32pvfb_flush_write_locked(info, true);
+	mutex_unlock(&par->write_lock);
 	if (info->screen_base)
 		iounmap(info->screen_base);
 	framebuffer_release(info);
@@ -730,8 +927,10 @@ static void rv32pvfb_destroy(struct fb_info *info)
 
 static const struct fb_ops rv32pvfb_ops = {
 	.owner = THIS_MODULE,
-	__FB_DEFAULT_IOMEM_OPS_RDWR,
-	__FB_DEFAULT_IOMEM_OPS_MMAP,
+	.fb_release = rv32pvfb_release,
+	.fb_read = fb_io_read,
+	.fb_write = rv32pvfb_write,
+	.fb_mmap = rv32pvfb_mmap,
 	.fb_destroy = rv32pvfb_destroy,
 	.fb_setcolreg = rv32pvfb_setcolreg,
 	.fb_fillrect = rv32pvfb_fillrect,
@@ -794,6 +993,9 @@ static int rv32pvfb_probe(struct platform_device *pdev)
 	}
 	platform_set_drvdata(pdev, info);
 	par = info->par;
+	par->info = info;
+	mutex_init(&par->write_lock);
+	INIT_DELAYED_WORK(&par->write_flush_work, rv32pvfb_write_flush_work);
 	info->screen_base = ioremap_wc(mem->start, aperture_size);
 	if (!info->screen_base) {
 		ret = -ENOMEM;
@@ -804,6 +1006,7 @@ static int rv32pvfb_probe(struct platform_device *pdev)
 	info->fix.smem_start = mem->start;
 	info->fix.smem_len = aperture_size;
 	info->fix.line_length = stride;
+	info->screen_size = (unsigned long)stride * height;
 	info->var = rv32pvfb_var;
 	info->var.xres = width;
 	info->var.yres = height;
@@ -842,7 +1045,8 @@ static int rv32pvfb_probe(struct platform_device *pdev)
 				par->features &= ~(RV32PV_FEATURE_PAYLOAD_POOL |
 						   RV32PV_FEATURE_IMAGE1 |
 						   RV32PV_FEATURE_TILE |
-						   RV32PV_FEATURE_TEXT_RUN16);
+						   RV32PV_FEATURE_TEXT_RUN16 |
+						   RV32PV_FEATURE_BULK_WRITE);
 			} else {
 				par->payload_limit = limit;
 			}
@@ -859,7 +1063,25 @@ static int rv32pvfb_probe(struct platform_device *pdev)
 					   RV32PV_FEATURE_COPY |
 					   RV32PV_FEATURE_IMAGE1 |
 					   RV32PV_FEATURE_TILE |
-					   RV32PV_FEATURE_TEXT_RUN16);
+					   RV32PV_FEATURE_TEXT_RUN16 |
+					   RV32PV_FEATURE_BULK_WRITE);
+		}
+		if ((par->features & (RV32PV_FEATURE_BULK_WRITE |
+				      RV32PV_FEATURE_SHARED_COMMAND |
+				      RV32PV_FEATURE_ASYNC_FIFO |
+				      RV32PV_FEATURE_PAYLOAD_POOL)) ==
+		    (RV32PV_FEATURE_BULK_WRITE |
+		     RV32PV_FEATURE_SHARED_COMMAND |
+		     RV32PV_FEATURE_ASYNC_FIFO |
+		     RV32PV_FEATURE_PAYLOAD_POOL)) {
+			par->write_capacity = par->payload_limit;
+			par->write_buffer = devm_kmalloc(&pdev->dev,
+						  par->write_capacity,
+						  GFP_KERNEL);
+		}
+		if (!par->write_buffer) {
+			par->features &= ~RV32PV_FEATURE_BULK_WRITE;
+			par->write_capacity = 0;
 		}
 		if ((par->features & (RV32PV_FEATURE_TILE |
 				      RV32PV_FEATURE_TILE_BATCH)) ==

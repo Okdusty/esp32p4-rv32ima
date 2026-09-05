@@ -83,13 +83,16 @@
 #define VIRTIO_NET_QUEUE_MAX     64u
 #define VIRTIO_NET_HEADER_SIZE   12u
 #define ETHERNET_FRAME_MAX       1600u
-#define RX_SOFTWARE_QUEUE_DEPTH  16u
-#define VIRTIO_COMPLETION_BATCH_MAX 4u
+#define RX_SOFTWARE_QUEUE_DEPTH  32u
+#define VIRTIO_COMPLETION_BATCH_MAX 16u
+#define BRIDGE_SERVICE_BURST_MAX 16u
 #define C6_RETRY_DELAY_MS        5000u
 #define WIFI_RETRY_DELAY_MS      2000u
-/* Preempt Hosted delivery as soon as one Ethernet frame is ready.  The SDIO
- * receive pipeline climbs from priorities 20 through 22; display stays at 19. */
-#define BRIDGE_TASK_PRIORITY     23u
+/* ESP-Hosted owns priorities 20 through 23.  Keep the bridge at the bottom of
+ * that pipeline so its SDIO writer/delivery tasks can always drain work that
+ * we submit.  Bounded bursts prevent a permanently busy virtqueue from
+ * monopolizing this priority alongside Hosted's RX reader. */
+#define BRIDGE_TASK_PRIORITY     20u
 
 struct virtq_desc {
 	uint64_t address;
@@ -156,6 +159,17 @@ static uint32_t rx_drop_count;
 static uint32_t tx_frame_count;
 static uint32_t tx_error_count;
 static bool packet_path_reported;
+static struct virtio_net_bridge_perf_stats perf_stats;
+
+#if CONFIG_RV32_EMULATOR_PERF_STATS
+#define NET_PERF_INC(field) \
+	__atomic_add_fetch(&perf_stats.field, 1u, __ATOMIC_RELAXED)
+#define NET_PERF_ADD(field, value) \
+	__atomic_add_fetch(&perf_stats.field, (uint32_t)(value), __ATOMIC_RELAXED)
+#else
+#define NET_PERF_INC(field) do { } while (0)
+#define NET_PERF_ADD(field, value) do { (void)(value); } while (0)
+#endif
 
 static QueueHandle_t rx_ready_queue;
 static StaticQueue_t rx_ready_queue_control;
@@ -320,8 +334,11 @@ static void completion_batch_publish(struct virtio_completion_batch *batch)
 	}
 
 	if (interrupt_guest)
+	{
 		__atomic_fetch_or(&interrupt_status, VIRTIO_MMIO_INT_VRING,
 				  __ATOMIC_RELEASE);
+		NET_PERF_INC(guest_interrupts);
+	}
 }
 
 static bool completion_batch_full(const struct virtio_completion_batch *batch)
@@ -500,14 +517,20 @@ static bool process_one_tx(struct virtio_completion_batch *batch)
 	if (packet_valid &&
 	    __atomic_load_n(&station_connected, __ATOMIC_ACQUIRE)) {
 		if (esp_wifi_internal_tx(WIFI_IF_STA, packet, packet_length) ==
-		    ESP_OK)
+		    ESP_OK) {
 			__atomic_add_fetch(&tx_frame_count, 1u, __ATOMIC_RELAXED);
-		else
+			NET_PERF_INC(tx_frames);
+			NET_PERF_ADD(tx_bytes, packet_length);
+		} else {
 			__atomic_add_fetch(&tx_error_count, 1u, __ATOMIC_RELAXED);
+			NET_PERF_INC(tx_errors);
+		}
 	} else if (!packet_valid) {
 		__atomic_add_fetch(&tx_error_count, 1u, __ATOMIC_RELAXED);
+		NET_PERF_INC(tx_errors);
 	}
 	completion_batch_add(batch, VIRTIO_NET_TX_QUEUE, &queue, head, 0);
+	NET_PERF_INC(tx_completions);
 	return true;
 }
 
@@ -525,6 +548,7 @@ static bool process_one_rx(const struct rx_packet *packet,
 		used_length = 0;
 	completion_batch_add(batch, VIRTIO_NET_RX_QUEUE, &queue, head,
 			     used_length);
+	NET_PERF_INC(rx_completions);
 	return true;
 }
 
@@ -664,11 +688,14 @@ static esp_err_t wifi_receive(void *buffer, uint16_t length,
 		result = ESP_ERR_INVALID_SIZE;
 	} else if (xQueueSend(rx_ready_queue, &packet, 0) != pdTRUE) {
 		__atomic_add_fetch(&rx_drop_count, 1u, __ATOMIC_RELAXED);
+		NET_PERF_INC(rx_drops);
 		result = ESP_ERR_NO_MEM;
 	} else {
 		/* Ownership of ESP-Hosted's packet allocation remains with the
 		 * bridge until it has copied directly into Linux's virtqueue. */
 		__atomic_add_fetch(&rx_frame_count, 1u, __ATOMIC_RELAXED);
+		NET_PERF_INC(rx_frames);
+		NET_PERF_ADD(rx_bytes, length);
 		if (bridge_task_handle)
 			xTaskNotifyGive(bridge_task_handle);
 		return ESP_OK;
@@ -798,6 +825,7 @@ static void bridge_task(void *argument)
 		/* Packet RX, guest queue kicks and link events notify this task
 		 * directly.  Only a delayed association retry uses a tick timeout. */
 		ulTaskNotifyTake(pdTRUE, wait_ticks);
+		NET_PERF_INC(service_wakes);
 		process_hosted_event();
 		process_wifi_event();
 
@@ -825,23 +853,31 @@ static void bridge_task(void *argument)
 		      VIRTIO_STATUS_DRIVER_OK))
 			continue;
 
+		bool service_again = false;
+		uint32_t tx_budget = BRIDGE_SERVICE_BURST_MAX;
 		do {
 			struct virtio_completion_batch tx_batch = { 0 };
 
-			while (process_one_tx(&tx_batch)) {
+			while (tx_budget != 0u && process_one_tx(&tx_batch)) {
+				tx_budget--;
 				if (completion_batch_full(&tx_batch)) {
 					completion_batch_publish(&tx_batch);
 					memset(&tx_batch, 0, sizeof(tx_batch));
 				}
 			}
 			completion_batch_publish(&tx_batch);
+			if (tx_budget == 0u) {
+				service_again = true;
+				break;
+			}
 		} while (queue_rearm_and_has_available(VIRTIO_NET_TX_QUEUE));
 
 		bool rx_buffers_added;
+		uint32_t rx_budget = BRIDGE_SERVICE_BURST_MAX;
 		do {
 			struct virtio_completion_batch rx_batch = { 0 };
 
-			for (;;) {
+			while (rx_budget != 0u) {
 				if (!pending_rx_valid) {
 					if (xQueueReceive(rx_ready_queue, &pending_rx,
 							  0) != pdTRUE)
@@ -853,15 +889,29 @@ static void bridge_task(void *argument)
 				esp_wifi_internal_free_rx_buffer(
 					pending_rx.buffer_to_free);
 				pending_rx_valid = false;
+				rx_budget--;
 				if (completion_batch_full(&rx_batch)) {
 					completion_batch_publish(&rx_batch);
 					memset(&rx_batch, 0, sizeof(rx_batch));
 				}
 			}
 			completion_batch_publish(&rx_batch);
+			if (rx_budget == 0u) {
+				service_again = true;
+				break;
+			}
 			rx_buffers_added = queue_rearm_and_has_available(
 				VIRTIO_NET_RX_QUEUE);
 		} while (pending_rx_valid && rx_buffers_added);
+
+		/* Retain our own notification when a burst hits its limit.  Yielding
+		 * here lets Hosted's equal/higher-priority SDIO stages make progress;
+		 * the next pass resumes immediately without waiting for a tick. */
+		if (service_again) {
+			NET_PERF_INC(budget_reschedules);
+			xTaskNotifyGive(bridge_task_handle);
+			taskYIELD();
+		}
 
 		if (!packet_path_reported &&
 		    (__atomic_load_n(&rx_frame_count, __ATOMIC_RELAXED) != 0u ||
@@ -1057,4 +1107,26 @@ void virtio_net_bridge_store(uint32_t address, uint32_t value, size_t width)
 bool virtio_net_bridge_irq_pending(void)
 {
 	return __atomic_load_n(&interrupt_status, __ATOMIC_ACQUIRE) != 0;
+}
+
+void virtio_net_bridge_perf_snapshot(
+	struct virtio_net_bridge_perf_stats *stats)
+{
+	if (stats == NULL)
+		return;
+
+#define NET_PERF_LOAD(field) \
+	stats->field = __atomic_load_n(&perf_stats.field, __ATOMIC_RELAXED)
+	NET_PERF_LOAD(rx_frames);
+	NET_PERF_LOAD(rx_bytes);
+	NET_PERF_LOAD(rx_drops);
+	NET_PERF_LOAD(tx_frames);
+	NET_PERF_LOAD(tx_bytes);
+	NET_PERF_LOAD(tx_errors);
+	NET_PERF_LOAD(rx_completions);
+	NET_PERF_LOAD(tx_completions);
+	NET_PERF_LOAD(guest_interrupts);
+	NET_PERF_LOAD(service_wakes);
+	NET_PERF_LOAD(budget_reschedules);
+#undef NET_PERF_LOAD
 }
