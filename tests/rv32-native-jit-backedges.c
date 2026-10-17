@@ -37,7 +37,7 @@ static int backedge_check(uint32_t pc, uint32_t prefix, uint32_t condition,
 	uint32_t expected[32];
 	uint32_t executed = prefix;
 	uint32_t next_pc;
-	struct rv32_native_jit_runtime *runtime = &jit_runtime;
+	struct rv32_native_jit_runtime *runtime = jit_rt;
 
 	for (uint32_t i = 0u; i < 32u; i++)
 		regs[i] = expected[i] = 0x12340000u + i;

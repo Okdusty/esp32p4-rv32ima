@@ -30,6 +30,10 @@
 #include "esp_hosted_cli.h"
 #include "rpc_wrap.h"
 #include "esp_private/wifi.h"
+#if CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM
+#include "esp_heap_caps.h"
+#include "esp_private/esp_cache_private.h"
+#endif
 
 /**
  * @brief  Slave capabilities are parsed
@@ -283,12 +287,24 @@ static hosted_mempool_t * mempool_common = NULL;
 static hosted_mempool_t * transport_drv_common_mempool_create(void)
 {
 	if (!mempool_common) {
+		size_t alignment = HOSTED_MEM_ALIGNMENT_64;
+#if CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM
+		size_t cache_alignment = 0;
+		if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &cache_alignment) == ESP_OK &&
+		    cache_alignment > alignment)
+			alignment = cache_alignment;
+#endif
+		/* The base AND every block must meet DMA cache alignment. 1600-byte
+		 * blocks alternate between 0 and 64 modulo a 128-byte P4 cache line,
+		 * even when the pool's first address is correctly aligned. */
+		size_t block_size = (ESP_TRANSPORT_MAX_BUF_SIZE + alignment - 1u) &
+			~(alignment - 1u);
 		hosted_mempool_config_t config = {
 			.pre_allocated_mem = NULL,
 			.pre_allocated_mem_size = 0,
 			.num_blocks = H_TRANSPORT_QUEUE_SIZE + MEMPOOL_PADDING,
-			.block_size = ESP_TRANSPORT_MAX_BUF_SIZE,
-			.alignment_in_bytes = HOSTED_MEM_ALIGNMENT_64,
+			.block_size = block_size,
+			.alignment_in_bytes = alignment,
 			.malloc = transport_util_malloc,
 			.calloc = transport_util_calloc,
 			.memset = g_h.funcs->_h_memset,

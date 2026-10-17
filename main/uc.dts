@@ -21,9 +21,9 @@
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 		];
 #if RV32_DISPLAY_ENABLED
-		bootargs = "console=tty0 console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
+		bootargs = "console=tty0 console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3 usbhid.kbpoll=16 usbhid.mousepoll=16";
 #else
-		bootargs = "console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3";
+		bootargs = "console=ttyS0,921600 earlycon=uart8250,mmio,0x10000000,16550a quiet loglevel=3 usbhid.kbpoll=16 usbhid.mousepoll=16";
 #endif
 		stdout-path = "serial0:921600n8";
 
@@ -117,8 +117,8 @@
 			reg = <0x00 0x0c000000 0x00 0x00400000>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-			/* UART, USB, net, console, SD and optional GPU sources. */
-			riscv,ndev = <6>;
+			/* UART, USB, net, console, SD, GPU and read-only flash. */
+			riscv,ndev = <7>;
 			interrupts-extended = <&cpu_intc 9>;
 		};
 
@@ -143,6 +143,15 @@
 			reg = <0x00 0x12200000 0x00 0x00000200>;
 			interrupt-parent = <&plic>;
 			interrupts = <5>;
+		};
+
+		/* Read-only disk served from the "rofs" flash partition. Without an
+		 * image the slot reports device ID 0 and Linux ignores it. */
+		virtio_rofs: virtio@12400000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x12400000 0x00 0x00000200>;
+			interrupt-parent = <&plic>;
+			interrupts = <7>;
 		};
 
 		/* When the host-side option is off this standards-compliant MMIO

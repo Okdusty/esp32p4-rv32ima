@@ -1,6 +1,6 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 # Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
-# 16 MiB flash layout (also usable on the board's 32 MiB flash):
+# 32 MiB flash layout:
 # 0x0000000 - 0x0002000 : Second stage bootloader
 # 0x0002000 - 0x0009000 : Partition table
 # 0x0009000 - 0x000F000 : NVS
@@ -8,6 +8,7 @@
 # 0x0010000 - 0x0110000 : Application (1MB)
 # 0x0110000 - 0x0FF0000 : Kernel Image (14.875MB)
 # 0x0FF0000 - 0x1000000 : DTB (64KB)
+# 0x1000000 - 0x2000000 : Read-only guest filesystem, e.g. desktop (16MB)
 
 #nvs,      data, nvs,     0x9000,    0x6000,
 #phy_init, data, phy,     0xf000,    0x1000,
@@ -21,3 +22,4 @@ phy_init, data, phy,     0xf000,   0x1000,
 factory,  app,  factory, 0x10000,  0x100000,
 kernel,   data, 0x58,    0x110000, 0xEE0000,
 dtb,      data, 0x58,    0xFF0000, 0x10000,
+rofs,     data, 0x59,    0x1000000, 0x1000000,

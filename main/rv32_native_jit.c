@@ -1,4 +1,5 @@
 #include "rv32_native_jit.h"
+#include "rv32_memory_placement.h"
 
 #include <limits.h>
 #include <stddef.h>
@@ -10,6 +11,18 @@
 #include "esp_heap_caps.h"
 #ifdef ESP_PLATFORM
 #include "psram.h"
+#include "esp_cpu.h"
+#endif
+
+#if CONFIG_RV32_HOST_PERF_STATS
+static inline uint32_t jit_profile_cycle_count(void)
+{
+#ifdef ESP_PLATFORM
+	return esp_cpu_get_cycle_count();
+#else
+	return 0u;
+#endif
+}
 #endif
 
 /* Generated regions occupy complete 128-byte cache lines in a bounded ring
@@ -33,15 +46,16 @@
 #define JIT_MAX_INTERNAL_BRANCH_PATCHES JIT_MAX_GUEST_INSTRUCTIONS
 #define JIT_MAX_TRACE_CALL_DEPTH 8u
 #define JIT_EXEC_PAGE_ENTRIES 64u
+#define JIT_EXEC_HISTORY_BITS 4096u
 #define JIT_CODE_WORDS 512u
 #define JIT_CODE_BYTES (JIT_CODE_WORDS * 4u)
 #define JIT_CODE_ALIGNMENT 128u
 #define JIT_CODE_ARENA_MIN_BYTES (64u * 1024u)
 #define JIT_INTERNAL_CODE_ARENA_MAX_BYTES (128u * 1024u)
 #define JIT_CODE_ARENA_MAX_BYTES (2048u * 1024u)
-#define JIT_INTERNAL_RESERVE_BYTES (64u * 1024u)
+#define JIT_INTERNAL_RESERVE_BYTES (32u * 1024u)
 #define JIT_HOT_CODE_ARENA_MIN_BYTES (16u * 1024u)
-#define JIT_HOT_CODE_ARENA_MAX_BYTES (64u * 1024u)
+#define JIT_HOT_CODE_ARENA_MAX_BYTES (96u * 1024u)
 #define JIT_HOT_CODE_ARENA_STEP_BYTES (16u * 1024u)
 #define JIT_CODE_UNIT_WORDS (JIT_CODE_ALIGNMENT / sizeof(uint32_t))
 #define JIT_LOOP_HOT_THRESHOLD 16u
@@ -51,10 +65,10 @@
  * The two-stage policy avoids the medium-hot ring ping-pong seen with globally
  * lower thresholds while making short-lived render/copy loops benefit from an
  * otherwise idle tier. */
-#define JIT_HOT_LOOP_ADMIT_CALLS 2048u
-#define JIT_HOT_GENERAL_ADMIT_CALLS 8192u
-#define JIT_HOT_LOOP_REPLACE_CALLS 8192u
-#define JIT_HOT_GENERAL_REPLACE_CALLS 32768u
+#define JIT_HOT_LOOP_ADMIT_CALLS 256u
+#define JIT_HOT_GENERAL_ADMIT_CALLS 512u
+#define JIT_HOT_LOOP_REPLACE_CALLS 1024u
+#define JIT_HOT_GENERAL_REPLACE_CALLS 2048u
 #define JIT_HOT_LOCATION_UNIT_BITS 10u
 #define JIT_HOT_LOCATION_UNIT_MASK \
 	((1u << JIT_HOT_LOCATION_UNIT_BITS) - 1u)
@@ -67,6 +81,37 @@
 #define JIT_NATIVE_CHAIN_ENTRY_BYTES (4u * sizeof(uint32_t))
 #define JIT_MIN_GUEST_INSTRUCTIONS 3u
 #define JIT_SELF_TEST_LOOP_ITERATIONS 32u
+/* Guest instructions a native loop may run before the chain checks for a
+ * pending host interrupt; one C round trip per this many instructions. */
+#define JIT_LOOP_WAKE_BUDGET 8192u
+/* Start offsets known not to compile: an unsupported first instruction or
+ * fewer than JIT_MIN_GUEST_INSTRUCTIONS collectable ones.  Both depend only
+ * on the code bytes, so entries live until the next code flush. */
+#define JIT_NEGATIVE_CACHE_ENTRIES 512u
+/* memory_site.store value for an inline word atomic. */
+#define JIT_SITE_AMO 2u
+
+#ifdef ESP_PLATFORM
+#include "rv32_host_wake.h"
+#define JIT_HOST_WAKE_PENDING() (rv32_host_wake != 0u)
+#define JIT_HOST_WAKE_WORD (&rv32_host_wake)
+#else
+#define JIT_HOST_WAKE_PENDING() 0
+static const uint32_t jit_no_host_wake;
+#define JIT_HOST_WAKE_WORD (&jit_no_host_wake)
+#endif
+
+/* MiniRV32NativeMemoryContext layout: TLB generation in bits 0..7,
+ * privilege in bits 8..9, SUM in bit 10 and MXR in bit 11. */
+#define JIT_CONTEXT_EPOCH_MASK 0xffu
+#define JIT_CONTEXT_PRIVILEGE_SHIFT 8u
+#define JIT_CONTEXT_SUM (1u << 10)
+/* Machine mode always stays in the interpreter. */
+#if CONFIG_RV32_NATIVE_JIT_SUPERVISOR
+#define JIT_MAX_PRIVILEGE 1u
+#else
+#define JIT_MAX_PRIVILEGE 0u
+#endif
 
 /* Generated transition counters are diagnostic only.  Standalone tests keep
  * them by default so they can prove whether a native tail link was taken;
@@ -119,6 +164,9 @@ enum jit_instruction_kind {
 	JIT_INSN_BRANCH,
 	JIT_INSN_JAL,
 	JIT_INSN_JALR,
+	JIT_INSN_AMO,
+	JIT_INSN_CSR,
+	JIT_INSN_NOP,
 };
 
 typedef uint32_t (*jit_block_fn)(struct rv32_native_jit_runtime *runtime);
@@ -127,6 +175,7 @@ typedef uint32_t (*jit_block_fn)(struct rv32_native_jit_runtime *runtime);
  * native chain.  Native successors tail-jump without crossing this boundary. */
 extern uint32_t rv32_native_jit_enter(
 	jit_block_fn block, struct rv32_native_jit_runtime *runtime);
+extern void rv32_native_jit_refill_trampoline(void);
 
 struct jit_cache_entry {
 	uint32_t physical_offset;
@@ -162,6 +211,54 @@ struct jit_hot_entry {
 	uint16_t location;
 	uint16_t calls;
 };
+
+/* Read by rv32_native_jit_dispatch (rv32_native_jit_enter.S), which hard-codes
+ * these byte offsets and the entry/hot-entry layouts asserted below. */
+struct rv32_native_jit_dispatch_table {
+	struct jit_cache_entry *entries;	/* 0 */
+	struct jit_hot_entry *hot_entries;	/* 4 */
+	uint32_t *code_arena;			/* 8 */
+	uint32_t *hot_code_arena;		/* 12 */
+	const volatile uint32_t *host_wake;	/* 16 */
+	uint32_t fast_dispatches;		/* 20 */
+	uint32_t loop_iterations_offset;	/* 24 */
+	uint32_t set_mask;			/* 28 */
+	uint32_t loop_wake_budget;		/* 32 */
+	uint32_t hot_loop_admit_calls;		/* 36 */
+	uint32_t hot_general_admit_calls;	/* 40 */
+	uint32_t hot_loop_replace_calls;	/* 44 */
+	uint32_t hot_general_replace_calls;	/* 48 */
+	uint8_t *link_learning_budget;		/* 52 */
+	struct jit_exec_page *exec_pages;	/* 56 */
+	const uint32_t *exec_privilege_tag;	/* 60 */
+};
+struct rv32_native_jit_dispatch_table rv32_native_jit_dispatch_table;
+/* Which init self-test group failed, for the firmware's diagnostic. */
+uint32_t rv32_native_jit_self_test_failure;
+/* A freshly compiled region sends its first JIT_LINK_CONFIRMATIONS same-page
+ * exits through C so jit_observe_link can still publish a native link; the
+ * stub then resolves the remaining (polymorphic) exits itself. */
+static uint8_t jit_link_learning_budget[JIT_CACHE_SLOTS];
+extern void rv32_native_jit_dispatch(void);
+
+_Static_assert(sizeof(struct jit_cache_entry) == 16u &&
+	       offsetof(struct jit_cache_entry, guest_instruction_count) == 8u &&
+	       offsetof(struct jit_cache_entry, state) == 9u &&
+	       offsetof(struct jit_cache_entry, loops_to_start) == 11u &&
+	       offsetof(struct jit_cache_entry, code_unit) == 12u,
+	       "rv32_native_jit_dispatch hard-codes the cache entry layout");
+_Static_assert(sizeof(struct jit_hot_entry) == 4u &&
+	       offsetof(struct jit_hot_entry, calls) == 2u,
+	       "rv32_native_jit_dispatch hard-codes the hot entry layout");
+_Static_assert(offsetof(struct rv32_native_jit_dispatch_table,
+			exec_privilege_tag) == 60u &&
+	       sizeof(struct jit_exec_page) == 8u &&
+	       JIT_EXEC_PAGE_ENTRIES == 64u,
+	       "rv32_native_jit_dispatch hard-codes the table layout");
+_Static_assert(JIT_ENTRY_READY == 1u && JIT_CACHE_WAYS == 2u &&
+	       JIT_CODE_ALIGNMENT == 128u && JIT_HOT_LOCATION_UNIT_BITS == 10u &&
+	       JIT_NATIVE_CHAIN_ENTRY_BYTES == 16u,
+	       "rv32_native_jit_dispatch hard-codes these constants");
 
 /* Generated tails read this compact directory on every native-region edge.
  * Keep it in internal RAM: the Doom profile traverses roughly 1.5 million
@@ -203,6 +300,7 @@ struct jit_deferred_guard {
 	uint8_t funct3;
 	uint8_t source1;
 	uint8_t source2;
+	bool refill;
 };
 
 struct jit_memory_stub {
@@ -248,6 +346,17 @@ struct jit_loop_write_cache_stub {
 	uint8_t alignment_mask;
 };
 
+struct jit_two_page_store_stub {
+	uint32_t *range_miss;
+	uint32_t *continuation;
+	const uint32_t *instructions;
+	int16_t min_offset;
+	int16_t max_end;
+	uint8_t memory_stub;
+	uint8_t count;
+	uint8_t alignment_mask;
+};
+
 struct jit_builder {
 	uint32_t *start;
 	uint32_t *cursor;
@@ -258,12 +367,14 @@ struct jit_builder {
 	struct jit_memory_stub *memory_stubs;
 	struct jit_loop_read_cache_stub *loop_read_cache_stubs;
 	struct jit_loop_write_cache_stub *loop_write_cache_stubs;
+	struct jit_two_page_store_stub *two_page_store_stubs;
 	uint8_t bailout_patch_count;
 	uint8_t control_exit_patch_count;
 	uint8_t dirty_call_patch_count;
 	uint8_t memory_stub_count;
 	uint8_t loop_read_cache_stub_count;
 	uint8_t loop_write_cache_stub_count;
+	uint8_t two_page_store_stub_count;
 	bool instruction_counter_active;
 	bool failed;
 };
@@ -281,6 +392,13 @@ struct jit_memory_group {
 	int32_t min_offset;
 	int32_t max_end;
 	uint32_t alignment_mask;
+};
+
+/* Entry values only steer grouping; generated checks must not assume they
+ * still hold on a later entry. */
+struct jit_group_hint {
+	const uint32_t *entry_values;
+	uint32_t invariant_registers;
 };
 
 struct jit_persistent_memory_group {
@@ -315,11 +433,12 @@ struct jit_compile_workspace {
 		loop_read_cache_stubs[JIT_MAX_LOOP_READ_CACHES];
 	struct jit_loop_write_cache_stub
 		loop_write_cache_stubs[JIT_MAX_LOOP_WRITE_CACHES];
+	struct jit_two_page_store_stub two_page_store_stubs[JIT_MAX_MEMORY_SITES];
 	uint32_t trace_return_pcs[JIT_MAX_TRACE_CALL_DEPTH];
 	uint8_t trace_link_registers[JIT_MAX_TRACE_CALL_DEPTH];
 };
 
-static struct jit_cache_entry jit_entries[JIT_CACHE_SLOTS];
+static RV32_HOT_STATE_BSS struct jit_cache_entry jit_entries[JIT_CACHE_SLOTS];
 static struct rv32_native_jit_memory_site
 	(*jit_memory_sites)[JIT_MAX_MEMORY_SITES];
 #ifndef ESP_PLATFORM
@@ -330,10 +449,10 @@ static struct rv32_native_jit_memory_site
 	jit_memory_sites_storage[JIT_CACHE_SLOTS][JIT_MAX_MEMORY_SITES];
 #endif
 static struct jit_warm_entry *jit_warm;
-#ifndef ESP_PLATFORM
+/* Every failing dispatch probe touches one warm entry, so the table stays in
+ * internal RAM even though the rest of the cold directory lives in PSRAM. */
 static struct jit_warm_entry jit_warm_storage[JIT_WARM_SLOTS];
-#endif
-static _Alignas(JIT_CODE_ALIGNMENT) struct jit_link_entry
+static RV32_HOT_STATE_BSS _Alignas(JIT_CODE_ALIGNMENT) struct jit_link_entry
 	jit_link_storage[JIT_CACHE_SLOTS];
 static struct jit_link_entry *jit_links = jit_link_storage;
 static struct jit_link_candidate *jit_link_candidates;
@@ -341,9 +460,26 @@ static struct jit_link_candidate *jit_link_candidates;
 static struct jit_link_candidate jit_link_candidate_storage[JIT_CACHE_SLOTS];
 #endif
 static uint8_t jit_replace_way[JIT_CACHE_SETS];
-static struct jit_hot_entry jit_hot_entries[JIT_CACHE_SLOTS];
+static RV32_HOT_STATE_BSS struct jit_hot_entry jit_hot_entries[JIT_CACHE_SLOTS];
 static struct jit_exec_page jit_exec_pages[JIT_EXEC_PAGE_ENTRIES];
-static struct jit_compile_workspace jit_compile_workspace;
+static RV32_HOT_STATE_BSS uint32_t jit_negative_cache[JIT_NEGATIVE_CACHE_ENTRIES];
+
+static inline uint32_t *jit_negative_slot(uint32_t physical_offset)
+{
+	return &jit_negative_cache[(physical_offset >> 2) &
+				   (JIT_NEGATIVE_CACHE_ENTRIES - 1u)];
+}
+
+/* Offsets are word aligned, so the low bit marks an occupied slot. */
+static inline void jit_remember_negative(uint32_t physical_offset)
+{
+	*jit_negative_slot(physical_offset) = physical_offset | 1u;
+}
+/* Pages executed under the current translations.  Bits survive eviction and
+ * fences: a false positive costs a link flush, a false negative would keep
+ * stale links after a remap. */
+static uint32_t jit_exec_history[JIT_EXEC_HISTORY_BITS / 32u];
+static RV32_STATE_BSS struct jit_compile_workspace jit_compile_workspace;
 /* The mapping cache still permits safe C-side chaining across validated Sv32
  * pages.  Keep native trace construction within its starting page in normal
  * operation: profiling showed that the much larger multi-page regions caused
@@ -357,7 +493,7 @@ static uint32_t *jit_hot_code_arena;
 static _Alignas(JIT_CODE_ALIGNMENT) uint32_t
 	jit_hot_code_storage[JIT_HOT_CODE_ARENA_MIN_BYTES / sizeof(uint32_t)];
 #endif
-static _Alignas(JIT_CODE_ALIGNMENT) uint32_t jit_staging[JIT_CODE_WORDS];
+static RV32_STATE_BSS _Alignas(JIT_CODE_ALIGNMENT) uint32_t jit_staging[JIT_CODE_WORDS];
 static uint16_t jit_loop_code_head;
 static uint16_t jit_regular_code_head;
 static uint16_t jit_loop_code_units;
@@ -365,7 +501,26 @@ static uint16_t jit_code_arena_units;
 static uint16_t jit_hot_code_head;
 static uint16_t jit_hot_code_arena_units;
 static uint32_t jit_hot_code_occupancy[JIT_HOT_OCCUPANCY_WORDS];
-static struct rv32_native_jit_runtime jit_runtime;
+/* Data-page caches for U, S and S with SUM, so traps and uaccess windows
+ * switch banks instead of flushing.  Generated code uses the runtime it was
+ * entered with; jit_rt is the last adopted bank. */
+enum jit_memory_bank {
+	JIT_BANK_USER,
+	JIT_BANK_SUPERVISOR,
+	JIT_BANK_SUPERVISOR_SUM,
+	JIT_MEMORY_BANKS,
+};
+static struct rv32_native_jit_runtime jit_runtimes[JIT_MEMORY_BANKS];
+static struct rv32_native_jit_runtime *jit_rt = &jit_runtimes[JIT_BANK_USER];
+/* TLB epoch of the shared exec mappings and links; UINT32_MAX when empty. */
+static uint32_t jit_memory_epoch = UINT32_MAX;
+/* U and S never execute the same Sv32 page, so exec mappings carry the
+ * privilege above the 20-bit VPN. */
+static uint32_t jit_exec_privilege_tag;
+/* S-mode fetches here use the fixed kernel linear map; fences never change it. */
+static uint32_t jit_kernel_linear_base;
+static uint32_t jit_kernel_linear_size;
+static void jit_invalidate_translations(void);
 static struct rv32_native_jit_stats jit_stats;
 #if CONFIG_RV32_HOST_PERF_STATS
 /* One internal-RAM add per top-level native dispatch is substantially less
@@ -1074,6 +1229,90 @@ static bool jit_valid_op(uint32_t instruction)
 	return funct7 == 0x20u && (funct3 == 0u || funct3 == 5u);
 }
 
+static struct rv32_native_jit_csr_layout jit_csr_layout;
+static bool jit_csr_layout_valid;
+
+void rv32_native_jit_set_csr_layout(
+	const struct rv32_native_jit_csr_layout *layout)
+{
+	const int32_t *offsets = (const int32_t *)layout;
+
+	jit_csr_layout_valid = false;
+	if (layout == NULL)
+		return;
+	for (size_t i = 0; i < sizeof(*layout) / sizeof(int32_t); i++) {
+		if (offsets[i] < -2048 || offsets[i] > 2047 || (offsets[i] & 3))
+			return;
+	}
+	jit_csr_layout = *layout;
+	jit_csr_layout_valid = true;
+}
+
+/* Guest state offset of a supervisor CSR the generated code may access, or
+ * INT32_MIN.  satp writes change translations and stay interpreted. */
+static int32_t jit_csr_offset(uint32_t csrno, bool write)
+{
+	if (!jit_csr_layout_valid)
+		return INT32_MIN;
+	switch (csrno) {
+	case 0x100u: return jit_csr_layout.sstatus;
+	case 0x104u: return jit_csr_layout.sie;
+	case 0x105u: return jit_csr_layout.stvec;
+	case 0x140u: return jit_csr_layout.sscratch;
+	case 0x141u: return jit_csr_layout.sepc;
+	case 0x142u: return jit_csr_layout.scause;
+	case 0x143u: return jit_csr_layout.stval;
+	case 0x144u: return jit_csr_layout.sip;
+	case 0x180u: return write ? INT32_MIN : jit_csr_layout.satp;
+	default: return INT32_MIN;
+	}
+}
+
+/* CSRRW/CSRRWI always write; the set/clear forms write only with a nonzero
+ * source, exactly as the interpreter's write-back is a no-op otherwise. */
+static bool jit_csr_writes(uint32_t instruction)
+{
+	uint32_t funct3 = (instruction >> 12) & 7u;
+	uint32_t rs1 = (instruction >> 15) & 0x1fu;
+
+	return funct3 == 1u || funct3 == 5u || rs1 != 0u;
+}
+
+/* A write that can change the memory context (SUM/MXR via a register
+ * operand to sstatus) or newly deliver a supervisor interrupt (set bits in
+ * sstatus, sie or sip) may leave the region after the write. */
+static bool jit_csr_may_exit(uint32_t instruction)
+{
+	uint32_t funct3 = (instruction >> 12) & 7u;
+	uint32_t csrno = instruction >> 20;
+
+	if (!jit_csr_writes(instruction))
+		return false;
+	if (csrno == 0x100u && funct3 <= 3u)
+		return true;
+	if (csrno == 0x100u || csrno == 0x104u || csrno == 0x144u)
+		return funct3 == 1u || funct3 == 2u || funct3 == 5u ||
+			funct3 == 6u;
+	return false;
+}
+
+/* RV32A word operations.  LR/SC keep their reservation in the guest state
+ * word the CSR layout names, so they compile only once that is known. */
+static bool jit_valid_amo(uint32_t instruction)
+{
+	switch (instruction >> 27) {
+	case 0x00u: case 0x01u: case 0x04u: case 0x08u: case 0x0cu:
+	case 0x10u: case 0x14u: case 0x18u: case 0x1cu:
+		return true;
+	case 0x02u: /* LR.W */
+		return jit_csr_layout_valid && ((instruction >> 20) & 0x1fu) == 0u;
+	case 0x03u: /* SC.W */
+		return jit_csr_layout_valid;
+	default:
+		return false;
+	}
+}
+
 static enum jit_instruction_kind jit_instruction_kind(uint32_t instruction)
 {
 	uint32_t opcode = instruction & 0x7fu;
@@ -1104,10 +1343,59 @@ static enum jit_instruction_kind jit_instruction_kind(uint32_t instruction)
 		return JIT_INSN_JAL;
 	case 0x67u:
 		return funct3 == 0u ? JIT_INSN_JALR : JIT_INSN_UNSUPPORTED;
+	case 0x2fu: /* RV32A word operations */
+		return (funct3 == 2u && jit_valid_amo(instruction)) ?
+			JIT_INSN_AMO : JIT_INSN_UNSUPPORTED;
+	case 0x0fu: /* Plain FENCE needs no host action; FENCE.I and CBOs do. */
+		return funct3 == 0u ? JIT_INSN_NOP : JIT_INSN_UNSUPPORTED;
+	case 0x73u: /* Zicsr on the supervisor CSRs; ecall/xRET/WFI/fences stay. */
+		return (funct3 != 0u && funct3 != 4u &&
+			jit_csr_offset(instruction >> 20,
+				       jit_csr_writes(instruction)) != INT32_MIN) ?
+			JIT_INSN_CSR : JIT_INSN_UNSUPPORTED;
 	default:
 		return JIT_INSN_UNSUPPORTED;
 	}
 }
+
+#if CONFIG_RV32_HOST_PERF_STATS
+/* Instruction class of an unsupported region start/cut for the perf report:
+ * 0 ecall/ebreak, 1 xRET, 2 WFI, 3 SFENCE.VMA, 4 FENCE.I, 5 CBO, 6 time/cycle
+ * CSR, 7 satp write, 8 other CSR, 9 LR/SC, 10 other RV32A, 11 anything else. */
+static uint32_t jit_unsupported_class(uint32_t instruction)
+{
+	uint32_t opcode = instruction & 0x7fu;
+	uint32_t funct3 = (instruction >> 12) & 7u;
+	uint32_t csrno = instruction >> 20;
+
+	if (opcode == 0x73u) {
+		if (funct3 == 0u) {
+			if (csrno == 0u || csrno == 1u)
+				return 0u;
+			if (csrno == 0x102u || csrno == 0x302u)
+				return 1u;
+			if (csrno == 0x105u)
+				return 2u;
+			if ((csrno & 0xfe0u) == 0x120u)
+				return 3u;
+			return 11u;
+		}
+		if (csrno >= 0xc00u && csrno <= 0xc81u)
+			return 6u;
+		if (csrno == 0x180u)
+			return 7u;
+		return 8u;
+	}
+	if (opcode == 0x0fu)
+		return funct3 == 1u ? 4u : 5u;
+	if (opcode == 0x2fu) {
+		uint32_t funct5 = instruction >> 27;
+
+		return (funct5 == 2u || funct5 == 3u) ? 9u : 10u;
+	}
+	return 11u;
+}
+#endif
 
 static bool jit_instruction_terminal(enum jit_instruction_kind kind)
 {
@@ -1157,12 +1445,24 @@ static uint32_t jit_memory_width(uint32_t funct3, bool load)
 	return funct3 == 2u ? 4u : 0u;
 }
 
+static bool jit_group_crosses_hint_page(const struct jit_group_hint *hint,
+	uint32_t base, int32_t min_offset, int32_t max_end)
+{
+	if (hint->entry_values == NULL ||
+	    (hint->invariant_registers & (1u << base)) == 0u)
+		return false;
+	uint32_t value = base == 0u ? 0u : hint->entry_values[base];
+	return ((value + (uint32_t)min_offset) >> 12) !=
+	       ((value + (uint32_t)max_end) >> 12);
+}
+
 /* Find adjacent accesses whose effective addresses are all base + immediate.
  * A single page/alignment guard can cover the whole group, but only while no
  * load overwrites the shared base register. */
 static struct jit_memory_group jit_find_memory_group(
 	const uint32_t *instructions, const enum jit_instruction_kind *kinds,
-	const bool *leaders, uint32_t total, uint32_t first, bool store)
+	const bool *leaders, uint32_t total, uint32_t first, bool store,
+	const struct jit_group_hint *hint)
 {
 	struct jit_memory_group group = {
 		.min_offset = INT32_MAX,
@@ -1196,6 +1496,12 @@ static struct jit_memory_group jit_find_memory_group(
 		if (width == 0u || end > 2047 ||
 		    (((uint32_t)offset & (width - 1u)) != 0u))
 			break;
+		/* Loads stop at a page crossing; stores have a two-page path. */
+		if (!store && group.count != 0u &&
+		    jit_group_crosses_hint_page(hint, base,
+			offset < group.min_offset ? offset : group.min_offset,
+			end > group.max_end ? end : group.max_end))
+			break;
 
 		if (offset < group.min_offset)
 			group.min_offset = offset;
@@ -1227,6 +1533,8 @@ static bool jit_instruction_writes_register(
 	case JIT_INSN_LOAD:
 	case JIT_INSN_JAL:
 	case JIT_INSN_JALR:
+	case JIT_INSN_AMO:
+	case JIT_INSN_CSR:
 		return ((instruction >> 7) & 0x1fu) == reg;
 	default:
 		return false;
@@ -1275,7 +1583,7 @@ static bool jit_loop_preserves_alignment(
  * share the same checked page guard without being reordered. */
 static struct jit_persistent_memory_group jit_find_persistent_memory_group(
 	const uint32_t *instructions, const enum jit_instruction_kind *kinds,
-	const bool *leaders, uint32_t total)
+	const bool *leaders, uint32_t total, const struct jit_group_hint *hint)
 {
 	struct jit_persistent_memory_group best = { 0 };
 
@@ -1314,6 +1622,15 @@ static struct jit_persistent_memory_group jit_find_persistent_memory_group(
 
 				if (width != 0u && end <= 2047 &&
 				    ((uint32_t)offset & (width - 1u)) == 0u) {
+					/* End before a page-crossing load: members are
+					 * the contiguous first..last range. */
+					if (!candidate.store && candidate.memory.count != 0u &&
+					    jit_group_crosses_hint_page(hint, candidate.base,
+						offset < candidate.memory.min_offset ?
+							offset : candidate.memory.min_offset,
+						end > candidate.memory.max_end ?
+							end : candidate.memory.max_end))
+						break;
 					if (offset < candidate.memory.min_offset)
 						candidate.memory.min_offset = offset;
 					if (end > candidate.memory.max_end)
@@ -1372,7 +1689,8 @@ static uint32_t jit_find_loop_read_caches(
 	const bool *leaders, uint32_t count,
 	const struct jit_persistent_memory_group *persistent,
 	bool preserve_persistent_base,
-	struct jit_loop_read_cache caches[JIT_MAX_LOOP_READ_CACHES])
+	struct jit_loop_read_cache caches[JIT_MAX_LOOP_READ_CACHES],
+	const struct jit_group_hint *hint)
 {
 	static const uint8_t tag_registers[JIT_MAX_LOOP_READ_CACHES] = {
 		RV_S0, RV_S10,
@@ -1394,7 +1712,7 @@ static uint32_t jit_find_loop_read_caches(
 			continue;
 		if (!preserve_persistent_base) {
 			group = jit_find_memory_group(
-				instructions, kinds, leaders, count, i, false);
+				instructions, kinds, leaders, count, i, false, hint);
 			if (group.count > 1u) {
 				i += group.count - 1u;
 				continue;
@@ -1425,7 +1743,7 @@ static struct jit_loop_write_cache jit_find_loop_write_cache(
 	const uint32_t *instructions, const enum jit_instruction_kind *kinds,
 	const bool *leaders, uint32_t count,
 	const struct jit_persistent_memory_group *persistent,
-	bool persistent_guard_hoisted)
+	bool persistent_guard_hoisted, const struct jit_group_hint *hint)
 {
 	struct jit_loop_write_cache cache = { 0 };
 
@@ -1442,7 +1760,7 @@ static struct jit_loop_write_cache jit_find_loop_write_cache(
 			if (!store && kinds[i] != JIT_INSN_LOAD)
 				continue;
 			group = jit_find_memory_group(
-				instructions, kinds, leaders, count, i, store);
+				instructions, kinds, leaders, count, i, store, hint);
 			if (group.count > 1u)
 				return cache;
 		}
@@ -1455,7 +1773,7 @@ static struct jit_loop_write_cache jit_find_loop_write_cache(
 			    persistent, i, instructions[i], kinds[i]))
 			continue;
 		group = jit_find_memory_group(
-			instructions, kinds, leaders, count, i, true);
+			instructions, kinds, leaders, count, i, true, hint);
 		if (group.count > 1u) {
 			i += group.count - 1u;
 			continue;
@@ -1523,6 +1841,16 @@ static void jit_note_instruction_registers(
 		jit_note_read(use, rs1);
 		jit_note_read(use, rs2);
 		break;
+	case JIT_INSN_AMO:
+		jit_note_read(use, rs1);
+		jit_note_read(use, rs2);
+		jit_note_write(use, rd);
+		break;
+	case JIT_INSN_CSR:
+		if (((instruction >> 12) & 4u) == 0u)
+			jit_note_read(use, rs1);
+		jit_note_write(use, rd);
+		break;
 	case JIT_INSN_BRANCH:
 		jit_note_read(use, rs1);
 		jit_note_read(use, rs2);
@@ -1548,6 +1876,7 @@ static void jit_build_register_map(struct jit_register_map *map,
 {
 	struct jit_register_use use[32] = { 0 };
 	bool selected[32] = { false };
+	uint32_t prefix_writes = 0u;
 
 	memset(map, 0, sizeof(*map));
 	memset(map->host_for_guest, -1, sizeof(map->host_for_guest));
@@ -1555,6 +1884,12 @@ static void jit_build_register_map(struct jit_register_map *map,
 
 	for (uint32_t i = 0; i < count; i++)
 		jit_note_instruction_registers(use, instructions[i], kinds[i]);
+	/* Writes in the leading integer run dominate every exit, so those
+	 * registers need no initial load.  Anything that can bail out ends it. */
+	for (uint32_t i = 0; i < count && kinds[i] == JIT_INSN_INTEGER; i++)
+		prefix_writes |= UINT32_C(1) << ((instructions[i] >> 7) & 0x1fu);
+	for (uint32_t reg = 1u; reg < 32u; reg++)
+		use[reg].needs_initial |= !(prefix_writes & (UINT32_C(1) << reg));
 
 	for (uint32_t slot = 0; slot < JIT_MAX_MAPPED_REGISTERS; slot++) {
 		uint32_t host_reg;
@@ -1599,14 +1934,9 @@ static void jit_build_register_map(struct jit_register_map *map,
 			 * resident instead of spilling them on every native iteration. */
 			if (repeated)
 				ordinary_cost *= 4;
-			/* Every mapping costs its initial guest load and optional commit.
-			 * rv32_native_jit_enter already saves every ABI-preserved register once
-			 * around the complete linked chain, regardless of how many regions map
-			 * them, so charging another save/restore here incorrectly discourages
-			 * useful mappings in short regions.  Always load the old guest value: a
-			 * checked memory operation may fault before a nominal first write reaches
-			 * this register. */
-			mapped_cost = 1 + !!use[reg].writes;
+			/* rv32_native_jit_enter saves callee-saved registers once per
+			 * chain, so only the guest load and store count here. */
+			mapped_cost = use[reg].needs_initial + !!use[reg].writes;
 			benefit = ordinary_cost - mapped_cost;
 			if (benefit > best_benefit) {
 				best_benefit = benefit;
@@ -1620,7 +1950,7 @@ static void jit_build_register_map(struct jit_register_map *map,
 		map->host_for_guest[best_reg] = (int8_t)host_reg;
 		map->guest_for_host[map->count] = (uint8_t)best_reg;
 		map->host_register[map->count] = (uint8_t)host_reg;
-		map->needs_initial[map->count] = 1u;
+		map->needs_initial[map->count] = use[best_reg].needs_initial;
 		map->dirty[map->count] = use[best_reg].writes != 0u;
 		map->count++;
 	}
@@ -1824,6 +2154,20 @@ static bool jit_defer_memory_guard(struct jit_builder *builder,
 	guard->funct3 = (uint8_t)funct3;
 	guard->source1 = (uint8_t)source1;
 	guard->source2 = (uint8_t)source2;
+	guard->refill = false;
+	return true;
+}
+
+/* A page-tag guard directly follows lw t2, tag(t1), which a successful refill
+ * retries.  Range and alignment guards never retry. */
+static bool jit_defer_page_guard(struct jit_builder *builder,
+	struct jit_memory_stub *stub, uint32_t *instruction,
+	uint32_t funct3, uint32_t source1, uint32_t source2)
+{
+	if (!jit_defer_memory_guard(builder, stub, instruction,
+				    funct3, source1, source2))
+		return false;
+	stub->guards[stub->guard_count - 1u].refill = true;
 	return true;
 }
 
@@ -1940,7 +2284,7 @@ static bool jit_emit_loop_read_cache_stubs(struct jit_builder *builder)
 		resume = builder->cursor;
 		jit_emit(builder, 0u);
 		if (builder->failed ||
-		    !jit_defer_memory_guard(builder, memory_stub, shared_miss,
+		    !jit_defer_page_guard(builder, memory_stub, shared_miss,
 					     1u, RV_T0, RV_T2) ||
 		    !jit_patch_branch(resume, stub->continuation, 0u,
 				      RV_X0, RV_X0))
@@ -1950,15 +2294,52 @@ static bool jit_emit_loop_read_cache_stubs(struct jit_builder *builder)
 }
 
 static bool jit_emit_deferred_memory_stubs(
-	struct jit_builder *builder, const struct jit_register_map *map)
+	struct jit_builder *builder, const struct jit_register_map *map,
+	const struct rv32_native_jit_memory_site *sites)
 {
 	for (uint32_t index = 0; index < builder->memory_stub_count; index++) {
 		const struct jit_memory_stub *stub = &builder->memory_stubs[index];
+		const struct jit_deferred_guard *refill = NULL;
+
+		if (jit_rt->refill_ram != NULL) {
+			for (uint32_t g = 0; g < stub->guard_count; g++) {
+				if (!stub->guards[g].refill)
+					continue;
+				if (refill != NULL)
+					return false;
+				refill = &stub->guards[g];
+			}
+		}
+		if (refill != NULL) {
+			/* The retry target must be the tag load, before any guest
+			 * access. */
+			if ((refill->instruction[-1] & 0x000fffffu) !=
+			    rv_i(0x03u, RV_T2, 2u, RV_T1, 0) ||
+			    !jit_patch_branch(refill->instruction, builder->cursor,
+				refill->funct3, refill->source1, refill->source2))
+				return false;
+			if (stub->grouped)
+				jit_emit(builder, rv_i(0x13u, RV_A1, 0u, RV_A4,
+						       stub->group_immediate));
+			jit_emit_constant(builder, RV_A0,
+				(sites[stub->site].descriptor & 7u) |
+				(stub->store ? 8u : 0u));
+			jit_emit_constant(builder, RV_T2,
+				(uint32_t)(uintptr_t)rv32_native_jit_refill_trampoline);
+			jit_emit(builder, rv_i(0x67u, RV_T4, 0u, RV_T2, 0));
+			uint32_t *retry = builder->cursor;
+			jit_emit(builder, 0u);
+			if (!jit_patch_branch(retry, refill->instruction - 1,
+					      1u, RV_T2, RV_X0))
+				return false;
+		}
 		uint32_t *slow_path = builder->cursor;
 
 		for (uint32_t guard = 0; guard < stub->guard_count; guard++) {
 			const struct jit_deferred_guard *patch =
 				&stub->guards[guard];
+			if (patch == refill)
+				continue;
 
 			if (!jit_patch_branch(patch->instruction, slow_path,
 					      patch->funct3, patch->source1,
@@ -2093,7 +2474,7 @@ static bool jit_emit_loop_write_cache_stubs(struct jit_builder *builder)
 		resume = builder->cursor;
 		jit_emit(builder, 0u);
 		if (builder->failed ||
-		    !jit_defer_memory_guard(builder, memory_stub, shared_miss,
+		    !jit_defer_page_guard(builder, memory_stub, shared_miss,
 					     1u, RV_T0, RV_T2) ||
 		    !jit_patch_unconditional(resume, stub->continuation))
 			return false;
@@ -2305,7 +2686,7 @@ static bool jit_emit_load(struct jit_builder *builder,
 			   offsetof(struct rv32_native_jit_read_page, host_bias));
 	jit_emit(builder, rv_r(0x33u, RV_T0, 0u, RV_A1, RV_T0, 0u));
 	jit_emit(builder, rv_i(0x03u, destination, funct3, RV_T0, 0));
-	if (!jit_defer_memory_guard(builder, stub, page_miss_patch,
+	if (!jit_defer_page_guard(builder, stub, page_miss_patch,
 				    1u, RV_T0, RV_T2) ||
 	    (alignment_miss_patch != NULL &&
 	     !jit_defer_memory_guard(builder, stub, alignment_miss_patch,
@@ -2407,12 +2788,332 @@ static bool jit_emit_store(struct jit_builder *builder,
 	jit_emit(builder, rv_s(0x23u, funct3, RV_T0, RV_A2, 0));
 	if (!jit_emit_linear_dirty_page(builder, 1u, width))
 		return false;
-	if (!jit_defer_memory_guard(builder, stub, page_miss_patch,
+	if (!jit_defer_page_guard(builder, stub, page_miss_patch,
 				    1u, RV_T0, RV_T2) ||
 	    (alignment_miss_patch != NULL &&
 	     !jit_defer_memory_guard(builder, stub, alignment_miss_patch,
 				     1u, RV_T0, RV_X0)))
 		return false;
+	return !builder->failed;
+}
+
+/* Word atomics on a single hart are a checked read-modify-write through the
+ * write-page cache.  A miss re-executes the instruction in the interpreter
+ * instead of resolving it in C, so no half-applied update can escape. */
+static bool jit_emit_amo(struct jit_builder *builder,
+			 const struct jit_register_map *map,
+			 struct jit_cache_entry *entry,
+			 struct rv32_native_jit_memory_site *memory_sites,
+			 uint32_t instruction, uint32_t guest_pc,
+			 uint32_t executed_before)
+{
+	uint32_t rd = (instruction >> 7) & 0x1fu;
+	uint32_t rs1 = (instruction >> 15) & 0x1fu;
+	uint32_t rs2 = (instruction >> 20) & 0x1fu;
+	uint32_t funct5 = instruction >> 27;
+	uint32_t address_source = jit_guest_source(builder, map, rs1, RV_T0);
+	uint32_t value_source;
+	uint32_t site = entry->memory_site_count;
+	uint32_t *page_miss_patch;
+	uint32_t *alignment_miss_patch;
+	struct jit_memory_stub *stub;
+
+	if (site >= JIT_MAX_MEMORY_SITES)
+		return false;
+	memory_sites[site].guest_pc = guest_pc;
+	memory_sites[site].executed_before = (uint8_t)executed_before;
+	memory_sites[site].descriptor = (uint8_t)((site << 3) | 2u);
+	memory_sites[site].destination = 0u;
+	memory_sites[site].store = JIT_SITE_AMO;
+	entry->memory_site_count++;
+	stub = jit_defer_memory_stub(builder, site, true, false, 0, 0u);
+	if (stub == NULL)
+		return false;
+
+	jit_emit(builder, rv_i(0x13u, RV_A1, 0u, address_source, 0));
+	value_source = jit_guest_source(builder, map, rs2, RV_T0);
+	jit_emit(builder, rv_i(0x13u, RV_A2, 0u, value_source, 0));
+	jit_emit(builder, rv_i(0x13u, RV_T0, 5u, RV_A1, 12)); /* srli */
+	jit_emit(builder, rv_i(0x13u, RV_T1, 7u, RV_T0,
+			       RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u));
+	jit_emit(builder, rv_i(0x13u, RV_T1, 1u, RV_T1, 5));
+	jit_emit(builder, rv_r(0x33u, RV_T1, 0u,
+			       JIT_RUNTIME_REGISTER, RV_T1, 0u));
+	jit_emit_load_host(builder, RV_T2, RV_T1,
+			   offsetof(struct rv32_native_jit_runtime, write_pages) +
+			   offsetof(struct rv32_native_jit_write_page,
+				    virtual_page));
+	page_miss_patch = builder->cursor;
+	jit_emit(builder, 0u); /* bne t0, t2, slow */
+	jit_emit(builder, rv_i(0x13u, RV_T0, 7u, RV_A1, 3));
+	alignment_miss_patch = builder->cursor;
+	jit_emit(builder, 0u); /* bne t0, x0, slow */
+	jit_emit_load_host(builder, RV_T0, RV_T1,
+			   offsetof(struct rv32_native_jit_runtime, write_pages) +
+			   offsetof(struct rv32_native_jit_write_page, host_bias));
+	jit_emit(builder, rv_r(0x33u, RV_T0, 0u, RV_A1, RV_T0, 0u));
+	if (funct5 == 0x02u || funct5 == 0x03u) {
+		/* The reservation is the physical offset (host address minus the
+		 * image base) shifted into extraflags, exactly as interpreted.
+		 * t2 = this access's offset; a3 = reservation word. */
+		jit_emit_load_host(builder, RV_T2, JIT_RUNTIME_REGISTER,
+				   offsetof(struct rv32_native_jit_runtime, image));
+		jit_emit(builder, rv_r(0x33u, RV_T2, 0u, RV_T0, RV_T2, 0x20u));
+		jit_emit(builder, rv_i(0x03u, RV_A3, 2u, JIT_GUEST_REGS_REGISTER,
+				       jit_csr_layout.extraflags));
+		if (funct5 == 0x02u) {
+			jit_emit(builder, rv_i(0x13u, RV_A3, 7u, RV_A3, 7));
+			jit_emit(builder, rv_i(0x13u, RV_T2, 1u, RV_T2, 3));
+			jit_emit(builder, rv_r(0x33u, RV_A3, 6u, RV_A3, RV_T2, 0u));
+			jit_emit(builder, rv_s(0x23u, 2u, JIT_GUEST_REGS_REGISTER,
+					       RV_A3, jit_csr_layout.extraflags));
+			jit_emit(builder, rv_i(0x03u, RV_T2, 2u, RV_T0, 0)); /* value */
+			if (rd != 0u) {
+				uint32_t destination =
+					jit_guest_destination(map, rd, RV_T2);
+
+				if (destination != RV_T2)
+					jit_emit(builder, rv_i(0x13u, destination, 0u,
+							       RV_T2, 0));
+				jit_commit_unmapped_destination(builder, map, rd,
+								destination);
+			}
+		} else {
+			uint32_t *mismatch_patch;
+			uint32_t *done_patch;
+			uint32_t destination = rd != 0u ?
+				jit_guest_destination(map, rd, RV_T2) : RV_X0;
+
+			jit_emit(builder, rv_i(0x13u, RV_A3, 5u, RV_A3, 3));
+			mismatch_patch = builder->cursor;
+			jit_emit(builder, 0u); /* bne a3, t2, failed */
+			jit_emit(builder, rv_s(0x23u, 2u, RV_T0, RV_A2, 0));
+			if (rd != 0u)
+				jit_emit(builder, rv_i(0x13u, destination, 0u, RV_X0, 0));
+			if (!jit_emit_linear_dirty_page(builder, 1u, 4u))
+				return false;
+			done_patch = builder->cursor;
+			jit_emit(builder, 0u); /* j done */
+			if (!jit_patch_branch(mismatch_patch, builder->cursor, 1u,
+					      RV_A3, RV_T2))
+				return false;
+			if (rd != 0u)
+				jit_emit(builder, rv_i(0x13u, destination, 0u, RV_X0, 1));
+			if (!jit_patch_unconditional(done_patch, builder->cursor))
+				return false;
+			if (rd != 0u)
+				jit_commit_unmapped_destination(builder, map, rd,
+								destination);
+		}
+		if (!jit_defer_page_guard(builder, stub, page_miss_patch,
+					  1u, RV_T0, RV_T2) ||
+		    !jit_defer_memory_guard(builder, stub, alignment_miss_patch,
+					    1u, RV_T0, RV_X0))
+			return false;
+		return !builder->failed;
+	}
+	/* t1 must keep the write-page entry pointer for the dirty-page check
+	 * below; t2 (the page tag) is free once the guard has passed. */
+	jit_emit(builder, rv_i(0x03u, RV_T2, 2u, RV_T0, 0)); /* old value */
+	switch (funct5) {
+	case 0x00u: /* AMOADD */
+		jit_emit(builder, rv_r(0x33u, RV_A2, 0u, RV_T2, RV_A2, 0u));
+		break;
+	case 0x01u: /* AMOSWAP */
+		break;
+	case 0x04u: /* AMOXOR */
+		jit_emit(builder, rv_r(0x33u, RV_A2, 4u, RV_T2, RV_A2, 0u));
+		break;
+	case 0x08u: /* AMOOR */
+		jit_emit(builder, rv_r(0x33u, RV_A2, 6u, RV_T2, RV_A2, 0u));
+		break;
+	case 0x0cu: /* AMOAND */
+		jit_emit(builder, rv_r(0x33u, RV_A2, 7u, RV_T2, RV_A2, 0u));
+		break;
+	case 0x10u: /* AMOMIN: keep rs2 when rs2 < old */
+		jit_emit(builder, rv_b(4u, RV_A2, RV_T2, 8));
+		jit_emit(builder, rv_i(0x13u, RV_A2, 0u, RV_T2, 0));
+		break;
+	case 0x14u: /* AMOMAX: keep rs2 when rs2 >= old */
+		jit_emit(builder, rv_b(5u, RV_A2, RV_T2, 8));
+		jit_emit(builder, rv_i(0x13u, RV_A2, 0u, RV_T2, 0));
+		break;
+	case 0x18u: /* AMOMINU */
+		jit_emit(builder, rv_b(6u, RV_A2, RV_T2, 8));
+		jit_emit(builder, rv_i(0x13u, RV_A2, 0u, RV_T2, 0));
+		break;
+	case 0x1cu: /* AMOMAXU */
+		jit_emit(builder, rv_b(7u, RV_A2, RV_T2, 8));
+		jit_emit(builder, rv_i(0x13u, RV_A2, 0u, RV_T2, 0));
+		break;
+	default:
+		return false;
+	}
+	jit_emit(builder, rv_s(0x23u, 2u, RV_T0, RV_A2, 0));
+	/* The access has succeeded: publish rd before the dirty-page check,
+	 * which clobbers t0, t2, a2 and a3. */
+	if (rd != 0u) {
+		uint32_t destination = jit_guest_destination(map, rd, RV_T2);
+
+		if (destination != RV_T2)
+			jit_emit(builder, rv_i(0x13u, destination, 0u, RV_T2, 0));
+		jit_commit_unmapped_destination(builder, map, rd, destination);
+	}
+	if (!jit_emit_linear_dirty_page(builder, 1u, 4u))
+		return false;
+	if (!jit_defer_page_guard(builder, stub, page_miss_patch,
+				  1u, RV_T0, RV_T2) ||
+	    !jit_defer_memory_guard(builder, stub, alignment_miss_patch,
+				    1u, RV_T0, RV_X0))
+		return false;
+	return !builder->failed;
+}
+
+/* Supervisor CSR accesses stay native.  Reads and side-effect-free writes
+ * touch the guest state word directly.  A write that may change the memory
+ * context (SUM/MXR) or make a supervisor interrupt deliverable leaves the
+ * region after the write, so the interpreter re-evaluates both exactly as it
+ * would after executing the instruction itself. */
+static bool jit_emit_csr(struct jit_builder *builder,
+			 const struct jit_register_map *map,
+			 uint32_t instruction, uint32_t guest_pc)
+{
+	uint32_t rd = (instruction >> 7) & 0x1fu;
+	uint32_t rs1 = (instruction >> 15) & 0x1fu;
+	uint32_t funct3 = (instruction >> 12) & 7u;
+	uint32_t csrno = instruction >> 20;
+	bool writes = jit_csr_writes(instruction);
+	int32_t offset = jit_csr_offset(csrno, writes);
+	bool sum_check = writes && csrno == 0x100u && funct3 <= 3u;
+	bool irq_check = writes &&
+		(csrno == 0x100u || csrno == 0x104u || csrno == 0x144u) &&
+		(funct3 == 1u || funct3 == 2u || funct3 == 5u || funct3 == 6u);
+	struct jit_deferred_guard exits[2];
+	struct jit_deferred_guard continues[3];
+	uint32_t exit_count = 0u;
+	uint32_t continue_count = 0u;
+	uint32_t *skip_patch = NULL;
+	uint32_t new_register = RV_T2;
+
+	if (offset == INT32_MIN)
+		return false;
+	jit_emit(builder, rv_i(0x03u, RV_T1, 2u, JIT_GUEST_REGS_REGISTER,
+			       offset)); /* old value */
+	if (writes) {
+		uint32_t source;
+
+		switch (funct3) {
+		case 1u: /* CSRRW */
+			new_register = jit_guest_source(builder, map, rs1, RV_T2);
+			break;
+		case 2u: /* CSRRS */
+			source = jit_guest_source(builder, map, rs1, RV_T2);
+			jit_emit(builder, rv_r(0x33u, RV_T2, 6u, RV_T1, source, 0u));
+			break;
+		case 3u: /* CSRRC */
+			source = jit_guest_source(builder, map, rs1, RV_T2);
+			jit_emit(builder, rv_i(0x13u, RV_T0, 4u, source, -1));
+			jit_emit(builder, rv_r(0x33u, RV_T2, 7u, RV_T1, RV_T0, 0u));
+			break;
+		case 5u: /* CSRRWI */
+			jit_emit(builder, rv_i(0x13u, RV_T2, 0u, RV_X0, (int32_t)rs1));
+			break;
+		case 6u: /* CSRRSI */
+			jit_emit(builder, rv_i(0x13u, RV_T2, 6u, RV_T1, (int32_t)rs1));
+			break;
+		case 7u: /* CSRRCI */
+			jit_emit(builder, rv_i(0x13u, RV_T2, 7u, RV_T1, ~(int32_t)rs1));
+			break;
+		default:
+			return false;
+		}
+		jit_emit(builder, rv_s(0x23u, 2u, JIT_GUEST_REGS_REGISTER,
+				       new_register, offset));
+		if (sum_check) {
+			/* SUM (bit 18) or MXR (bit 19) changed: the memory context is
+			 * now different, so finish in C. */
+			jit_emit(builder, rv_r(0x33u, RV_T0, 4u, RV_T1, new_register, 0u));
+			jit_emit(builder, rv_i(0x13u, RV_T0, 5u, RV_T0, 18));
+			jit_emit(builder, rv_i(0x13u, RV_T0, 7u, RV_T0, 3));
+			exits[exit_count++] = (struct jit_deferred_guard) {
+				.instruction = builder->cursor, .funct3 = 1u,
+				.source1 = RV_T0, .source2 = RV_X0,
+			};
+			jit_emit(builder, 0u); /* bne t0, x0, exit */
+		}
+	}
+	if (rd != 0u) {
+		uint32_t destination = jit_guest_destination(map, rd, RV_T0);
+
+		jit_emit(builder, rv_i(0x13u, destination, 0u, RV_T1, 0));
+		jit_commit_unmapped_destination(builder, map, rd, destination);
+	}
+	if (irq_check) {
+		/* Mirror MiniRV32SupervisorInterruptCause: a pending enabled
+		 * supervisor interrupt is deliverable in U-mode, or in S-mode with
+		 * sstatus.SIE set.  Falling through these checks is the exit. */
+		jit_emit(builder, rv_i(0x03u, RV_T0, 2u, JIT_GUEST_REGS_REGISTER,
+				       jit_csr_layout.sip));
+		jit_emit(builder, rv_i(0x03u, RV_T1, 2u, JIT_GUEST_REGS_REGISTER,
+				       jit_csr_layout.sie));
+		jit_emit(builder, rv_r(0x33u, RV_T0, 7u, RV_T0, RV_T1, 0u));
+		jit_emit(builder, rv_i(0x13u, RV_T0, 7u, RV_T0, 0x220));
+		continues[continue_count++] = (struct jit_deferred_guard) {
+			.instruction = builder->cursor, .funct3 = 0u,
+			.source1 = RV_T0, .source2 = RV_X0,
+		};
+		jit_emit(builder, 0u); /* beq t0, x0, continue: nothing pending */
+		jit_emit(builder, rv_i(0x03u, RV_T1, 2u, JIT_GUEST_REGS_REGISTER,
+				       jit_csr_layout.extraflags));
+		jit_emit(builder, rv_i(0x13u, RV_T1, 7u, RV_T1, 3));
+		exits[exit_count++] = (struct jit_deferred_guard) {
+			.instruction = builder->cursor, .funct3 = 0u,
+			.source1 = RV_T1, .source2 = RV_X0,
+		};
+		jit_emit(builder, 0u); /* beq t1, x0, exit: U-mode delivers */
+		jit_emit(builder, rv_i(0x13u, RV_T1, 0u, RV_T1, -1));
+		continues[continue_count++] = (struct jit_deferred_guard) {
+			.instruction = builder->cursor, .funct3 = 1u,
+			.source1 = RV_T1, .source2 = RV_X0,
+		};
+		jit_emit(builder, 0u); /* bne t1, x0, continue: M-mode */
+		jit_emit(builder, rv_i(0x03u, RV_T1, 2u, JIT_GUEST_REGS_REGISTER,
+				       jit_csr_layout.sstatus));
+		jit_emit(builder, rv_i(0x13u, RV_T1, 7u, RV_T1, 2));
+		continues[continue_count++] = (struct jit_deferred_guard) {
+			.instruction = builder->cursor, .funct3 = 0u,
+			.source1 = RV_T1, .source2 = RV_X0,
+		};
+		jit_emit(builder, 0u); /* beq t1, x0, continue: SIE clear */
+	} else if (sum_check) {
+		skip_patch = builder->cursor;
+		jit_emit(builder, 0u); /* j continue */
+	}
+	if (sum_check || irq_check) {
+		uint32_t *exit_label = builder->cursor;
+		uint32_t *continue_label;
+
+		jit_emit_constant(builder, RV_A1, guest_pc + 4u);
+		jit_record_control_exit(builder);
+		continue_label = builder->cursor;
+		if (builder->failed)
+			return false;
+		for (uint32_t i = 0; i < exit_count; i++) {
+			if (!jit_patch_branch(exits[i].instruction, exit_label,
+					      exits[i].funct3, exits[i].source1,
+					      exits[i].source2))
+				return false;
+		}
+		for (uint32_t i = 0; i < continue_count; i++) {
+			if (!jit_patch_branch(continues[i].instruction, continue_label,
+					      continues[i].funct3, continues[i].source1,
+					      continues[i].source2))
+				return false;
+		}
+		if (skip_patch != NULL &&
+		    !jit_patch_unconditional(skip_patch, continue_label))
+			return false;
+	}
 	return !builder->failed;
 }
 
@@ -2459,7 +3160,7 @@ static bool jit_emit_load_group(
 	    (guards.alignment_miss != NULL &&
 	     !jit_defer_memory_guard(builder, stub, guards.alignment_miss,
 				     1u, RV_T2, RV_X0)) ||
-	    !jit_defer_memory_guard(builder, stub, guards.page_miss,
+	    !jit_defer_page_guard(builder, stub, guards.page_miss,
 				    1u, RV_T0, RV_T2))
 		return false;
 	return !builder->failed;
@@ -2507,14 +3208,119 @@ static bool jit_emit_store_group(
 		return false;
 	stub = jit_defer_memory_stub(builder, site, true, true,
 				     jit_s_immediate(first), first_rs2);
-	if (!jit_defer_memory_guard(builder, stub, guards.range_miss,
-				    1u, RV_T0, RV_T2) ||
-	    (guards.alignment_miss != NULL &&
+	if (stub == NULL ||
+	    builder->two_page_store_stub_count >= JIT_MAX_MEMORY_SITES)
+		return false;
+	struct jit_two_page_store_stub *two_page =
+		&builder->two_page_store_stubs[builder->two_page_store_stub_count++];
+	*two_page = (struct jit_two_page_store_stub) {
+		.range_miss = guards.range_miss,
+		.continuation = builder->cursor,
+		.instructions = instructions,
+		.min_offset = (int16_t)group->min_offset,
+		.max_end = (int16_t)group->max_end,
+		.memory_stub = (uint8_t)(stub - builder->memory_stubs),
+		.count = (uint8_t)group->count,
+		.alignment_mask = (uint8_t)group->alignment_mask,
+	};
+	if ((guards.alignment_miss != NULL &&
 	     !jit_defer_memory_guard(builder, stub, guards.alignment_miss,
 				     1u, RV_T2, RV_X0)) ||
-	    !jit_defer_memory_guard(builder, stub, guards.page_miss,
+	    !jit_defer_page_guard(builder, stub, guards.page_miss,
 				    1u, RV_T0, RV_T2))
 		return false;
+	return !builder->failed;
+}
+
+/* A store group spans under a page of offsets, so at most two pages (with
+ * 32-bit wraparound).  Both write mappings are checked before any store;
+ * MMIO and dirty-tracked pages go through the resolver. */
+static bool jit_emit_two_page_store_stubs(struct jit_builder *builder,
+					 const struct jit_register_map *map)
+{
+	const size_t pages = offsetof(struct rv32_native_jit_runtime, write_pages);
+	for (uint32_t n = 0; n < builder->two_page_store_stub_count; ++n) {
+		const struct jit_two_page_store_stub *stub = &builder->two_page_store_stubs[n];
+		struct jit_memory_stub *memory = &builder->memory_stubs[stub->memory_stub];
+		struct jit_deferred_guard failures[5];
+		uint32_t failure_count = 0u;
+		if (!jit_patch_branch(stub->range_miss, builder->cursor, 1u, RV_T0, RV_T2))
+			return false;
+		/* Preserve the first/last VPNs and the original guest base (a4). */
+		jit_emit(builder, rv_i(0x13u, RV_A2, 0u, RV_T0, 0));
+		jit_emit(builder, rv_i(0x13u, RV_A1, 0u, RV_T2, 0));
+		if (stub->alignment_mask != 0u) {
+			jit_emit(builder, rv_i(0x13u, RV_T0, 7u, RV_A4, stub->alignment_mask));
+			failures[failure_count++] = (struct jit_deferred_guard) {
+				.instruction = builder->cursor, .funct3 = 1u,
+				.source1 = RV_T0, .source2 = RV_X0,
+			};
+			jit_emit(builder, 0u);
+		}
+		for (uint32_t page = 0; page < 2u; ++page) {
+			uint32_t tag = page == 0u ? RV_A2 : RV_A1;
+			uint32_t bias = page == 0u ? RV_A5 : RV_A3;
+			jit_emit(builder, rv_i(0x13u, RV_T1, 7u, tag,
+					       RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u));
+			jit_emit(builder, rv_i(0x13u, RV_T1, 1u, RV_T1, 5));
+			jit_emit(builder, rv_r(0x33u, RV_T1, 0u, RV_T1, JIT_RUNTIME_REGISTER, 0u));
+			jit_emit_load_host(builder, RV_T0, RV_T1,
+				pages + offsetof(struct rv32_native_jit_write_page, virtual_page));
+			failures[failure_count++] = (struct jit_deferred_guard) {
+				.instruction = builder->cursor, .funct3 = 1u,
+				.source1 = RV_T0, .source2 = (uint8_t)tag,
+			};
+			jit_emit(builder, 0u);
+			jit_emit_load_host(builder, RV_T0, RV_T1,
+				pages + offsetof(struct rv32_native_jit_write_page, linear_page_start));
+			failures[failure_count++] = (struct jit_deferred_guard) {
+				.instruction = builder->cursor, .funct3 = 5u,
+				.source1 = RV_T0, .source2 = RV_X0,
+			};
+			jit_emit(builder, 0u); /* bge: nonnegative start means tracked/MMIO. */
+			jit_emit_load_host(builder, bias, RV_T1,
+				pages + offsetof(struct rv32_native_jit_write_page, host_bias));
+		}
+		for (uint32_t i = 0; i < stub->count; ++i) {
+			uint32_t instruction = stub->instructions[i];
+			int32_t offset = jit_s_immediate(instruction);
+			uint32_t width = jit_memory_width((instruction >> 12) & 7u, false);
+			jit_emit(builder, rv_i(0x13u, RV_T0, 0u, RV_A4, offset));
+			if (offset == stub->min_offset) {
+				jit_emit(builder, rv_r(0x33u, RV_T0, 0u, RV_T0, RV_A5, 0u));
+			} else if (offset + (int32_t)width - 1 == stub->max_end) {
+				jit_emit(builder, rv_r(0x33u, RV_T0, 0u, RV_T0, RV_A3, 0u));
+			} else {
+				jit_emit(builder, rv_i(0x13u, RV_T2, 5u, RV_T0, 12));
+				uint32_t *first_page = builder->cursor;
+				jit_emit(builder, 0u);
+				jit_emit(builder, rv_r(0x33u, RV_T0, 0u, RV_T0, RV_A3, 0u));
+				uint32_t *selected = builder->cursor;
+				jit_emit(builder, 0u);
+				if (!jit_patch_branch(first_page, builder->cursor, 0u, RV_T2, RV_A2))
+					return false;
+				jit_emit(builder, rv_r(0x33u, RV_T0, 0u, RV_T0, RV_A5, 0u));
+				if (!jit_patch_unconditional(selected, builder->cursor))
+					return false;
+			}
+			uint32_t value = jit_guest_source(builder, map,
+						 (instruction >> 20) & 31u, RV_T2);
+			jit_emit(builder, rv_s(0x23u, (instruction >> 12) & 7u, RV_T0, value, 0));
+		}
+		uint32_t *resume = builder->cursor;
+		jit_emit(builder, 0u);
+		if (!jit_patch_unconditional(resume, stub->continuation))
+			return false;
+		for (uint32_t i = 0; i < failure_count; ++i) {
+			const struct jit_deferred_guard *f = &failures[i];
+			if (!jit_patch_branch(f->instruction, builder->cursor,
+					      f->funct3, f->source1, f->source2))
+				return false;
+		}
+		if (!jit_defer_memory_guard(builder, memory, builder->cursor, 0u, RV_X0, RV_X0))
+			return false;
+		jit_emit(builder, 0u);
+	}
 	return !builder->failed;
 }
 
@@ -2551,7 +3357,7 @@ static bool jit_emit_persistent_memory_guard(
 	    (guards.alignment_miss != NULL &&
 	     !jit_defer_memory_guard(builder, stub, guards.alignment_miss,
 				     1u, RV_T2, RV_X0)) ||
-	    !jit_defer_memory_guard(builder, stub, guards.page_miss,
+	    !jit_defer_page_guard(builder, stub, guards.page_miss,
 				    1u, RV_T0, RV_T2))
 		return false;
 	/* Guard misses branch away while a4 still holds the guest base.  The fast
@@ -2590,9 +3396,9 @@ static bool jit_emit_persistent_memory_access(
 		jit_emit(builder, rv_s(0x23u, funct3, RV_A4, value,
 				       jit_s_immediate(instruction)));
 		/* The aggregate guard proves every selected store touches this one
-		 * translated page, so reporting it after the first store covers all
-		 * later stores without per-pixel dirty-range work. */
-		if (index == group->first &&
+		 * translated page, so one report covers them all.  A hoisted guard
+		 * reports in the preamble, as t1 is clobbered inside the loop. */
+		if (index == group->first && !guard_hoisted &&
 		    !jit_emit_linear_dirty_page(builder, group->memory.count,
 						group->total_bytes))
 			return false;
@@ -2926,6 +3732,14 @@ static void jit_invalidate_exec_pages(void)
 {
 	for (uint32_t i = 0; i < JIT_EXEC_PAGE_ENTRIES; i++)
 		jit_exec_pages[i].virtual_page = UINT32_MAX;
+	/* Callers have already discarded all links and multi-page regions. */
+	memset(jit_exec_history, 0, sizeof(jit_exec_history));
+}
+
+static uint32_t jit_exec_history_index(uint32_t virtual_page)
+{
+	return (virtual_page ^ (virtual_page >> 12)) &
+		(JIT_EXEC_HISTORY_BITS - 1u);
 }
 
 /* Remember only mappings that have already passed MiniRV32's ordinary
@@ -2936,6 +3750,7 @@ static void jit_cache_exec_page(uint32_t physical_offset, uint32_t guest_pc)
 	uint32_t page_offset = guest_pc & 0xfffu;
 	uint32_t physical_page_offset;
 	uint32_t virtual_page = guest_pc >> 12;
+	uint32_t tag = virtual_page | jit_exec_privilege_tag;
 	struct jit_exec_page *page;
 
 	if (physical_offset < page_offset)
@@ -2945,11 +3760,20 @@ static void jit_cache_exec_page(uint32_t physical_offset, uint32_t guest_pc)
 	/* The emulator and its native dispatcher own this cache on one hart. Avoid
 	 * a release fence and two stores when the overwhelmingly common mapping is
 	 * already current; no CPU1 worker reads or writes these entries. */
-	if (page->virtual_page == virtual_page &&
+	if (page->virtual_page == tag &&
 	    page->physical_page_offset == physical_page_offset)
 		return;
+	/* Linear-map kernel text is never fenced; leaving it out of the history
+	 * avoids link flushes from hash collisions with user pages. */
+	if (jit_exec_privilege_tag == 0u ||
+	    guest_pc - jit_kernel_linear_base >= jit_kernel_linear_size) {
+		uint32_t history_index = jit_exec_history_index(virtual_page);
+
+		jit_exec_history[history_index >> 5] |=
+			UINT32_C(1) << (history_index & 31u);
+	}
 	page->physical_page_offset = physical_page_offset;
-	page->virtual_page = virtual_page;
+	page->virtual_page = tag;
 }
 
 static bool jit_resolve_exec_offset(uint32_t guest_pc,
@@ -2958,21 +3782,18 @@ static bool jit_resolve_exec_offset(uint32_t guest_pc,
 	const struct jit_exec_page *page =
 		&jit_exec_pages[jit_exec_page_index(guest_pc)];
 
-	if (page->virtual_page != guest_pc >> 12)
+	if (page->virtual_page != ((guest_pc >> 12) | jit_exec_privilege_tag))
 		return false;
 	*physical_offset = page->physical_page_offset + (guest_pc & 0xfffu);
 	return true;
 }
 
-/* Same-page regions remain valid when a TLB generation or permission context
- * changes because their lookup still includes the freshly translated physical
- * start address.  Multi-page regions also depend on cached target mappings and
- * must be discarded at that boundary. */
+/* Same-page regions survive TLB and permission changes because lookup uses
+ * the freshly translated physical address.  Links and multi-page regions
+ * depend on cached mappings and go at each TLB epoch.  A privilege change
+ * needs neither: U and S never execute the same page. */
 static void jit_invalidate_cross_page_entries(void)
 {
-	/* Direct successor edges bypass the ordinary physical-key lookup. Any TLB
-	 * generation or page invalidation therefore discards all predictions, even
-	 * though same-page generated regions themselves remain reusable. */
 	jit_clear_all_links();
 	if (!jit_has_cross_page_entries)
 		return;
@@ -3036,8 +3857,13 @@ static bool jit_collect_region(const uint8_t *guest_ram,
 		       guest_ram + cursor_offset,
 		       sizeof(instruction));
 		kind = jit_instruction_kind(instruction);
-		if (kind == JIT_INSN_UNSUPPORTED)
+		if (kind == JIT_INSN_UNSUPPORTED) {
+#if CONFIG_RV32_HOST_PERF_STATS
+			jit_stats.unsupported_cuts[
+				jit_unsupported_class(instruction)]++;
+#endif
 			break;
+		}
 		instructions[count] = instruction;
 		guest_pcs[count] = cursor_pc;
 		kinds[count] = kind;
@@ -3122,9 +3948,9 @@ static bool jit_candidate_loops_to_start(const uint8_t *guest_ram,
 	return false;
 }
 
-static __attribute__((noinline)) bool jit_compile(
+static __attribute__((noinline)) bool jit_compile_with_entry_values(
 	uint32_t slot, const uint8_t *guest_ram, uint32_t physical_offset,
-	uint32_t guest_pc, uint32_t instruction_limit)
+	uint32_t guest_pc, uint32_t instruction_limit, const uint32_t *entry_values)
 {
 	struct jit_cache_entry *entry = &jit_entries[slot];
 	struct rv32_native_jit_memory_site *memory_sites =
@@ -3137,6 +3963,7 @@ static __attribute__((noinline)) bool jit_compile(
 	struct jit_internal_branch_patch *internal_branch_patches =
 		jit_compile_workspace.internal_branch_patches;
 	struct jit_register_map map;
+	struct jit_group_hint group_hint = { .entry_values = entry_values };
 	struct jit_persistent_memory_group persistent_memory;
 	struct jit_loop_read_cache loop_read_caches[JIT_MAX_LOOP_READ_CACHES];
 	struct jit_loop_write_cache loop_write_cache = { 0 };
@@ -3149,6 +3976,7 @@ static __attribute__((noinline)) bool jit_compile(
 			jit_compile_workspace.loop_read_cache_stubs,
 		.loop_write_cache_stubs =
 			jit_compile_workspace.loop_write_cache_stubs,
+		.two_page_store_stubs = jit_compile_workspace.two_page_store_stubs,
 	};
 	uint32_t count;
 	uint32_t loop_read_cache_count = 0u;
@@ -3221,6 +4049,11 @@ static __attribute__((noinline)) bool jit_compile(
 			dynamic_counter_active = true;
 			continue;
 		}
+		if (kinds[i] == JIT_INSN_CSR && i + 1u < count &&
+		    jit_csr_may_exit(instructions[i])) {
+			dynamic_counter_active = true;
+			continue;
+		}
 		if (kinds[i] != JIT_INSN_BRANCH || i + 1u >= count)
 			continue;
 		/* Any nonterminal branch makes the number of executed instructions
@@ -3237,8 +4070,14 @@ static __attribute__((noinline)) bool jit_compile(
 	}
 	dynamic_counter_active |= repeated;
 	builder.instruction_counter_active = dynamic_counter_active;
+	if (entry_values != NULL) {
+		for (uint32_t reg = 0u; reg < 32u; reg++) {
+			if (!jit_region_writes_register(instructions, kinds, count, reg))
+				group_hint.invariant_registers |= 1u << reg;
+		}
+	}
 	persistent_memory = jit_find_persistent_memory_group(
-		instructions, kinds, leaders, count);
+		instructions, kinds, leaders, count, &group_hint);
 	/* If the repeated region starts with an invariant memory stream, its guard
 	 * has no preceding guest work to preserve on a cold exit.  Translate it
 	 * once in the entry preamble and retain the host base in a4 across every
@@ -3252,10 +4091,10 @@ static __attribute__((noinline)) bool jit_compile(
 		loop_read_cache_count = jit_find_loop_read_caches(
 			instructions, kinds, leaders, count, &persistent_memory,
 			hoist_persistent_memory,
-			loop_read_caches);
+			loop_read_caches, &group_hint);
 		loop_write_cache = jit_find_loop_write_cache(
 			instructions, kinds, leaders, count, &persistent_memory,
-			hoist_persistent_memory);
+			hoist_persistent_memory, &group_hint);
 		for (uint32_t i = 0; i < loop_read_cache_count; i++) {
 			struct jit_loop_read_cache *cache = &loop_read_caches[i];
 			uint32_t instruction = instructions[cache->instruction_index];
@@ -3369,6 +4208,10 @@ static __attribute__((noinline)) bool jit_compile(
 		    &builder, &map, entry, memory_sites, &persistent_memory,
 		    instructions[0], guest_pc, 0u))
 		goto rejected;
+	if (hoist_persistent_memory && persistent_memory.store &&
+	    !jit_emit_linear_dirty_page(&builder, persistent_memory.memory.count,
+					persistent_memory.total_bytes))
+		goto rejected;
 	loop_start = builder.cursor;
 
 	for (uint32_t i = 0; i < count; i++) {
@@ -3403,7 +4246,7 @@ static __attribute__((noinline)) bool jit_compile(
 			break;
 		case JIT_INSN_LOAD: {
 			struct jit_memory_group group = jit_find_memory_group(
-				instructions, kinds, leaders, count, i, false);
+				instructions, kinds, leaders, count, i, false, &group_hint);
 			const struct jit_loop_read_cache *loop_cache =
 				jit_loop_read_cache_for(loop_read_caches,
 							loop_read_cache_count, i);
@@ -3429,7 +4272,7 @@ static __attribute__((noinline)) bool jit_compile(
 		}
 		case JIT_INSN_STORE: {
 			struct jit_memory_group group = jit_find_memory_group(
-				instructions, kinds, leaders, count, i, true);
+				instructions, kinds, leaders, count, i, true, &group_hint);
 			const struct jit_loop_write_cache *loop_cache =
 				jit_loop_write_cache_for(&loop_write_cache, i);
 
@@ -3526,6 +4369,25 @@ static __attribute__((noinline)) bool jit_compile(
 				okay = !builder.failed;
 			}
 			break;
+		case JIT_INSN_AMO:
+			okay = jit_emit_amo(&builder, &map, entry, memory_sites,
+					    instructions[i], instruction_pc,
+					    executed_before);
+			break;
+		case JIT_INSN_NOP:
+			okay = true;
+			break;
+		case JIT_INSN_CSR:
+			if (dynamic_counter_active &&
+			    jit_csr_may_exit(instructions[i])) {
+				if (!jit_emit_executed_add(
+					    &builder, i - segment_start + 1u))
+					goto rejected;
+				segment_start = i + 1u;
+			}
+			okay = jit_emit_csr(&builder, &map, instructions[i],
+					    instruction_pc);
+			break;
 		case JIT_INSN_JALR:
 			if (dynamic_counter_active) {
 				if (!jit_emit_executed_add(
@@ -3614,7 +4476,8 @@ static __attribute__((noinline)) bool jit_compile(
 		jit_emit(&builder, 0u);
 		if (!jit_emit_loop_read_cache_stubs(&builder) ||
 		    !jit_emit_loop_write_cache_stubs(&builder) ||
-		    !jit_emit_deferred_memory_stubs(&builder, &map) ||
+		    !jit_emit_two_page_store_stubs(&builder, &map) ||
+		    !jit_emit_deferred_memory_stubs(&builder, &map, memory_sites) ||
 		    !jit_emit_linear_dirty_helper(&builder) ||
 		    !jit_patch_unconditional(normal_stub_skip, builder.cursor))
 			goto rejected;
@@ -3701,6 +4564,15 @@ static __attribute__((noinline)) bool jit_compile(
 		jit_emit(&builder, rv_i(0x67u, RV_X0, 0u, RV_T2, 0));
 
 		normal_return = builder.cursor;
+		/* A compiled same-page successor continues natively through the
+		 * shared dispatch stub, which returns here only on a miss. */
+		jit_emit_constant(&builder, RV_T3,
+				  physical_offset - (guest_pc & 0xfffu));
+		jit_emit_constant(&builder, RV_T4, guest_pc & ~0xfffu);
+		jit_emit_constant(&builder, RV_A5, slot);
+		jit_emit_constant(&builder, RV_T2,
+				  (uint32_t)(uintptr_t)rv32_native_jit_dispatch);
+		jit_emit(&builder, rv_i(0x67u, RV_T1, 0u, RV_T2, 0));
 		/* These fields are consumed only after leaving the native chain. Keep
 		 * them out of the successful link path, which often executes once per
 		 * short region. A cold stub has already seeded its own local count and
@@ -3760,6 +4632,7 @@ static __attribute__((noinline)) bool jit_compile(
 	entry->guest_instruction_count = (uint8_t)count;
 	entry->loops_to_start = loops_to_start;
 	entry->spans_pages = spans_pages;
+	jit_link_learning_budget[slot] = JIT_LINK_CONFIRMATIONS;
 	entry->state = JIT_ENTRY_READY;
 	jit_has_cross_page_entries |= spans_pages;
 	jit_stats.compiled_blocks++;
@@ -3782,6 +4655,14 @@ static __attribute__((noinline)) bool jit_compile(
 	rejected:
 	if (builder.failed)
 		rejection = JIT_REJECT_CODE_SIZE;
+#if CONFIG_RV32_JIT_EXIT_TRACE
+	if (rv32_jit_trace_enabled()) {
+		uint32_t opcode;
+		memcpy(&opcode, guest_ram + physical_offset, sizeof(opcode));
+		rv32_jit_trace_record(RV32_JIT_TRACE_COLLECT + rejection,
+			guest_pc, physical_offset, opcode, 0u, 0u, 0u);
+	}
+#endif
 	entry->physical_offset = physical_offset;
 	entry->guest_pc = guest_pc;
 	entry->guest_instruction_count = 0u;
@@ -3794,6 +4675,7 @@ static __attribute__((noinline)) bool jit_compile(
 	switch (rejection) {
 	case JIT_REJECT_COLLECT:
 		jit_stats.rejected_collect++;
+		jit_remember_negative(physical_offset);
 		break;
 	case JIT_REJECT_CODE_SIZE:
 		jit_stats.rejected_code_size++;
@@ -3806,6 +4688,14 @@ static __attribute__((noinline)) bool jit_compile(
 		break;
 	}
 	return false;
+}
+
+/* Self-tests compile synthetic regions before binding live guest registers. */
+static bool jit_compile(uint32_t slot, const uint8_t *guest_ram,
+	uint32_t physical_offset, uint32_t guest_pc, uint32_t instruction_limit)
+{
+	return jit_compile_with_entry_values(slot, guest_ram, physical_offset,
+		guest_pc, instruction_limit, NULL);
 }
 
 struct jit_test_memory {
@@ -3858,10 +4748,54 @@ static uint32_t jit_test_store(struct rv32_native_jit_runtime *runtime,
 	return 0u;
 }
 
-/* Resolve one cold memory exit after generated code has committed its mapped
- * guest registers.  Successful accesses are completed exactly once here and
- * seed the corresponding translated-page cache.  Faulting or MMIO accesses
- * retain the callback's architectural exit information for the interpreter. */
+/* Called from the refill trampoline with guest registers live; the callback
+ * may publish mappings but must not perform a guest access. */
+uint32_t IRAM_ATTR rv32_native_jit_refill_ram_page(
+	struct rv32_native_jit_runtime *runtime, uint32_t address, uint32_t access)
+{
+#if CONFIG_RV32_JIT_EXIT_TRACE
+	uint32_t trace_start = rv32_jit_trace_cycles();
+#endif
+#if CONFIG_RV32_HOST_PERF_STATS
+	uint32_t start = jit_profile_cycle_count();
+#endif
+	bool resumed = runtime->refill_ram != NULL &&
+		runtime->refill_ram(runtime, address, access);
+#if CONFIG_RV32_HOST_PERF_STATS || CONFIG_RV32_EMULATOR_PERF_STATS
+	jit_stats.ram_refill_attempts++;
+	jit_stats.ram_refill_resumes += resumed;
+#endif
+#if CONFIG_RV32_HOST_PERF_STATS
+	jit_stats.ram_refill_cycles += (uint32_t)(jit_profile_cycle_count() - start);
+#endif
+#if CONFIG_RV32_JIT_EXIT_TRACE
+	rv32_jit_trace_refill(resumed, rv32_jit_trace_cycles() - trace_start);
+#endif
+	return resumed;
+}
+
+#if CONFIG_RV32_JIT_EXIT_TRACE
+static enum rv32_jit_trace_reason jit_trace_memory_reason(
+	const struct rv32_native_jit_runtime *runtime, uint32_t width,
+	bool mapped)
+{
+	if (runtime->result.trap) return RV32_JIT_TRACE_FAULT;
+	switch (runtime->trace_memory_kind) {
+	case RV32_JIT_TRACE_MEMORY_RAM:
+		if (width && (runtime->memory_address & (width - 1u)))
+			return RV32_JIT_TRACE_RAM_UNALIGNED;
+		return mapped ? RV32_JIT_TRACE_RAM_GUARD : RV32_JIT_TRACE_RAM_MAP;
+	case RV32_JIT_TRACE_MEMORY_UNCACHED: return RV32_JIT_TRACE_UNCACHED;
+	case RV32_JIT_TRACE_MEMORY_FRAMEBUFFER: return RV32_JIT_TRACE_FRAMEBUFFER;
+	case RV32_JIT_TRACE_MEMORY_DEVICE: return RV32_JIT_TRACE_DEVICE;
+	default: return RV32_JIT_TRACE_OTHER;
+	}
+}
+#endif
+
+/* Finish a cold memory exit once generated code has committed its registers.
+ * A successful access completes here and seeds the page cache; faults and
+ * MMIO exit to the interpreter. */
 static void jit_resolve_memory_bailout(
 	struct rv32_native_jit_runtime *runtime, uint32_t bailout)
 {
@@ -3879,6 +4813,37 @@ static void jit_resolve_memory_bailout(
 	}
 
 	site = &runtime->sites[site_index];
+	if (site->store == JIT_SITE_AMO) {
+		/* The interpreter owns reservations, MMIO and faults: rerun the
+		 * atomic there.  Nothing was applied on the native side. */
+		runtime->result.next_pc = site->guest_pc;
+		runtime->result.executed += site->executed_before;
+		return;
+	}
+#if CONFIG_RV32_JIT_EXIT_TRACE
+	bool trace = rv32_jit_trace_enabled();
+	uint32_t physical = UINT32_MAX, opcode = 0u, start = 0u;
+	uint32_t width = jit_memory_width(site->descriptor & 7u, !site->store);
+	uint32_t vpn = runtime->memory_address >> 12;
+	uint32_t index = vpn & (RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u);
+	bool mapped = (site->store ? runtime->write_pages[index].virtual_page :
+		       runtime->read_pages[index].virtual_page) == vpn;
+	if (trace) {
+		/* The exit may lie in a linked successor; use its page, and read
+		 * the opcode before the callback can change memory. */
+		uint32_t slot = runtime->result.native_slot;
+		if (slot < JIT_CACHE_SLOTS &&
+		    (site->guest_pc >> 12) == (jit_entries[slot].guest_pc >> 12))
+			physical = (jit_entries[slot].physical_offset & ~0xfffu) |
+				(site->guest_pc & 0xfffu);
+		else
+			(void)jit_resolve_exec_offset(site->guest_pc, &physical);
+		if (physical != UINT32_MAX && runtime->image != NULL)
+			memcpy(&opcode, runtime->image + physical, sizeof(opcode));
+		runtime->trace_memory_kind = RV32_JIT_TRACE_MEMORY_OTHER;
+		start = rv32_jit_trace_cycles();
+	}
+#endif
 	if (site->store) {
 		failed = runtime->store(runtime, runtime->memory_address,
 					runtime->memory_value, site->descriptor);
@@ -3886,6 +4851,14 @@ static void jit_resolve_memory_bailout(
 		failed = runtime->load(runtime, runtime->memory_address,
 				       site->descriptor);
 	}
+#if CONFIG_RV32_JIT_EXIT_TRACE
+	if (trace) {
+		uint32_t cycles = rv32_jit_trace_cycles() - start;
+		rv32_jit_trace_record(jit_trace_memory_reason(runtime, width, mapped),
+			site->guest_pc, physical, opcode, runtime->memory_address,
+			runtime->result.trap, cycles);
+	}
+#endif
 	if (failed != 0u)
 		return;
 
@@ -3897,7 +4870,7 @@ static void jit_resolve_memory_bailout(
 
 static __attribute__((noinline)) bool jit_self_test_chain_results(void)
 {
-	struct rv32_native_jit_runtime *runtime = &jit_runtime;
+	struct rv32_native_jit_runtime *runtime = jit_rt;
 	const uint32_t base_pc = 0x18000u;
 	uint32_t source_program[] = {
 		rv_i(0x13u, 1u, 0u, 1u, 1),
@@ -4037,9 +5010,96 @@ static __attribute__((noinline)) bool jit_self_test_chain_results(void)
 	return true;
 }
 
+/* Same-page successors already in the cache continue through
+ * rv32_native_jit_dispatch without returning to C: the published result names
+ * the final region, the budget stops the chain exactly like the C dispatcher,
+ * and a region's link-learning budget sends its first exits back to C. */
+static __attribute__((noinline)) bool jit_self_test_native_dispatch(void)
+{
+	struct rv32_native_jit_runtime *runtime = jit_rt;
+	const uint32_t base_pc = 0x18000u;
+	static uint32_t program[3u * 64u];
+	static const uint32_t no_wake;
+	const volatile uint32_t *saved_wake =
+		rv32_native_jit_dispatch_table.host_wake;
+	uint32_t slots[3];
+	uint32_t regs[32];
+	bool okay = false;
+
+	/* Device bridges may already have requested a host wake while the
+	 * firmware initialises; the stub would then (correctly) refuse to chain
+	 * and this deterministic test would fail.  Judge the stub, not timing. */
+	rv32_native_jit_dispatch_table.host_wake = &no_wake;
+
+	memset(program, 0, sizeof(program));
+	for (uint32_t region = 0u; region < 3u; region++) {
+		uint32_t *code = &program[region * 64u];
+		uint32_t physical = region * 0x100u;
+		uint32_t pc = base_pc + physical;
+		uint32_t set = jit_hash(physical, pc, JIT_CACHE_SETS - 1u);
+
+		code[0] = rv_i(0x13u, 1u, 0u, 1u, (int32_t)(1u << (2u * region)));
+		code[1] = rv_i(0x13u, 1u, 0u, 1u, (int32_t)(2u << (2u * region)));
+		code[2] = rv_b(0u, 0u, 0u, 0xf8); /* beq x0, x0, next region */
+		/* The generated lookup hashes the key, so place each entry in its
+		 * own set's way 0, or way 1 after a collision with an earlier one. */
+		slots[region] = set * JIT_CACHE_WAYS;
+		for (uint32_t earlier = 0u; earlier < region; earlier++) {
+			if (slots[earlier] / JIT_CACHE_WAYS != set)
+				continue;
+			if (slots[earlier] % JIT_CACHE_WAYS == 1u)
+				goto out;
+			slots[region] = set * JIT_CACHE_WAYS + 1u;
+		}
+		if (!jit_compile(slots[region], (const uint8_t *)program, physical,
+				 pc, 3u))
+			goto out;
+		jit_link_learning_budget[slots[region]] = 0u;
+	}
+	jit_clear_all_links();
+	for (uint32_t round = 0u; round < 4u; round++) {
+		/* 0: full chain; 1: budget admits only the first region; 2: one
+		 * learning exit returns to C; 3: learning exhausted, chain again. */
+		uint32_t chain_limit = round == 1u ? 5u : 9u;
+		uint32_t final = round == 0u || round == 3u ? 2u : 0u;
+		uint32_t expected_next = base_pc + (final + 1u) * 0x100u;
+		jit_block_fn block = (jit_block_fn)(uintptr_t)
+			jit_current_entry_code(slots[0]);
+
+		if (round == 2u)
+			jit_link_learning_budget[slots[0]] = 1u;
+		memset(regs, 0, sizeof(regs));
+		*runtime = (struct rv32_native_jit_runtime) {
+			.regs = regs,
+			.chain_executed = 13u,
+			.chain_instruction_limit = 13u + chain_limit,
+			.result = {
+				.next_pc = UINT32_MAX,
+				.executed = UINT32_MAX,
+				.native_successor = 1u,
+				.native_slot = UINT32_MAX,
+			},
+		};
+		if (rv32_native_jit_enter(block, runtime) != 0u ||
+		    runtime->result.executed != 3u ||
+		    runtime->result.next_pc != expected_next ||
+		    runtime->result.native_slot != slots[final] ||
+		    runtime->result.native_successor != 0u ||
+		    runtime->chain_executed != 13u + (final + 1u) * 3u ||
+		    regs[1] != (final == 2u ? 63u : 3u) ||
+		    jit_link_learning_budget[slots[0]] != 0u)
+			goto out;
+	}
+	jit_clear_all_links();
+	okay = true;
+out:
+	rv32_native_jit_dispatch_table.host_wake = saved_wake;
+	return okay;
+}
+
 static __attribute__((noinline)) bool jit_self_test_interior_loops(void)
 {
-	struct rv32_native_jit_runtime *runtime = &jit_runtime;
+	struct rv32_native_jit_runtime *runtime = jit_rt;
 	uint32_t conditional_program[] = {
 		rv_i(0x13u, 1u, 0u, 1u, 100), /* preheader runs only once */
 		rv_b(0u, 6u, 0u, 12),        /* optionally skip to index 4 */
@@ -4256,7 +5316,7 @@ static __attribute__((noinline)) bool jit_self_test_interior_loops(void)
 	}
 #if CONFIG_RV32_HOST_PERF_STATS
 	{
-		struct rv32_native_jit_stats stats;
+		static struct rv32_native_jit_stats stats; /* off the main stack */
 
 		jit_profile_discarded_guest_instructions = 11u;
 		jit_profile_guest_instructions[0] = 17u;
@@ -4276,10 +5336,9 @@ static __attribute__((noinline)) bool jit_self_test_interior_loops(void)
 
 static bool jit_self_test(void)
 {
-	/* Initialization is single-threaded and clears jit_runtime before return.
-	 * Reuse it here instead of placing its page caches (over 2.5 KiB) on the
-	 * 4 KiB main-task stack underneath jit_compile's own bounded frame. */
-#define runtime jit_runtime
+	/* Borrow the user bank, cleared again by init, instead of putting
+	 * 2.5 KiB of page caches on the 4 KiB main-task stack. */
+#define runtime (*jit_rt)
 	uint32_t program[JIT_MAX_GUEST_INSTRUCTIONS] = {
 		rv_i(0x13u, 1u, 0u, 0u, 7),      /* addi x1, x0, 7 */
 		rv_i(0x13u, 1u, 0u, 1u, 1),      /* addi x1, x1, 1 */
@@ -5460,15 +6519,15 @@ static bool jit_self_test(void)
 					return false;
 			}
 		}
-		if (jit_test_load(&jit_runtime, memory.address, 2u) != 0u)
+		if (jit_test_load(jit_rt, memory.address, 2u) != 0u)
 			return false;
-		jit_runtime.memory_calls = 0u;
+		jit_rt->memory_calls = 0u;
 		result = rv32_native_jit_try(offsets[0], pcs[0], 8u, 0u);
 		if (result == NULL || result->trap != 0u ||
 		    result->executed != 8u || result->next_pc != 0x9024u ||
 		    result->native_successor != 1u || regs[1] != 1u ||
 		    regs[2] != 7u || regs[3] != 9u ||
-		    regs[6] != memory.value || jit_runtime.memory_calls != 0u)
+		    regs[6] != memory.value || jit_rt->memory_calls != 0u)
 			return false;
 
 		/* Repeatedly observe the same edge, then prove that the generated tail
@@ -5491,7 +6550,7 @@ static bool jit_self_test(void)
 		result = rv32_native_jit_try(offsets[0], pcs[0], 8u, 0u);
 		if (result == NULL || result->trap != 0u ||
 		    result->executed != 8u || result->next_pc != 0x9024u ||
-		    jit_runtime.chain_links !=
+		    jit_rt->chain_links !=
 			    (RV32_NATIVE_JIT_RUNTIME_COUNTERS ? 1u : 0u) ||
 		    regs[1] != 1u ||
 		    regs[2] != 7u || regs[3] != 9u ||
@@ -5503,18 +6562,18 @@ static bool jit_self_test(void)
 		 * than the memory-less source slot and count both regions exactly once. */
 		for (uint32_t index = 0;
 		     index < RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES; index++)
-			jit_runtime.read_pages[index].virtual_page = UINT32_MAX;
+			jit_rt->read_pages[index].virtual_page = UINT32_MAX;
 		memset(regs, 0, sizeof(regs));
 		regs[4] = memory.address;
-		jit_runtime.memory_calls = 0u;
+		jit_rt->memory_calls = 0u;
 		result = rv32_native_jit_try(offsets[0], pcs[0], 8u, 0u);
 		if (result == NULL || result->trap != 0u ||
 		    result->executed != 5u || result->next_pc != 0x9014u ||
-		    jit_runtime.chain_links !=
+		    jit_rt->chain_links !=
 			    (RV32_NATIVE_JIT_RUNTIME_COUNTERS ? 1u : 0u) ||
 		    regs[1] != 1u ||
 		    regs[2] != 2u || regs[3] != 3u ||
-		    regs[6] != memory.value || jit_runtime.memory_calls != 1u)
+		    regs[6] != memory.value || jit_rt->memory_calls != 1u)
 			return false;
 
 		/* A translation-context boundary must remove the shortcut while leaving
@@ -5522,23 +6581,23 @@ static bool jit_self_test(void)
 		rv32_native_jit_memory_cache_flush();
 		memset(regs, 0, sizeof(regs));
 		regs[4] = memory.address;
-		jit_runtime.memory_calls = 0u;
+		jit_rt->memory_calls = 0u;
 		result = rv32_native_jit_try(offsets[0], pcs[0], 8u, 0u);
 		if (result == NULL || result->trap != 0u ||
 		    result->executed != 5u || result->next_pc != 0x9014u ||
-		    jit_runtime.chain_links != 0u || regs[1] != 1u ||
+		    jit_rt->chain_links != 0u || regs[1] != 1u ||
 		    regs[2] != 2u || regs[3] != 3u ||
-		    regs[6] != memory.value || jit_runtime.memory_calls != 1u)
+		    regs[6] != memory.value || jit_rt->memory_calls != 1u)
 			return false;
 		memset(regs, 0, sizeof(regs));
 		regs[4] = memory.address;
-		jit_runtime.memory_calls = 0u;
+		jit_rt->memory_calls = 0u;
 		result = rv32_native_jit_try(offsets[0], pcs[0], 8u, 0u);
 		if (result == NULL || result->trap != 0u ||
 		    result->executed != 8u || result->next_pc != 0x9024u ||
-		    jit_runtime.chain_links != 0u || regs[1] != 1u ||
+		    jit_rt->chain_links != 0u || regs[1] != 1u ||
 		    regs[2] != 7u || regs[3] != 9u ||
-		    regs[6] != memory.value || jit_runtime.memory_calls != 0u)
+		    regs[6] != memory.value || jit_rt->memory_calls != 0u)
 			return false;
 	}
 
@@ -5601,10 +6660,10 @@ static bool jit_self_test(void)
 		    !jit_entries[0].spans_pages)
 			return false;
 		block = (jit_block_fn)(uintptr_t)jit_entry_code(0u);
-		if (rv32_native_jit_enter(block, &jit_runtime) != 0u ||
-		    jit_runtime.result.trap != 0u ||
-		    jit_runtime.result.executed != 8u ||
-		    jit_runtime.result.next_pc != 0xa014u || regs[1] != 5u ||
+		if (rv32_native_jit_enter(block, jit_rt) != 0u ||
+		    jit_rt->result.trap != 0u ||
+		    jit_rt->result.executed != 8u ||
+		    jit_rt->result.next_pc != 0xa014u || regs[1] != 5u ||
 		    regs[2] != 7u || regs[3] != 9u)
 			return false;
 		rv32_native_jit_memory_cache_flush();
@@ -5624,25 +6683,25 @@ static bool jit_self_test(void)
 				(retained_pc >> 12) &
 				(RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u);
 
-			jit_runtime.read_pages[target_index].virtual_page =
+			jit_rt->read_pages[target_index].virtual_page =
 				pcs[1] >> 12;
-			jit_runtime.write_pages[target_index].virtual_page =
+			jit_rt->write_pages[target_index].virtual_page =
 				pcs[1] >> 12;
-			jit_runtime.read_pages[retained_index].virtual_page =
+			jit_rt->read_pages[retained_index].virtual_page =
 				retained_pc >> 12;
-			jit_runtime.write_pages[retained_index].virtual_page =
+			jit_rt->write_pages[retained_index].virtual_page =
 				retained_pc >> 12;
 			jit_cache_exec_page(offsets[1], pcs[1]);
 			jit_cache_exec_page(32u, retained_pc);
 			rv32_native_jit_memory_cache_flush_page(pcs[1] + 0x123u);
-			if (jit_runtime.read_pages[target_index].virtual_page !=
+			if (jit_rt->read_pages[target_index].virtual_page !=
 				    UINT32_MAX ||
-			    jit_runtime.write_pages[target_index].virtual_page !=
+			    jit_rt->write_pages[target_index].virtual_page !=
 				    UINT32_MAX ||
 			    jit_resolve_exec_offset(pcs[1], &resolved) ||
-			    jit_runtime.read_pages[retained_index].virtual_page !=
+			    jit_rt->read_pages[retained_index].virtual_page !=
 				    retained_pc >> 12 ||
-			    jit_runtime.write_pages[retained_index].virtual_page !=
+			    jit_rt->write_pages[retained_index].virtual_page !=
 				    retained_pc >> 12 ||
 			    !jit_resolve_exec_offset(retained_pc, &resolved) ||
 			    resolved != 32u)
@@ -5730,10 +6789,11 @@ static bool jit_self_test(void)
 	memset(jit_warm, 0, JIT_WARM_BYTES);
 	memset(jit_replace_way, 0, sizeof(jit_replace_way));
 	memset(jit_hot_entries, 0, sizeof(jit_hot_entries));
-	jit_clear_all_links();
-	memset(&jit_runtime, 0, sizeof(jit_runtime));
+	memset(jit_runtimes, 0, sizeof(jit_runtimes));
+	jit_rt = &jit_runtimes[JIT_BANK_USER];
+	jit_exec_privilege_tag = 0u;
 	memset(&jit_stats, 0, sizeof(jit_stats));
-	jit_invalidate_exec_pages();
+	jit_invalidate_translations();
 	jit_reset_code_heads();
 	return true;
 }
@@ -5766,24 +6826,20 @@ bool rv32_native_jit_init(void)
 	    psram_metadata_bytes >=
 		    memory_site_bytes + JIT_WARM_BYTES + candidate_bytes) {
 		jit_memory_sites = psram_metadata;
-		jit_warm = (struct jit_warm_entry *)
-			((uint8_t *)psram_metadata + memory_site_bytes);
 		jit_link_candidates = (struct jit_link_candidate *)
-			((uint8_t *)jit_warm + JIT_WARM_BYTES);
+			((uint8_t *)psram_metadata + memory_site_bytes);
 		memset(jit_memory_sites, 0, memory_site_bytes);
-		memset(jit_warm, 0, JIT_WARM_BYTES);
 		memset(jit_link_candidates, 0, candidate_bytes);
 	} else {
 		jit_memory_sites = heap_caps_calloc(
 			JIT_CACHE_SLOTS, sizeof(*jit_memory_sites),
 			MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-		jit_warm = heap_caps_calloc(
-			JIT_WARM_SLOTS, sizeof(*jit_warm),
-			MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 		jit_link_candidates = heap_caps_calloc(
 			JIT_CACHE_SLOTS, sizeof(*jit_link_candidates),
 			MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 	}
+	jit_warm = jit_warm_storage;
+	memset(jit_warm, 0, JIT_WARM_BYTES);
 	if (jit_memory_sites == NULL || jit_warm == NULL ||
 	    jit_link_candidates == NULL)
 		return false;
@@ -5870,22 +6926,92 @@ bool rv32_native_jit_init(void)
 	jit_loop_code_units = (uint16_t)(jit_code_arena_units / 2u);
 	jit_hot_code_arena_units =
 		(uint16_t)(hot_arena_bytes / JIT_CODE_ALIGNMENT);
+	rv32_native_jit_dispatch_table = (struct rv32_native_jit_dispatch_table){
+		.entries = jit_entries,
+		.hot_entries = jit_hot_entries,
+		.code_arena = jit_code_arena,
+		.hot_code_arena = jit_hot_code_arena,
+		.host_wake = JIT_HOST_WAKE_WORD,
+		.loop_iterations_offset =
+			offsetof(struct rv32_native_jit_runtime, loop_iterations),
+		.set_mask = JIT_CACHE_SETS - 1u,
+		.loop_wake_budget = JIT_LOOP_WAKE_BUDGET,
+		.hot_loop_admit_calls = JIT_HOT_LOOP_ADMIT_CALLS,
+		.hot_general_admit_calls = JIT_HOT_GENERAL_ADMIT_CALLS,
+		.hot_loop_replace_calls = JIT_HOT_LOOP_REPLACE_CALLS,
+		.hot_general_replace_calls = JIT_HOT_GENERAL_REPLACE_CALLS,
+		.link_learning_budget = jit_link_learning_budget,
+		.exec_pages = jit_exec_pages,
+		.exec_privilege_tag = &jit_exec_privilege_tag,
+	};
 	jit_clear_all_links();
 	memset(jit_hot_entries, 0, sizeof(jit_hot_entries));
 	jit_reset_code_heads();
 	jit_invalidate_exec_pages();
-	return jit_self_test_chain_results() &&
-		jit_self_test_interior_loops() && jit_self_test();
+	if (!jit_self_test_chain_results())
+		rv32_native_jit_self_test_failure = 1u;
+	else if (!jit_self_test_native_dispatch())
+		rv32_native_jit_self_test_failure = 2u;
+	else if (!jit_self_test_interior_loops())
+		rv32_native_jit_self_test_failure = 3u;
+	else if (!jit_self_test())
+		rv32_native_jit_self_test_failure = 4u;
+	return rv32_native_jit_self_test_failure == 0u;
 }
 
-static void jit_invalidate_memory_pages(void)
+uint32_t rv32_native_jit_fast_dispatch_count(void)
+{
+	return rv32_native_jit_dispatch_table.fast_dispatches;
+}
+
+void rv32_native_jit_memory_cache_flush_host_range(const void *host, size_t size)
+{
+	uintptr_t first = (uintptr_t)host;
+	if (!host || !size || size - 1u > UINTPTR_MAX - first)
+		return;
+	uintptr_t last = first + size - 1u;
+	/* Every bank may map the surface, the kernel ones through the linear map. */
+	for (uint32_t bank = 0; bank < JIT_MEMORY_BANKS; bank++) {
+		struct rv32_native_jit_runtime *runtime = &jit_runtimes[bank];
+
+		for (uint32_t i = 0; i < RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES; i++) {
+			struct rv32_native_jit_read_page *read = &runtime->read_pages[i];
+			struct rv32_native_jit_write_page *write =
+				&runtime->write_pages[i];
+			uint32_t read_host = (read->virtual_page << 12) + read->host_bias;
+			uint32_t write_host =
+				(write->virtual_page << 12) + write->host_bias;
+			/* 64-bit end so the top host page cannot wrap. */
+			if (read->virtual_page != UINT32_MAX && read_host <= last &&
+			    (uint64_t)read_host + 4095u >= first)
+				read->virtual_page = UINT32_MAX;
+			if (write->virtual_page != UINT32_MAX && write_host <= last &&
+			    (uint64_t)write_host + 4095u >= first)
+				write->virtual_page = UINT32_MAX;
+		}
+	}
+}
+
+static void jit_invalidate_memory_pages(struct rv32_native_jit_runtime *runtime)
 {
 	for (uint32_t i = 0; i < RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES; i++) {
-		jit_runtime.read_pages[i].virtual_page = UINT32_MAX;
-		jit_runtime.write_pages[i].virtual_page = UINT32_MAX;
-		jit_runtime.write_pages[i].linear_page_start = UINT32_MAX;
-		jit_runtime.write_pages[i].linear_page_end = 0u;
+		runtime->read_pages[i].virtual_page = UINT32_MAX;
+		runtime->write_pages[i].virtual_page = UINT32_MAX;
+		runtime->write_pages[i].linear_page_start = UINT32_MAX;
+		runtime->write_pages[i].linear_page_end = 0u;
 	}
+}
+
+/* Drop everything derived from Sv32 translations, in every bank. */
+static void jit_invalidate_translations(void)
+{
+	jit_invalidate_cross_page_entries();
+	for (uint32_t bank = 0; bank < JIT_MEMORY_BANKS; bank++) {
+		jit_runtimes[bank].memory_context = UINT32_MAX;
+		jit_invalidate_memory_pages(&jit_runtimes[bank]);
+	}
+	jit_invalidate_exec_pages();
+	jit_memory_epoch = UINT32_MAX;
 }
 
 void rv32_native_jit_bind(
@@ -5896,16 +7022,39 @@ void rv32_native_jit_bind(
 			  uint32_t virtual_address, uint32_t value,
 			  uint32_t descriptor))
 {
-	memset(&jit_runtime, 0, sizeof(jit_runtime));
-	jit_runtime.regs = guest_regs;
-	jit_runtime.image = guest_ram;
-	jit_runtime.opaque = opaque;
-	jit_runtime.load = load;
-	jit_runtime.store = store;
-	jit_runtime.memory_context = UINT32_MAX;
-	jit_clear_all_links();
-	jit_invalidate_memory_pages();
-	jit_invalidate_exec_pages();
+	memset(jit_runtimes, 0, sizeof(jit_runtimes));
+	for (uint32_t bank = 0; bank < JIT_MEMORY_BANKS; bank++) {
+		struct rv32_native_jit_runtime *runtime = &jit_runtimes[bank];
+
+		runtime->regs = guest_regs;
+		runtime->image = guest_ram;
+		runtime->opaque = opaque;
+		runtime->load = load;
+		runtime->store = store;
+	}
+	jit_rt = &jit_runtimes[JIT_BANK_USER];
+	jit_exec_privilege_tag = 0u;
+	memset(jit_negative_cache, 0, sizeof(jit_negative_cache));
+	jit_invalidate_translations();
+}
+
+void rv32_native_jit_set_ram_refill(bool (*refill)(
+	struct rv32_native_jit_runtime *, uint32_t, uint32_t))
+{
+	if (jit_runtimes[JIT_BANK_USER].refill_ram != refill) {
+		rv32_native_jit_flush();
+		for (uint32_t bank = 0; bank < JIT_MEMORY_BANKS; bank++)
+			jit_runtimes[bank].refill_ram = refill;
+	}
+}
+
+void rv32_native_jit_set_kernel_linear_map(uint32_t virtual_base,
+					   uint32_t size)
+{
+	/* Pages recorded under the old window may lack their history bit. */
+	jit_invalidate_translations();
+	jit_kernel_linear_base = virtual_base;
+	jit_kernel_linear_size = size;
 }
 
 static inline struct jit_cache_entry *jit_lookup_entry(
@@ -5929,9 +7078,76 @@ static inline struct jit_cache_entry *jit_lookup_entry(
 	return NULL;
 }
 
-const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
+static inline uint32_t jit_context_privilege(uint32_t memory_context)
+{
+	return (memory_context >> JIT_CONTEXT_PRIVILEGE_SHIFT) & 3u;
+}
+
+/* Slow path: privilege, SUM/MXR or TLB epoch changed. */
+static __attribute__((noinline)) void jit_select_memory_context(
+	uint32_t memory_context)
+{
+	uint32_t privilege = jit_context_privilege(memory_context);
+	uint32_t epoch = memory_context & JIT_CONTEXT_EPOCH_MASK;
+	struct rv32_native_jit_runtime *runtime;
+
+	if (privilege == 0u)
+		runtime = &jit_runtimes[JIT_BANK_USER];
+	else if (memory_context & JIT_CONTEXT_SUM)
+		runtime = &jit_runtimes[JIT_BANK_SUPERVISOR_SUM];
+	else
+		runtime = &jit_runtimes[JIT_BANK_SUPERVISOR];
+	jit_rt = runtime;
+	jit_exec_privilege_tag = privilege << 20;
+	if (runtime->memory_context == memory_context)
+		return;
+	/* The interpreter normally flushed already, leaving UINT32_MAX. */
+	if (epoch != jit_memory_epoch) {
+		if (jit_memory_epoch != UINT32_MAX)
+			jit_invalidate_translations();
+		jit_memory_epoch = epoch;
+	}
+	/* Same epoch, new SUM/MXR: only this bank's data permissions change. */
+	jit_invalidate_memory_pages(runtime);
+	runtime->memory_context = memory_context;
+}
+
+static inline void jit_adopt_memory_context(uint32_t memory_context)
+{
+	if (__builtin_expect(jit_rt->memory_context != memory_context, 0))
+		jit_select_memory_context(memory_context);
+}
+
+void IRAM_ATTR rv32_native_jit_seed_ram_page(uint32_t physical_offset,
+	uint32_t virtual_address, uint32_t memory_context, bool write)
+{
+	if (jit_code_arena == NULL || jit_rt->image == NULL ||
+	    ((physical_offset | virtual_address) & 0xfffu) != 0u ||
+	    jit_context_privilege(memory_context) > JIT_MAX_PRIVILEGE)
+		return;
+	/* Adopt first so the mapping lands in the right bank and epoch. */
+	jit_adopt_memory_context(memory_context);
+	uint32_t vpn = virtual_address >> 12;
+	uint32_t index = vpn & (RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u);
+	uint32_t bias = (uint32_t)(uintptr_t)(jit_rt->image + physical_offset) -
+		virtual_address;
+	if (write) {
+		struct rv32_native_jit_write_page *page = &jit_rt->write_pages[index];
+		page->host_bias = bias;
+		page->linear_page_start = UINT32_MAX;
+		page->linear_page_end = 0u;
+		__atomic_store_n(&page->virtual_page, vpn, __ATOMIC_RELEASE);
+	} else {
+		struct rv32_native_jit_read_page *page = &jit_rt->read_pages[index];
+		page->host_bias = bias;
+		__atomic_store_n(&page->virtual_page, vpn, __ATOMIC_RELEASE);
+	}
+}
+
+static const struct rv32_native_jit_result *IRAM_ATTR jit_try(
 	uint32_t physical_offset, uint32_t guest_pc,
-	uint32_t instruction_limit, uint32_t memory_context)
+	uint32_t instruction_limit, uint32_t memory_context,
+	uint32_t warm_weight)
 {
 	uint32_t set;
 	uint32_t slot = UINT32_MAX;
@@ -5940,23 +7156,20 @@ const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
 	uint32_t instruction;
 	bool candidate_loop;
 
-	if (jit_code_arena == NULL || jit_runtime.regs == NULL ||
-	    jit_runtime.image == NULL || instruction_limit <
+	if (jit_code_arena == NULL || jit_rt->regs == NULL ||
+	    jit_rt->image == NULL || instruction_limit <
 		JIT_MIN_GUEST_INSTRUCTIONS)
 		return NULL;
-	/* Linux boot previously exposed a supervisor-only translation fault.  Keep
-	 * the experiment on ordinary user code while retaining the interpreter for
-	 * kernel, exception and device paths.  This also keeps boot and I/O behavior
-	 * independent from the writable-code cache. */
-	if (((memory_context >> 8) & 3u) != 0u)
+	/* satp writes, LR/SC, xRET and MMIO accesses end a region, so S-mode code is
+	 * generated as for U-mode; only the data bank differs. */
+	if (jit_context_privilege(memory_context) > JIT_MAX_PRIVILEGE)
 		return NULL;
-	if (__builtin_expect(jit_runtime.memory_context != memory_context, 0)) {
-		jit_runtime.memory_context = memory_context;
-		jit_invalidate_cross_page_entries();
-		jit_invalidate_memory_pages();
-		jit_invalidate_exec_pages();
-	}
+	if (*jit_negative_slot(physical_offset) == (physical_offset | 1u))
+		return NULL;
+	jit_adopt_memory_context(memory_context);
 	jit_cache_exec_page(physical_offset, guest_pc);
+	/* Native callbacks never switch banks. */
+	struct rv32_native_jit_runtime *const runtime = jit_rt;
 
 #if CONFIG_RV32_HOST_PERF_STATS || CONFIG_RV32_EMULATOR_PERF_STATS
 	jit_stats.lookups++;
@@ -5973,23 +7186,23 @@ const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
 		uint32_t cross_page_chains = 0u;
 #endif
 
-		jit_runtime.dirty_epoch++;
-		if (__builtin_expect(jit_runtime.dirty_epoch == 0u, 0)) {
+		runtime->dirty_epoch++;
+		if (__builtin_expect(runtime->dirty_epoch == 0u, 0)) {
 			for (uint32_t index = 0;
 			     index < RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES; index++)
-				jit_runtime.write_pages[index].dirty_epoch = 0u;
-			jit_runtime.dirty_epoch = 1u;
+				runtime->write_pages[index].dirty_epoch = 0u;
+			runtime->dirty_epoch = 1u;
 		}
-		jit_runtime.result.native_successor = 0u;
-		jit_runtime.result.linear_dirty_start = UINT32_MAX;
-		jit_runtime.result.linear_dirty_end = 0u;
-		jit_runtime.result.linear_store_calls = 0u;
-		jit_runtime.result.linear_store_bytes = 0u;
-		jit_runtime.memory_calls = 0u;
-		jit_runtime.chain_instruction_limit = instruction_limit;
-		jit_runtime.chain_executed = 0u;
-		jit_runtime.chain_blocks = 0u;
-		jit_runtime.chain_links = 0u;
+		runtime->result.native_successor = 0u;
+		runtime->result.linear_dirty_start = UINT32_MAX;
+		runtime->result.linear_dirty_end = 0u;
+		runtime->result.linear_store_calls = 0u;
+		runtime->result.linear_store_bytes = 0u;
+		runtime->memory_calls = 0u;
+		runtime->chain_instruction_limit = instruction_limit;
+		runtime->chain_executed = 0u;
+		runtime->chain_blocks = 0u;
+		runtime->chain_links = 0u;
 
 		for (;;) {
 			jit_block_fn block;
@@ -5999,73 +7212,92 @@ const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
 			uint32_t executed;
 			uint32_t returned_slot;
 			uint32_t remaining =
-				instruction_limit - jit_runtime.chain_executed;
+				instruction_limit - runtime->chain_executed;
 			uint32_t next_pc;
 
 			if (entry->guest_instruction_count > remaining) {
-				if (jit_runtime.chain_executed == 0u)
+				if (runtime->chain_executed == 0u)
 					return NULL;
 				break;
 			}
-			jit_runtime.memory_value = 0u;
-			jit_runtime.result.next_pc = guest_pc;
-			jit_runtime.result.executed = 0u;
-			jit_runtime.result.trap = 0u;
-			jit_runtime.result.trap_value = 0u;
-			jit_runtime.result.native_successor = 0u;
-			jit_runtime.result.native_slot = UINT32_MAX;
-			jit_runtime.sites = jit_memory_sites[slot];
-			jit_runtime.site_count = entry->memory_site_count;
-			jit_runtime.loop_iterations = 1u;
+			runtime->memory_value = 0u;
+			runtime->result.next_pc = guest_pc;
+			runtime->result.executed = 0u;
+			runtime->result.trap = 0u;
+			runtime->result.trap_value = 0u;
+			runtime->result.native_successor = 0u;
+			runtime->result.native_slot = UINT32_MAX;
+			runtime->sites = jit_memory_sites[slot];
+			runtime->site_count = entry->memory_site_count;
+			runtime->loop_iterations = 1u;
 			if (entry->loops_to_start) {
-				/* The MiniRV32 batch limit is already the architectural service
-				 * boundary.  Spend that remaining guest-instruction budget here so
-				 * a long native loop does not return through C every 32 iterations. */
-				jit_runtime.loop_iterations =
-					remaining / entry->guest_instruction_count;
+				/* Run the loop natively for a long stretch, but come back
+				 * often enough to notice a pending host interrupt. */
+				uint32_t budget = remaining < JIT_LOOP_WAKE_BUDGET ?
+					remaining : JIT_LOOP_WAKE_BUDGET;
+
+				runtime->loop_iterations =
+					budget / entry->guest_instruction_count;
 			}
 			block = (jit_block_fn)(uintptr_t)jit_dispatch_code(slot,
 								      entry);
-			bailout = rv32_native_jit_enter(block, &jit_runtime);
-			returned_slot = jit_runtime.result.native_slot;
+		#if CONFIG_RV32_HOST_PERF_STATS
+			uint32_t native_cycle_start = jit_profile_cycle_count();
+			uint64_t refill_cycle_start = jit_stats.ram_refill_cycles;
+		#endif
+			bailout = rv32_native_jit_enter(block, runtime);
+		#if CONFIG_RV32_HOST_PERF_STATS
+			jit_stats.native_cycles += (uint32_t)(
+				jit_profile_cycle_count() - native_cycle_start) -
+				(jit_stats.ram_refill_cycles - refill_cycle_start);
+			jit_stats.native_entries++;
+		#endif
+			returned_slot = runtime->result.native_slot;
 			if (returned_slot >= JIT_CACHE_SLOTS ||
 			    jit_entries[returned_slot].state != JIT_ENTRY_READY) {
-				jit_runtime.result.trap = 2u;
-				jit_runtime.result.trap_value = 0u;
+				runtime->result.trap = 2u;
+				runtime->result.trap_value = 0u;
 				break;
 			}
 			returned_entry = &jit_entries[returned_slot];
 			/* A tail-linked target installs no C-side site pointer. Recover it
 			 * from the final slot before invoking the checked slow path. */
 			if (bailout != 0u) {
-				jit_runtime.sites = jit_memory_sites[returned_slot];
-				jit_runtime.site_count =
+#if CONFIG_RV32_HOST_PERF_STATS
+				uint32_t resolve_start = jit_profile_cycle_count();
+#endif
+				runtime->sites = jit_memory_sites[returned_slot];
+				runtime->site_count =
 					returned_entry->memory_site_count;
-				jit_resolve_memory_bailout(&jit_runtime, bailout);
-				jit_runtime.chain_executed +=
-					jit_runtime.result.executed;
+				jit_resolve_memory_bailout(runtime, bailout);
+				runtime->chain_executed +=
+					runtime->result.executed;
+#if CONFIG_RV32_HOST_PERF_STATS
+				jit_stats.resolve_cycles += (uint32_t)(
+					jit_profile_cycle_count() - resolve_start);
+#endif
 			}
-			executed = jit_runtime.result.executed;
+			executed = runtime->result.executed;
 
 	#if CONFIG_RV32_HOST_PERF_STATS || CONFIG_RV32_EMULATOR_PERF_STATS
 			block_bailouts +=
 				executed < returned_entry->guest_instruction_count;
 	#endif
-			total_executed = jit_runtime.chain_executed;
+			total_executed = runtime->chain_executed;
 			if (__builtin_expect(total_executed > instruction_limit, 0)) {
-				jit_runtime.result.trap = 2u;
-				jit_runtime.result.trap_value = 0u;
+				runtime->result.trap = 2u;
+				runtime->result.trap_value = 0u;
 				break;
 			}
 			if (executed == 0u || bailout != 0u ||
-			    jit_runtime.result.trap != 0u)
+			    runtime->result.trap != 0u || JIT_HOST_WAKE_PENDING())
 				break;
 
-			jit_runtime.result.native_successor = 1u;
+			runtime->result.native_successor = 1u;
 			if (instruction_limit - total_executed <
 			    JIT_MIN_GUEST_INSTRUCTIONS)
 				break;
-			next_pc = jit_runtime.result.next_pc;
+			next_pc = runtime->result.next_pc;
 			/* Native links may have crossed several independently compiled
 			 * regions. Continue from the authoritative final entry, not from
 			 * the region that C originally called. */
@@ -6093,39 +7325,48 @@ const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
 			cross_page_chains += crossed_page;
 #endif
 		}
-		total_executed = jit_runtime.chain_executed;
+		total_executed = runtime->chain_executed;
 	#if CONFIG_RV32_HOST_PERF_STATS
 		jit_profile_guest_instructions[profile_slot] += total_executed;
 	#endif
 	#if CONFIG_RV32_HOST_PERF_STATS || CONFIG_RV32_EMULATOR_PERF_STATS
-		jit_stats.lookups += chained_lookups + jit_runtime.chain_links;
-		jit_stats.calls += jit_runtime.chain_blocks;
+		jit_stats.lookups += chained_lookups + runtime->chain_links;
+		jit_stats.calls += runtime->chain_blocks;
 		jit_stats.guest_instructions += total_executed;
-		jit_stats.memory_calls += jit_runtime.memory_calls;
+		jit_stats.memory_calls += runtime->memory_calls;
 		jit_stats.memory_bailouts += block_bailouts;
 		jit_stats.cross_page_chains += cross_page_chains;
-		jit_stats.native_link_transitions += jit_runtime.chain_links;
+		jit_stats.native_link_transitions += runtime->chain_links;
 	#endif
-		jit_runtime.result.executed = total_executed;
-		if (total_executed == 0u && jit_runtime.result.trap == 0u)
+		runtime->result.executed = total_executed;
+		if (total_executed == 0u && runtime->result.trap == 0u)
 			return NULL;
-		return &jit_runtime.result;
+		return &runtime->result;
 	}
 	if (entry != NULL && entry->state == JIT_ENTRY_REJECTED)
-		return NULL;
-
-	/* Do not fill the warm table with privileged or otherwise unsupported
-	 * instructions.  A single physical instruction load is cheaper than
-	 * repeatedly compiling and rejecting such sites. */
-	memcpy(&instruction, jit_runtime.image + physical_offset,
-	       sizeof(instruction));
-	if (jit_instruction_kind(instruction) == JIT_INSN_UNSUPPORTED)
 		return NULL;
 
 	warm = &jit_warm[jit_hash(physical_offset, guest_pc,
 				  JIT_WARM_SLOTS - 1u)];
 	if (!warm->valid || warm->physical_offset != physical_offset ||
 	    warm->guest_pc != guest_pc) {
+		/* A first visit loads the physical instruction once so privileged
+		 * or otherwise unsupported starts never take a warm entry.  Repeat
+		 * visits skip that guest-RAM read; compilation revalidates the code. */
+		memcpy(&instruction, runtime->image + physical_offset,
+		       sizeof(instruction));
+		if (jit_instruction_kind(instruction) == JIT_INSN_UNSUPPORTED) {
+#if CONFIG_RV32_JIT_EXIT_TRACE
+			rv32_jit_trace_record(RV32_JIT_TRACE_UNSUPPORTED, guest_pc,
+				physical_offset, instruction, 0u, 0u, 0u);
+#endif
+#if CONFIG_RV32_HOST_PERF_STATS
+			jit_stats.unsupported_probes[
+				jit_unsupported_class(instruction)]++;
+#endif
+			jit_remember_negative(physical_offset);
+			return NULL;
+		}
 		warm->physical_offset = physical_offset;
 		warm->guest_pc = guest_pc;
 		warm->hits = 1u;
@@ -6133,13 +7374,16 @@ const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
 		warm->reserved = 0u;
 		return NULL;
 	}
-	if (warm->hits != UINT16_MAX)
-		warm->hits++;
+	/* A caller that skipped probes for this head accounts for them here. */
+	if (warm->hits < UINT16_MAX - warm_weight)
+		warm->hits = (uint16_t)(warm->hits + warm_weight);
+	else
+		warm->hits = UINT16_MAX;
 	if (warm->hits < JIT_LOOP_HOT_THRESHOLD)
 		return NULL;
 	if ((warm->reserved & JIT_WARM_CLASSIFIED) == 0u) {
 		warm->reserved = JIT_WARM_CLASSIFIED;
-		if (jit_candidate_loops_to_start(jit_runtime.image,
+		if (jit_candidate_loops_to_start(runtime->image,
 				physical_offset, guest_pc, instruction_limit))
 			warm->reserved |= JIT_WARM_LOOPS_TO_START;
 	}
@@ -6180,15 +7424,75 @@ const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
 		jit_stats.replacements++;
 		jit_stats.tag_evictions++;
 	}
-	(void)jit_compile(slot, jit_runtime.image, physical_offset, guest_pc,
-			  instruction_limit);
+	{
+#if CONFIG_RV32_HOST_PERF_STATS
+		uint32_t compile_start = jit_profile_cycle_count();
+#endif
+		(void)jit_compile_with_entry_values(slot, runtime->image,
+			physical_offset, guest_pc, instruction_limit,
+#if CONFIG_RV32_NATIVE_JIT_SPLIT_LOAD_PAGES
+			runtime->regs
+#else
+			NULL
+#endif
+		);
+#if CONFIG_RV32_HOST_PERF_STATS
+		jit_stats.compile_cycles += (uint32_t)(
+			jit_profile_cycle_count() - compile_start);
+#endif
+	}
 	warm->valid = 0u;
 	return NULL;
+}
+
+const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
+	uint32_t physical_offset, uint32_t guest_pc,
+	uint32_t instruction_limit, uint32_t memory_context)
+{
+	return jit_try(physical_offset, guest_pc, instruction_limit,
+		       memory_context, 1u);
+}
+
+const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try_weighted(
+	uint32_t physical_offset, uint32_t guest_pc,
+	uint32_t instruction_limit, uint32_t memory_context,
+	uint32_t warm_weight)
+{
+	return jit_try(physical_offset, guest_pc, instruction_limit,
+		       memory_context, warm_weight);
+}
+
+const struct rv32_native_jit_result *rv32_native_jit_try_profiled(
+	uint32_t physical_offset, uint32_t guest_pc,
+	uint32_t instruction_limit, uint32_t memory_context,
+	uint32_t warm_weight)
+{
+#if CONFIG_RV32_HOST_PERF_STATS
+	uint32_t cycle_start = jit_profile_cycle_count();
+	uint64_t compile_start = jit_stats.compile_cycles;
+#endif
+	const struct rv32_native_jit_result *result = jit_try(
+		physical_offset, guest_pc, instruction_limit, memory_context,
+		warm_weight);
+#if CONFIG_RV32_HOST_PERF_STATS
+	{
+		uint32_t cycles = jit_profile_cycle_count() - cycle_start;
+
+		jit_stats.dispatch_cycles += cycles;
+		jit_stats.dispatch_attempts++;
+		if (result == NULL && jit_stats.compile_cycles == compile_start) {
+			jit_stats.probe_count++;
+			jit_stats.probe_cycles += cycles;
+		}
+	}
+#endif
+	return result;
 }
 
 void rv32_native_jit_flush(void)
 {
 	memset(jit_entries, 0, sizeof(jit_entries));
+	memset(jit_negative_cache, 0, sizeof(jit_negative_cache));
 	memset(jit_warm, 0, JIT_WARM_BYTES);
 	memset(jit_replace_way, 0, sizeof(jit_replace_way));
 	memset(jit_hot_entries, 0, sizeof(jit_hot_entries));
@@ -6208,10 +7512,7 @@ void rv32_native_jit_flush(void)
 
 void rv32_native_jit_memory_cache_flush(void)
 {
-	jit_runtime.memory_context = UINT32_MAX;
-	jit_invalidate_cross_page_entries();
-	jit_invalidate_memory_pages();
-	jit_invalidate_exec_pages();
+	jit_invalidate_translations();
 }
 
 void rv32_native_jit_memory_cache_flush_page(uint32_t virtual_address)
@@ -6220,14 +7521,23 @@ void rv32_native_jit_memory_cache_flush_page(uint32_t virtual_address)
 	uint32_t data_index =
 		virtual_page & (RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u);
 	uint32_t exec_index = jit_exec_page_index(virtual_address);
+	uint32_t history_index = jit_exec_history_index(virtual_page);
 
-	/* A page-scoped SFENCE.VMA changes neither the global permission context
-	 * nor unrelated translations. Evict only the colliding direct-map slots;
-	 * this is conservative even when their tags belong to another page. */
-	jit_runtime.read_pages[data_index].virtual_page = UINT32_MAX;
-	jit_runtime.write_pages[data_index].virtual_page = UINT32_MAX;
-	jit_runtime.write_pages[data_index].linear_page_start = UINT32_MAX;
-	jit_runtime.write_pages[data_index].linear_page_end = 0u;
+	/* Page-scoped SFENCE.VMA: evict this VPN's slot in every bank, whatever
+	 * page it holds. */
+	for (uint32_t bank = 0; bank < JIT_MEMORY_BANKS; bank++) {
+		struct rv32_native_jit_runtime *runtime = &jit_runtimes[bank];
+
+		runtime->read_pages[data_index].virtual_page = UINT32_MAX;
+		runtime->write_pages[data_index].virtual_page = UINT32_MAX;
+		runtime->write_pages[data_index].linear_page_start = UINT32_MAX;
+		runtime->write_pages[data_index].linear_page_end = 0u;
+	}
+	/* Links only depend on executed pages.  Keep the history bit: it may
+	 * stand for another page too. */
+	if (!(jit_exec_history[history_index >> 5] &
+	      (UINT32_C(1) << (history_index & 31u))))
+		return;
 	jit_exec_pages[exec_index].virtual_page = UINT32_MAX;
 	jit_invalidate_cross_page_entries();
 }

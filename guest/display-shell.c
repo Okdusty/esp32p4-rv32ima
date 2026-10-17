@@ -2,8 +2,11 @@
  * Prefer the standard virtio-console hvc terminal. The host delivers UART0
  * RX through its input virtqueue and renders hvc output on CPU1, avoiding the
  * guest fbcon pixel path. Linux translates USB HID keyboard events through
- * its normal VT keymap; this process forwards the resulting tty0 bytes to the
+ * its normal VT keymap; this process forwards the resulting tty1 bytes to the
  * same hvc terminal. Older kernels retain the tty0 + TIOCSTI fallback.
+ *
+ * tty1 stands in for the hvc terminal: Ctrl+Alt+F2..F6 switch to fbcon
+ * logins and F7 to X, and the host hides its terminal while they are shown.
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
@@ -12,6 +15,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -27,20 +32,45 @@
 
 #define INPUT_CHUNK 128
 #define DISPLAY_INPUT "/dev/ttyD"
+#define TERMINAL_VT "/dev/tty1"
+#define FIRST_LOGIN_VT 2
+#define LAST_LOGIN_VT 6
+/* Private modes understood by the host terminal (display_bridge.c). */
+#define HIDE_TERMINAL "\033[?7700h"
+#define SHOW_TERMINAL "\033[?7700l"
+
+enum { EVENT_CHILD = 'C', EVENT_VT_RELEASE = 'R', EVENT_VT_ACQUIRE = 'A' };
 
 static int child_event_write = -1;
+static pid_t vt_logins[LAST_LOGIN_VT + 1];
 
 static void console_error(int console, const char *message);
 
-static void child_event(int signal_number)
+static void post_event(unsigned char event)
 {
 	int saved_errno = errno;
-	unsigned char event = 1;
 
-	(void)signal_number;
 	if (child_event_write >= 0)
 		(void)write(child_event_write, &event, sizeof(event));
 	errno = saved_errno;
+}
+
+static void child_event(int signal_number)
+{
+	(void)signal_number;
+	post_event(EVENT_CHILD);
+}
+
+static void vt_release_event(int signal_number)
+{
+	(void)signal_number;
+	post_event(EVENT_VT_RELEASE);
+}
+
+static void vt_acquire_event(int signal_number)
+{
+	(void)signal_number;
+	post_event(EVENT_VT_ACQUIRE);
 }
 
 static int configure_uart_input(int serial)
@@ -152,7 +182,7 @@ static void fatal_idle(int console, const char *message)
 		dprintf(STDERR_FILENO, "display-shell: %s: %s\n", message,
 			strerror(errno));
 
-	/* PID 1 must never return: Linux panics when init exits. */
+	/* Idle rather than exit, which would only make init restart us. */
 	for (;;)
 		pause();
 }
@@ -204,6 +234,16 @@ static pid_t start_login_reliably(int console, const char *console_path,
 	return login_pid;
 }
 
+static void start_vt_login(int vt, int child_event_read)
+{
+	char path[16];
+
+	snprintf(path, sizeof(path), "/dev/tty%d", vt);
+	vt_logins[vt] = start_login(path, child_event_read);
+	if (vt_logins[vt] < 0)
+		vt_logins[vt] = 0;
+}
+
 static pid_t reap_children(int console, const char *console_path,
 			   int child_event_read, pid_t login_pid)
 {
@@ -214,6 +254,12 @@ static pid_t reap_children(int console, const char *console_path,
 	while ((child = waitpid(-1, &status, WNOHANG)) > 0) {
 		if (child == login_pid)
 			login_exited = true;
+		for (int vt = FIRST_LOGIN_VT; vt <= LAST_LOGIN_VT; vt++) {
+			if (child == vt_logins[vt]) {
+				usleep(250000);
+				start_vt_login(vt, child_event_read);
+			}
+		}
 	}
 
 	if (!login_exited)
@@ -224,10 +270,60 @@ static pid_t reap_children(int console, const char *console_path,
 	return start_login_reliably(console, console_path, child_event_read);
 }
 
+/* Keep fbcon off tty1 and get a signal on every switch away and back. */
+static bool take_terminal_vt(int vt)
+{
+	struct vt_mode mode = {
+		.mode = VT_PROCESS,
+		.relsig = SIGUSR1,
+		.acqsig = SIGUSR2,
+	};
+
+	return ioctl(vt, KDSETMODE, KD_GRAPHICS) == 0 &&
+	       ioctl(vt, VT_SETMODE, &mode) == 0;
+}
+
+static void write_console(int console, const char *text)
+{
+	(void)write(console, text, strlen(text));
+}
+
+static void release_terminal_vt(int console, int vt)
+{
+	/* Let the host hide the terminal before the next VT draws. */
+	write_console(console, HIDE_TERMINAL);
+	(void)tcdrain(console);
+	usleep(20000);
+	if (ioctl(vt, VT_RELDISP, 1) < 0)
+		console_error(console, "VT release failed");
+}
+
+static void acquire_terminal_vt(int console, int vt)
+{
+	if (ioctl(vt, VT_RELDISP, VT_ACKACQ) < 0)
+		console_error(console, "VT acquire failed");
+	write_console(console, SHOW_TERMINAL);
+}
+
+/* The active VT from sysfs, or 0 if unknown; rereading rearms poll. */
+static int read_active_vt(int active)
+{
+	char name[16];
+	ssize_t length;
+
+	if (lseek(active, 0, SEEK_SET) < 0)
+		return 0;
+	length = read(active, name, sizeof(name) - 1);
+	if (length <= 0)
+		return 0;
+	name[length] = '\0';
+	return strncmp(name, "tty", 3) == 0 ? atoi(name + 3) : 0;
+}
+
 int main(void)
 {
 	struct sigaction action = { 0 };
-	struct pollfd watched[4];
+	struct pollfd watched[5];
 	unsigned char input[INPUT_CHUNK];
 	int child_events[2];
 	int console;
@@ -237,6 +333,8 @@ int main(void)
 	int vt_input_watch = -1;
 	int display_input;
 	int display_input_watch = -1;
+	int active = -1;
+	int active_watch = -1;
 	int child_watch;
 	int watched_count = 0;
 	const char *console_path = "/dev/hvc0";
@@ -257,10 +355,10 @@ int main(void)
 		fatal_idle(console, "terminal setup failed");
 	}
 	if (strcmp(console_path, "/dev/hvc0") == 0) {
-		vt_input = open("/dev/tty0",
+		vt_input = open(TERMINAL_VT,
 				O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
 		if (vt_input < 0 || configure_vt_input(vt_input) < 0) {
-			console_error(console, "cannot enable tty0 keyboard input");
+			console_error(console, "cannot enable tty1 keyboard input");
 			if (vt_input >= 0)
 				close(vt_input);
 			vt_input = -1;
@@ -280,6 +378,33 @@ int main(void)
 	if (sigaction(SIGCHLD, &action, NULL) < 0) {
 		fatal_idle(console, "SIGCHLD setup failed");
 	}
+	action.sa_flags = 0;
+	action.sa_handler = vt_release_event;
+	if (sigaction(SIGUSR1, &action, NULL) < 0)
+		fatal_idle(console, "SIGUSR1 setup failed");
+	action.sa_handler = vt_acquire_event;
+	if (sigaction(SIGUSR2, &action, NULL) < 0)
+		fatal_idle(console, "SIGUSR2 setup failed");
+
+	if (vt_input >= 0 && take_terminal_vt(vt_input)) {
+		/* A VT must exist before the keyboard can switch to it. */
+		for (int vt = FIRST_LOGIN_VT; vt <= LAST_LOGIN_VT; vt++) {
+			char path[16];
+			int fd;
+
+			snprintf(path, sizeof(path), "/dev/tty%d", vt);
+			fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+			if (fd >= 0)
+				close(fd);
+		}
+		active = open("/sys/class/tty/tty0/active",
+			      O_RDONLY | O_CLOEXEC);
+		/* Restarted while another VT is shown: keep the terminal hidden. */
+		write_console(console, active >= 0 && read_active_vt(active) > 1 ?
+				       HIDE_TERMINAL : SHOW_TERMINAL);
+	} else if (vt_input >= 0) {
+		console_error(console, "VT switching unavailable");
+	}
 
 	login_pid = start_login_reliably(console, console_path, child_events[0]);
 
@@ -298,6 +423,11 @@ int main(void)
 		watched[display_input_watch].fd = display_input;
 		watched[display_input_watch].events = POLLIN;
 	}
+	if (active >= 0) {
+		active_watch = watched_count++;
+		watched[active_watch].fd = active;
+		watched[active_watch].events = POLLPRI;
+	}
 	child_watch = watched_count++;
 	watched[child_watch].fd = child_events[0];
 	watched[child_watch].events = POLLIN;
@@ -314,11 +444,34 @@ int main(void)
 
 		if (watched[child_watch].revents & POLLIN) {
 			unsigned char events[32];
+			ssize_t count;
+			bool child_exited = false;
 
-			while (read(child_events[0], events, sizeof(events)) > 0)
-				;
-			login_pid = reap_children(console, console_path,
-						  child_events[0], login_pid);
+			while ((count = read(child_events[0], events,
+					     sizeof(events))) > 0) {
+				for (ssize_t i = 0; i < count; i++) {
+					if (events[i] == EVENT_VT_RELEASE)
+						release_terminal_vt(console, vt_input);
+					else if (events[i] == EVENT_VT_ACQUIRE)
+						acquire_terminal_vt(console, vt_input);
+					else
+						child_exited = true;
+				}
+			}
+			if (child_exited)
+				login_pid = reap_children(console, console_path,
+							  child_events[0],
+							  login_pid);
+		}
+
+		/* Start a VT's login the first time it is shown. */
+		if (active_watch >= 0 &&
+		    (watched[active_watch].revents & (POLLPRI | POLLERR))) {
+			int vt = read_active_vt(active);
+
+			if (vt >= FIRST_LOGIN_VT && vt <= LAST_LOGIN_VT &&
+			    vt_logins[vt] == 0)
+				start_vt_login(vt, child_events[0]);
 		}
 
 		if (serial_watch >= 0 &&
@@ -337,7 +490,7 @@ int main(void)
 			ssize_t received = read(vt_input, input, sizeof(input));
 
 			if (received < 0 && errno != EINTR && errno != EAGAIN)
-				console_error(console, "tty0 keyboard read failed");
+				console_error(console, "tty1 keyboard read failed");
 			if (received > 0)
 				inject_console_input(console, input, received,
 						     &injection_error_reported);

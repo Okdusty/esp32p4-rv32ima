@@ -53,6 +53,18 @@
 	#define MINIRV32_KERNEL_LINEAR_PHYS_OFFSET 0x00400000u
 #endif
 
+/* Highest privilege whose code may run natively: 0 keeps the native JIT on
+ * U-mode code, 1 adds S-mode.  Machine mode is always interpreted. */
+#ifndef MINIRV32_NATIVE_JIT_MAX_PRIVILEGE
+	#define MINIRV32_NATIVE_JIT_MAX_PRIVILEGE 0u
+#endif
+
+/* Nonzero when the host has a new interrupt for the guest: taken control
+ * transfers then end the batch so the interrupt is seen promptly. */
+#ifndef MINIRV32_HOST_WAKE_PENDING
+	#define MINIRV32_HOST_WAKE_PENDING() 0
+#endif
+
 #if (MINIRV32_TLB_ENTRIES & (MINIRV32_TLB_ENTRIES - 1)) != 0
 	#error "MINIRV32_TLB_ENTRIES must be a power of two"
 #endif
@@ -87,6 +99,9 @@
  * dirty range and published once at the end of an interpreter batch.  The
  * publisher remains asynchronous and decides what the memory represents. */
 #ifdef MINIRV32_LINEAR_MMIO_APERTURE
+	#ifndef MINIRV32_LINEAR_MMIO_ACCESS
+		#define MINIRV32_LINEAR_MMIO_ACCESS() do { } while (0)
+	#endif
 	#ifndef MINIRV32_LINEAR_MMIO_BASE
 		#error "MINIRV32_LINEAR_MMIO_BASE is required"
 	#endif
@@ -923,6 +938,15 @@ static __attribute__((noinline)) uint32_t MiniRV32SupervisorInterruptCause(
 	#define MINIRV32_DECODE_OPIMM_SRA() (ir & 0x40000000u)
 #endif
 
+#if defined(MINIRV32_NATIVE_JIT_TRY) || defined(MINIRV32_NATIVE_JIT_CACHE_RAM_PAGE)
+static inline uint32_t MiniRV32NativeMemoryContext(const struct MiniRV32IMAState *state)
+{
+	return (state->tlb_epoch & MINIRV32_TLB_EPOCH_MASK) |
+		((state->extraflags & 3u) << 8) |
+		(((state->mstatus >> 18) & 3u) << 10);
+}
+#endif
+
 MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 	struct MiniRV32IMAState *state,
 	uint8_t *image, uint32_t vProcAddress,
@@ -1081,15 +1105,13 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 		{
 			if (__builtin_expect(pc != native_jit_candidate_pc, 1))
 				goto native_jit_done;
-			if (__builtin_expect((CSR(extraflags) & 3u) != 0u, 0))
+			if (__builtin_expect((CSR(extraflags) & 3u) >
+					     MINIRV32_NATIVE_JIT_MAX_PRIVILEGE, 0))
 				goto native_jit_done;
 			uint32_t jit_limit = (uint32_t)(count - icount);
 			/* Cached native data-page mappings are valid only for this TLB
 			 * generation, privilege level and SUM/MXR permission state. */
-			uint32_t jit_memory_context =
-				(CSR(tlb_epoch) & MINIRV32_TLB_EPOCH_MASK) |
-				((CSR(extraflags) & 3u) << 8) |
-				(((CSR(mstatus) >> 18) & 3u) << 10);
+			uint32_t jit_memory_context = MiniRV32NativeMemoryContext(state);
 			__auto_type jit_result = MINIRV32_NATIVE_JIT_TRY(
 				ofs_pc, pc, jit_limit,
 				jit_memory_context);
@@ -1129,10 +1151,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 				uint32_t native_source_pc = pc;
 
 				pc = jit_result->next_pc;
-				/* Keep walking a hot user-mode control-flow path.  The successor
-				 * still passes through the normal warm-up, page and instruction
-				 * budget checks; this merely lets adjacent basic blocks become
-				 * candidates instead of limiting native execution to loop heads. */
+				/* Let the successor become a candidate too, not only loop
+				 * heads; it still passes the usual warm-up and budget checks. */
 				native_jit_candidate_pc =
 					jit_result->native_successor ? pc : UINT32_MAX;
 				exec_page_budget = MiniRV32ExecTargetBudget(
@@ -1140,7 +1160,18 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 				#ifdef MINIRV32_DECODED_BLOCK_CACHE
 				decoded_ptr = &decoded_refill_entry;
 				#endif
+				/* Native code may have rewritten sstatus (SUM/MXR); the
+				 * interpreter's own cached data pages must not outlive it. */
+				read_virtual_page = UINT32_MAX;
+				write_virtual_page = UINT32_MAX;
 				icount += (int)jit_result->executed - 1;
+				/* A CSR write in native code may have made a pending
+				 * supervisor interrupt deliverable (the idle loop's
+				 * csrsi sstatus,SIE after WFI).  End the batch, as the
+				 * interpreter's CSR path does, so the next batch traps
+				 * before the guest masks interrupts again. */
+				if (MiniRV32SupervisorInterruptCause(state))
+					count = icount + 1;
 				continue;
 			}
 			}
@@ -1246,6 +1277,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					#endif
 					exec_page_budget = MiniRV32ExecTargetBudget(
 						target_pc, pc);
+					if (MINIRV32_HOST_WAKE_PENDING())
+						count = icount + 1;
 					pc = target_pc - 4;
 					#ifdef MINIRV32_DECODED_BLOCK_CACHE
 					decoded_ptr = &decoded_refill_entry;
@@ -1265,6 +1298,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					#endif
 					exec_page_budget = MiniRV32ExecTargetBudget(
 						target_pc, pc);
+					if (MINIRV32_HOST_WAKE_PENDING())
+						count = icount + 1;
 					pc = target_pc - 4;
 					#ifdef MINIRV32_DECODED_BLOCK_CACHE
 					decoded_ptr = &decoded_refill_entry;
@@ -1320,6 +1355,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 
 						exec_page_budget = MiniRV32ExecTargetBudget(
 							target_pc, pc);
+						if (MINIRV32_HOST_WAKE_PENDING())
+							count = icount + 1;
 						pc = target_pc - 4;
 						#ifdef MINIRV32_DECODED_BLOCK_CACHE
 						decoded_ptr = &decoded_refill_entry;
@@ -1327,7 +1364,11 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 					}
 					#ifdef MINIRV32_NATIVE_JIT_TRY
 					else {
-						native_jit_candidate_pc = pc + 4u;
+						/* Kernel code is branchy and mostly cold; probing
+						 * every fall-through there costs more than it wins
+						 * even with the probe filter (measured 2026-10). */
+						native_jit_candidate_pc =
+							(CSR(extraflags) & 3u) ? UINT32_MAX : pc + 4u;
 					}
 					#endif
 					break;
@@ -1398,10 +1439,19 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 						if (!uncached &&
 						    read_physical_page >= MINIRV32_RAM_IMAGE_OFFSET &&
 						    read_physical_page - MINIRV32_RAM_IMAGE_OFFSET <=
-							MINI_RV32_RAM_SIZE - 0x1000u)
+							MINI_RV32_RAM_SIZE - 0x1000u) {
 							read_ram_offset_bias = read_physical_page -
 								MINIRV32_RAM_IMAGE_OFFSET - virtual_page;
-						else
+						#ifdef MINIRV32_NATIVE_JIT_CACHE_RAM_PAGE
+							/* Page refills publish into the current privilege's
+							 * bank; M-mode never does. */
+							if ((CSR(extraflags) & 3u) <=
+							    MINIRV32_NATIVE_JIT_MAX_PRIVILEGE)
+								MINIRV32_NATIVE_JIT_CACHE_RAM_PAGE(
+									read_physical_page - MINIRV32_RAM_IMAGE_OFFSET,
+									virtual_page, MiniRV32NativeMemoryContext(state), 0);
+						#endif
+						} else
 							read_ram_offset_bias = UINT32_MAX;
 					}
 
@@ -1450,6 +1500,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							const uint8_t *source =
 								linear_mmio_host + linear_mmio_offset;
 
+							MINIRV32_LINEAR_MMIO_ACCESS();
 							if (linear_mmio_width == sizeof(uint32_t)) {
 								__builtin_memcpy(&rval, source, sizeof(uint32_t));
 							} else if (linear_mmio_width == sizeof(uint16_t)) {
@@ -1566,10 +1617,17 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 						if (!uncached &&
 						    write_physical_page >= MINIRV32_RAM_IMAGE_OFFSET &&
 						    write_physical_page - MINIRV32_RAM_IMAGE_OFFSET <=
-							MINI_RV32_RAM_SIZE - 0x1000u)
+							MINI_RV32_RAM_SIZE - 0x1000u) {
 							write_ram_offset_bias = write_physical_page -
 								MINIRV32_RAM_IMAGE_OFFSET - virtual_page;
-						else
+						#ifdef MINIRV32_NATIVE_JIT_CACHE_RAM_PAGE
+							if ((CSR(extraflags) & 3u) <=
+							    MINIRV32_NATIVE_JIT_MAX_PRIVILEGE)
+								MINIRV32_NATIVE_JIT_CACHE_RAM_PAGE(
+									write_physical_page - MINIRV32_RAM_IMAGE_OFFSET,
+									virtual_page, MiniRV32NativeMemoryContext(state), 1);
+						#endif
+						} else
 							write_ram_offset_bias = UINT32_MAX;
 					}
 
@@ -1609,6 +1667,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							uint8_t *destination =
 								linear_mmio_host + linear_mmio_offset;
 
+							MINIRV32_LINEAR_MMIO_ACCESS();
 							if (linear_mmio_width == sizeof(uint32_t))
 								__builtin_memcpy(destination, &rs2,
 										 sizeof(uint32_t));

@@ -10,6 +10,15 @@ openwrt_revision=${OPENWRT_REVISION:-f0a60eee2fe051741c643ea6118718aae1ef17fb}
 jobs=${JOBS:-$(nproc)}
 sdkconfig_file=${SDKCONFIG:-"$repo_root/sdkconfig"}
 
+# Machine-local SSH keys, kept out of the tracked overlay; set either
+# variable empty to disable it.
+if [[ ! -v DROPBEAR_HOST_KEY && -s "$work_root/ssh/dropbear_ed25519_host_key" ]]; then
+  DROPBEAR_HOST_KEY="$work_root/ssh/dropbear_ed25519_host_key"
+fi
+if [[ ! -v DROPBEAR_AUTHORIZED_KEYS && -s "$work_root/ssh/authorized_keys" ]]; then
+  DROPBEAR_AUTHORIZED_KEYS="$work_root/ssh/authorized_keys"
+fi
+
 # Menuconfig owns the defaults, while environment overrides make automated
 # guest-image comparisons possible without editing any tracked file.
 guest_console=${RV32_GUEST_CONSOLE_MODE:-}
@@ -152,9 +161,27 @@ env STAGING_DIR="$openwrt_dir/staging_dir" \
 env STAGING_DIR="$openwrt_dir/staging_dir" \
 	"$cross_gcc" -Os -pipe -mabi=ilp32 -march=rv32ima \
 	-fno-caller-saves -fno-plt -fhonour-copts \
-	-Wformat -Werror=format-security -fstack-protector-strong \
+	-Wall -Wextra -Werror -fstack-protector-strong \
 	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
 	-I"$repo_root/main" \
+	"$repo_root/guest/rv32-reboot.c" \
+	-o "$openwrt_dir/files/usr/sbin/rv32-reboot"
+
+# PID 1. A compiled init avoids starting a shell command per setup step.
+env STAGING_DIR="$openwrt_dir/staging_dir" \
+	"$cross_gcc" -Os -pipe -mabi=ilp32 -march=rv32ima \
+	-fno-caller-saves -fno-plt -fhonour-copts \
+	-Wall -Wextra -Werror -fstack-protector-strong \
+	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
+	"$repo_root/guest/rv32-init.c" \
+	-o "$openwrt_dir/files/init"
+
+env STAGING_DIR="$openwrt_dir/staging_dir" \
+	"$cross_gcc" -Os -pipe -mabi=ilp32 -march=rv32ima \
+	-fno-caller-saves -fno-plt -fhonour-copts \
+	-Wformat -Werror=format-security -fstack-protector-strong \
+	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
+	-I"$repo_root/main" -I"$repo_root/main/display" \
 	"$repo_root/guest/fbstream.c" \
 	-o "$openwrt_dir/files/usr/bin/fbstream"
 
@@ -187,6 +214,134 @@ if [[ -e "$output_root/rootfs" ]]; then
   mv "$output_root/rootfs" "$output_root/rootfs.previous"
 fi
 mv "$new_rootfs" "$output_root/rootfs"
+
+# PID 1 is guest/rv32-init.c and the network is configured statically, so
+# OpenWrt's procd/netifd/ubus/uci service layer, its package manager and the
+# curl/mbedTLS stack never run.  The initramfs is unpacked into tmpfs and
+# pinned in guest RAM for the whole uptime, so every file here costs memory.
+(
+  cd "$output_root/rootfs"
+  shopt -s nullglob
+  while read -r pattern; do
+    [[ -z $pattern || $pattern == \#* ]] && continue
+    for path in $pattern; do
+      rm -rf -- "$path"
+    done
+  done <<'PRUNE'
+# package manager, curl, TLS, zlib (only apk and curl linked it)
+usr/bin/apk
+lib/apk
+etc/apk
+etc/profile.d/apk-cheatsheet.sh
+usr/bin/curl
+usr/lib/libcurl.so*
+usr/lib/libmbed*.so*
+etc/ssl
+usr/lib/libz.so*
+bin/uclient-fetch
+usr/bin/wget
+usr/lib/libuclient.so
+lib/libustream-ssl.so
+# procd / ubus / uci / netifd and their libraries
+sbin/procd
+sbin/init
+sbin/askfirst
+sbin/ujail
+sbin/ubusd
+bin/ubus
+lib/libubus.so*
+usr/lib/libudebug.so
+sbin/netifd
+lib/netifd
+lib/network
+usr/lib/libnl-tiny.so*
+sbin/uci
+lib/libuci.so*
+etc/config
+etc/uci-defaults
+sbin/validate_data
+lib/libvalidate.so
+sbin/logd
+sbin/logread
+# usr/libexec keeps sftp-server for scp/sftp over Dropbear
+usr/libexec/validate_firmware_image
+usr/libexec/network
+usr/libexec/login.sh
+usr/libexec/logread-ubox
+usr/bin/ucode
+usr/bin/ucc
+usr/bin/utpl
+usr/lib/ucode
+usr/lib/libucode.so*
+usr/bin/jshn
+usr/bin/jsonfilter
+usr/lib/libjson-c.so*
+lib/libblobmsg_json.so*
+lib/libjson_script.so*
+usr/share/libubox
+lib/libubox.so*
+# flash/upgrade tooling for real OpenWrt hardware
+lib/libfstools.so*
+sbin/mount_root
+sbin/factoryreset
+sbin/jffs2mark
+sbin/jffs2reset
+sbin/firstboot
+sbin/upgraded
+sbin/sysupgrade
+etc/sysupgrade.conf
+lib/upgrade
+lib/preinit
+etc/preinit
+sbin/mtd
+usr/bin/fwtool
+usr/bin/usign
+usr/bin/signify
+# the kernel has no loadable modules
+sbin/kmodloader
+sbin/insmod
+sbin/lsmod
+sbin/modinfo
+sbin/modprobe
+sbin/rmmod
+etc/modules.conf
+lib/config
+lib/firmware
+# hotplug / init scripts
+sbin/hotplug-call
+etc/hotplug.d
+etc/hotplug.json
+etc/hotplug-preinit.json
+usr/sbin/ntpd-hotplug
+sbin/udevtrigger
+sbin/urngd
+sbin/urandom_seed
+etc/init.d
+etc/rc.d
+etc/rc.common
+etc/rc.button
+sbin/service
+sbin/reload_config
+sbin/led.sh
+sbin/ifup
+sbin/ifdown
+sbin/ifstatus
+sbin/devstatus
+bin/board_detect
+bin/config_generate
+bin/ipcalc.sh
+etc/board.d
+etc/diag.sh
+lib/functions
+lib/functions.sh
+usr/bin/systemctl
+etc/banner.failsafe
+# curses add-on libraries; setterm needs only libncursesw
+usr/lib/libform*.so*
+usr/lib/libmenu*.so*
+usr/lib/libpanel*.so*
+PRUNE
+)
 rm -rf "$output_root/rootfs.previous"
 mv "$rootfs_archive" "$output_root/openwrt-rootfs-rv32.tar.gz"
 

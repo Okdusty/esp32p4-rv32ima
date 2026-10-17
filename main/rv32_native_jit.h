@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "rv32_jit_trace.h"
 
 #define RV32_NATIVE_JIT_CACHE_SLOTS 2048u
 #define RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES 64u
@@ -80,6 +81,14 @@ struct rv32_native_jit_runtime {
 	uint32_t (*store)(struct rv32_native_jit_runtime *runtime,
 			  uint32_t virtual_address, uint32_t value,
 			  uint32_t descriptor);
+	/* Publishes one RAM page mapping without performing the access.  access
+	 * is funct3 in bits 0..2 and the store flag in bit 3. */
+	bool (*refill_ram)(struct rv32_native_jit_runtime *runtime,
+			   uint32_t virtual_address, uint32_t access);
+#if CONFIG_RV32_JIT_EXIT_TRACE
+	/* Set only by the checked callback, never by generated code. */
+	uint32_t trace_memory_kind;
+#endif
 };
 
 /* Interval-only chain-entry diagnostic record. guest_instructions includes
@@ -98,10 +107,30 @@ struct rv32_native_jit_region_stats {
 };
 
 struct rv32_native_jit_stats {
+	/* calls counts generated blocks, including blocks reached by native links.
+	 * These separate counters measure the C API and assembly-entry boundaries. */
+	uint64_t dispatch_attempts;
+	uint64_t native_entries;
+	uint64_t dispatch_cycles;
+	uint64_t native_cycles;
+	/* Cycles inside dispatch spent compiling and resolving memory bailouts. */
+	uint64_t compile_cycles;
+	uint64_t resolve_cycles;
+	/* Dispatch attempts that entered no native code and compiled nothing. */
+	uint64_t probe_count;
+	uint64_t probe_cycles;
+	/* Why native code stopped: probes landing on an instruction the JIT does
+	 * not compile, and region collections cut by one, by instruction class. */
+#define RV32_NATIVE_JIT_UNSUPPORTED_CLASSES 12u
+	uint64_t unsupported_probes[RV32_NATIVE_JIT_UNSUPPORTED_CLASSES];
+	uint64_t unsupported_cuts[RV32_NATIVE_JIT_UNSUPPORTED_CLASSES];
 	uint64_t lookups;
 	uint64_t calls;
 	uint64_t guest_instructions;
 	uint64_t memory_calls;
+	uint64_t ram_refill_attempts;
+	uint64_t ram_refill_resumes;
+	uint64_t ram_refill_cycles;
 	uint64_t compiled_guest_instructions;
 	uint64_t compiled_native_words;
 	uint64_t traced_jumps;
@@ -144,9 +173,10 @@ struct rv32_native_jit_stats {
 };
 
 /*
- * Cache hot RV32 user integer regions as native ESP32-P4 code.  A checked
- * callback validates each new data page; a small tagged cache then permits
- * aligned native accesses without bypassing Sv32, uncached DMA or MMIO rules.
+ * Cache hot RV32 user and supervisor integer regions as native ESP32-P4 code.
+ * A checked callback validates each new data page; a small tagged cache per
+ * privilege/SUM bank then permits aligned native accesses without bypassing
+ * Sv32, uncached DMA or MMIO rules.  Machine-mode contexts are never native.
  */
 bool rv32_native_jit_init(void);
 void rv32_native_jit_bind(
@@ -156,12 +186,61 @@ void rv32_native_jit_bind(
 	uint32_t (*store)(struct rv32_native_jit_runtime *runtime,
 			  uint32_t virtual_address, uint32_t value,
 			  uint32_t descriptor));
+/* Install after bind and before execution. Changing the callback flushes
+ * compiled regions, which choose whether to emit resumable miss stubs. */
+void rv32_native_jit_set_ram_refill(bool (*refill)(
+	struct rv32_native_jit_runtime *, uint32_t, uint32_t));
+/* The interpreter's fixed S-mode linear map, which fences never change. */
+/* Byte offsets of the guest CSR words relative to regs[0], from the
+ * interpreter's state structure; generated code reads and writes them
+ * directly.  Unset (or out of range) leaves CSR instructions interpreted. */
+struct rv32_native_jit_csr_layout {
+	int32_t sstatus;
+	int32_t sie;
+	int32_t stvec;
+	int32_t sscratch;
+	int32_t sepc;
+	int32_t scause;
+	int32_t stval;
+	int32_t sip;
+	int32_t satp;
+	int32_t extraflags;
+};
+void rv32_native_jit_set_csr_layout(
+	const struct rv32_native_jit_csr_layout *layout);
+
+void rv32_native_jit_set_kernel_linear_map(uint32_t virtual_base,
+					   uint32_t size);
 const struct rv32_native_jit_result *rv32_native_jit_try(
 	uint32_t physical_offset, uint32_t guest_pc,
 	uint32_t instruction_limit, uint32_t memory_context);
+/* As rv32_native_jit_try, but counts warm_weight visits toward compiling a
+ * cold head; a caller that skips probes between calls passes the skipped
+ * count plus one so warm-up timing in guest visits is unchanged. */
+const struct rv32_native_jit_result *rv32_native_jit_try_weighted(
+	uint32_t physical_offset, uint32_t guest_pc,
+	uint32_t instruction_limit, uint32_t memory_context,
+	uint32_t warm_weight);
+const struct rv32_native_jit_result *rv32_native_jit_try_profiled(
+	uint32_t physical_offset, uint32_t guest_pc,
+	uint32_t instruction_limit, uint32_t memory_context,
+	uint32_t warm_weight);
 void rv32_native_jit_flush(void);
 void rv32_native_jit_memory_cache_flush(void);
 void rv32_native_jit_memory_cache_flush_page(uint32_t virtual_address);
+/* Call only between native executions. Revoke all cached data translations
+ * whose host pages overlap the supplied surface, including virtual aliases. */
+void rv32_native_jit_memory_cache_flush_host_range(const void *host, size_t size);
+/* Region exits resolved natively by rv32_native_jit_dispatch since boot. */
+uint32_t rv32_native_jit_fast_dispatch_count(void);
+/* Nonzero after a failed rv32_native_jit_init: 1 chain results, 2 native
+ * dispatch, 3 interior loops, 4 general self-test. */
+extern uint32_t rv32_native_jit_self_test_failure;
+/* Publish one whole, aligned ordinary-RAM page after the interpreter has
+ * checked its bounds and the indicated access permission. MMIO/uncached
+ * mappings must not be passed here. Read validation never grants writes. */
+void rv32_native_jit_seed_ram_page(uint32_t physical_offset,
+	uint32_t virtual_address, uint32_t memory_context, bool write);
 void rv32_native_jit_get_stats(struct rv32_native_jit_stats *stats);
 
 static inline void rv32_native_jit_memory_exit(

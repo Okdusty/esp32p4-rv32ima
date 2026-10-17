@@ -10,6 +10,11 @@
 #include <unistd.h>
 
 #include "sdkconfig.h"
+#include "rv32_diagnostics.h"
+#include "esp_system.h"
+#include "esp_rom_sys.h"
+#include "soc/lp_system_reg.h"
+#include "soc/soc.h"
 #include "esp_flash.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
@@ -25,6 +30,16 @@
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "hal/uart_ll.h"
+#include "hal/brownout_hal.h"
+#include "hal/brownout_ll.h"
+#include "esp_intr_alloc.h"
+#include "soc/lp_analog_peri_struct.h"
+#include "soc/power_supply_periph.h"
+#include "soc/hp_sys_clkrst_struct.h"
+#include "soc/uart_struct.h"
+#include "esp_rom_serial_output.h"
+#include "esp_private/system_internal.h"
+#include "virtio_net_bridge.h"
 #if CONFIG_RV32_EMULATOR_PERF_STATS
 #include "soc/cache_reg.h"
 #include "soc/soc.h"
@@ -105,11 +120,11 @@ void HostEnableGuestRamPrefetch(const void *base, size_t size)
   Cache_Disable_L2_Cache_Autoload();
   Cache_Config_L2_Cache_Autoload(&autoload);
   Cache_Enable_L2_Cache_Autoload();
-  printf("L2 next-line prefetch: host [%p, %p)\n", (void *)start,
+  RV32_DIAG("L2 next-line prefetch: host [%p, %p)\n", (void *)start,
          (void *)end);
 #else
   Cache_Disable_L2_Cache_Autoload();
-  printf("L2 next-line prefetch: disabled\n");
+  RV32_DIAG("L2 next-line prefetch: disabled\n");
   (void)base;
   (void)size;
 #endif
@@ -206,7 +221,7 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
         bootloader_random_enable();
         esp_fill_random(dtb + cursor, length);
         bootloader_random_disable();
-        printf("Seeded Linux CRNG with %" PRIu32
+        RV32_DIAG("Seeded Linux CRNG with %" PRIu32
                " bytes of fresh P4 hardware entropy\n", length);
         rng_seeded = true;
       }
@@ -230,7 +245,7 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
 
 #if CONFIG_RV32_USB_FULL_SPEED_ONLY
   if (usb_speed_limited)
-    printf("Linux DWC2 maximum-speed limited to full-speed (12 Mbit/s)\n");
+    RV32_DIAG("Linux DWC2 maximum-speed limited to full-speed (12 Mbit/s)\n");
   else
     printf("WARNING: USB full-speed limit requested, but the DTB has no "
            "maximum-speed property\n");
@@ -290,6 +305,164 @@ static void host_uart_report_drops(void)
     if (length > 0)
       host_uart_hw_write((const uint8_t *)message, (size_t)length);
   }
+}
+
+/* Supply dips.  Hot-plugging a USB device on this board can pull the 3.3 V
+ * rail below even the lowest brownout threshold, and ESP-IDF's handler always
+ * restarts.  Keep running when the dip left the chip intact.  A dip deep
+ * enough to reset on-chip peripherals shows up as lost UART settings, and a
+ * reset Wi-Fi co-processor as a link that does not come back; then restart
+ * cleanly.  Unlike a power-on reset, a software restart keeps the latched
+ * boot strapping, so it never lands in download mode. */
+#define HOST_BROWNOUT_LEVEL     7u /* 2.51 V, the lowest threshold */
+#define HOST_BROWNOUT_SETTLE_MS 200u
+#define HOST_BROWNOUT_LINK_MS   15000u
+#define HOST_POWER_STACK_SIZE   4096u
+#define HOST_POWER_PRIORITY     (tskIDLE_PRIORITY + 3u)
+/* UART0's fields in the clock registers it shares with LCD and UART1. */
+#define HOST_UART0_CLOCK_SELECT_MASK  0x07000000u
+#define HOST_UART0_CLOCK_DIVIDER_MASK 0x00ffffffu
+/* Bits the driver pulses at run time: FIFO and core resets. */
+#define HOST_UART_CONF0_PULSE_MASK    0x00c00000u
+#define HOST_UART_CLK_CONF_PULSE_MASK 0x0c000000u
+
+_Static_assert(CONFIG_ESP_CONSOLE_UART_NUM == 0,
+               "the dip check reads UART0's clock fields");
+
+struct host_uart_state {
+  uint32_t clock_select;
+  uint32_t clock_divider;
+  uint32_t clk_conf;
+  uint32_t clkdiv;
+  uint32_t conf0;
+};
+
+static volatile uint32_t host_brownout_events;
+static TaskHandle_t host_power_task_handle;
+static struct host_uart_state host_uart_expected;
+
+static void IRAM_ATTR host_brownout_isr(void *argument)
+{
+  BaseType_t woken = pdFALSE;
+
+  (void)argument;
+  /* One event per dip; the power task re-arms after checking it. */
+  LP_ANA_PERI.int_ena.bod_mode0_int_ena = 0;
+  brownout_ll_intr_clear();
+  host_brownout_events = host_brownout_events + 1u;
+  if (host_power_task_handle != NULL)
+    vTaskNotifyGiveFromISR(host_power_task_handle, &woken);
+  if (woken)
+    portYIELD_FROM_ISR();
+}
+
+static void host_uart_capture(struct host_uart_state *state)
+{
+  state->clock_select =
+      HP_SYS_CLKRST.peri_clk_ctrl110.val & HOST_UART0_CLOCK_SELECT_MASK;
+  state->clock_divider =
+      HP_SYS_CLKRST.peri_clk_ctrl111.val & HOST_UART0_CLOCK_DIVIDER_MASK;
+  state->clk_conf = UART0.clk_conf.val & ~HOST_UART_CLK_CONF_PULSE_MASK;
+  state->clkdiv = UART0.clkdiv_sync.val;
+  state->conf0 = UART0.conf0_sync.val & ~HOST_UART_CONF0_PULSE_MASK;
+}
+
+static void host_uart_restore(const struct host_uart_state *state)
+{
+  HP_SYS_CLKRST.peri_clk_ctrl110.val =
+      (HP_SYS_CLKRST.peri_clk_ctrl110.val & ~HOST_UART0_CLOCK_SELECT_MASK) |
+      state->clock_select;
+  HP_SYS_CLKRST.peri_clk_ctrl111.val =
+      (HP_SYS_CLKRST.peri_clk_ctrl111.val & ~HOST_UART0_CLOCK_DIVIDER_MASK) |
+      state->clock_divider;
+  UART0.clk_conf.val = state->clk_conf;
+  UART0.clkdiv_sync.val = state->clkdiv;
+  UART0.conf0_sync.val = state->conf0;
+  uart_ll_update(&UART0);
+}
+
+static void __attribute__((noreturn)) host_power_restart(const char *damage)
+{
+  /* ROM output polls the FIFO, so it works even if the dip cleared the UART
+   * driver's interrupt setup. */
+  esp_rom_printf("\r\n[Host] supply dip below 2.51 V %s; restarting\r\n",
+                 damage);
+  esp_rom_output_tx_wait_idle(CONFIG_ESP_CONSOLE_UART_NUM);
+  esp_reset_reason_set_hint(ESP_RST_BROWNOUT);
+  esp_rom_software_reset_system();
+  __builtin_unreachable();
+}
+
+static void host_power_task(void *argument)
+{
+  (void)argument;
+  for (;;) {
+    struct host_uart_state found;
+    bool link_was_up;
+    char message[112];
+    int length;
+
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    link_was_up = virtio_net_bridge_link_up();
+    vTaskDelay(pdMS_TO_TICKS(HOST_BROWNOUT_SETTLE_MS));
+    host_uart_capture(&found);
+    if (memcmp(&found, &host_uart_expected, sizeof(found)) != 0) {
+      host_uart_restore(&host_uart_expected);
+      host_power_restart("reset on-chip peripherals");
+    }
+
+    length = snprintf(message, sizeof(message),
+                      "\r\n[Host] supply dipped below 2.51 V; kept running "
+                      "(%" PRIu32 " dips since boot)\r\n",
+                      host_brownout_events);
+    if (length > 0)
+      host_uart_hw_write((const uint8_t *)message, (size_t)length);
+    brownout_ll_intr_clear();
+    brownout_ll_intr_enable(true);
+
+    /* A co-processor reset drops the link for good; an AP hiccup does not. */
+    if (link_was_up) {
+      TickType_t started = xTaskGetTickCount();
+
+      while (!virtio_net_bridge_link_up() &&
+             xTaskGetTickCount() - started <
+                 pdMS_TO_TICKS(HOST_BROWNOUT_LINK_MS))
+        vTaskDelay(pdMS_TO_TICKS(500));
+      if (!virtio_net_bridge_link_up())
+        host_power_restart("reset the Wi-Fi co-processor");
+    }
+  }
+}
+
+int HostBrownoutInit(void)
+{
+  const brownout_hal_config_t config = {
+    .threshold = HOST_BROWNOUT_LEVEL,
+    .enabled = true,
+    .reset_enabled = false,
+    .flash_power_down = false,
+    .rf_power_down = false,
+  };
+  BaseType_t power_core = CONFIG_FREERTOS_NUMBER_OF_CORES > 1 ? 1 : 0;
+
+  /* The console UART is fully configured by HostConsoleInit(). */
+  host_uart_capture(&host_uart_expected);
+  if (xTaskCreatePinnedToCore(host_power_task, "power", HOST_POWER_STACK_SIZE,
+                              NULL, HOST_POWER_PRIORITY,
+                              &host_power_task_handle, power_core) != pdPASS)
+    return -1;
+
+  /* Also disarms the BOD mode1 reset that the bootloader enabled. */
+  brownout_hal_config(&config);
+  brownout_ll_intr_clear();
+  if (esp_intr_alloc_intrstatus(power_supply_periph_signal.irq,
+                                ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_SHARED,
+                                (uint32_t)brownout_ll_intr_get_status_reg(),
+                                BROWNOUT_DETECTOR_LL_INTERRUPT_MASK,
+                                host_brownout_isr, NULL, NULL) != ESP_OK)
+    return -1;
+  brownout_ll_intr_enable(true);
+  return 0;
 }
 
 static void host_uart_tx_task(void *argument)
@@ -357,7 +530,7 @@ int HostConsoleInit(void)
   if (host_uart_init_result < 0)
     printf("WARNING: UART interrupt driver unavailable; using polled TX\n");
 
-  printf("UART%d bridge: %d baud, interrupt-buffered RX; "
+  RV32_DIAG("UART%d bridge: %d baud, interrupt-buffered RX; "
          "TX %u bytes/tick at priority %u on CPU%d\n",
          CONFIG_ESP_CONSOLE_UART_NUM, CONFIG_ESP_CONSOLE_UART_BAUDRATE,
          (unsigned int)HOST_UART_TX_TICK_BUDGET,
@@ -436,9 +609,9 @@ int psram_init(void) {
     return -1;
   }
 
-  printf("Available PSRAM: %zu bytes (%.2f MB)\n", available_psram,
+  RV32_DIAG("Available PSRAM: %zu bytes (%.2f MB)\n", available_psram,
          available_psram / (1024.0 * 1024.0));
-  printf("Largest PSRAM block: %zu bytes (%.2f MB)\n", largest_psram,
+  RV32_DIAG("Largest PSRAM block: %zu bytes (%.2f MB)\n", largest_psram,
          largest_psram / (1024.0 * 1024.0));
 
   alloc_size = GUEST_RAM_SIZE;
@@ -450,7 +623,7 @@ int psram_init(void) {
     return -1;
   }
 
-  printf("Attempting to allocate %zu bytes (%.2f MB)...\n", alloc_size,
+  RV32_DIAG("Attempting to allocate %zu bytes (%.2f MB)...\n", alloc_size,
          alloc_size / (1024.0 * 1024.0));
 
   psram_allocation = (uint8_t *)heap_caps_malloc(
@@ -486,9 +659,9 @@ int psram_init(void) {
   /* Guest physical addresses are real ESP32-P4 PSRAM bus addresses. */
   psram_base = (uint8_t *)(uintptr_t)GUEST_PHYS_BASE;
   psram_size = alloc_size;
-  printf("SUCCESS: PSRAM allocated at %p, size: %zu bytes (%.2f MB)\n",
+  RV32_DIAG("SUCCESS: PSRAM allocated at %p, size: %zu bytes (%.2f MB)\n",
          psram_allocation, psram_size, psram_size / (1024.0 * 1024.0));
-  printf("Identity-mapped Linux DMA RAM: 0x%08x-0x%08x\n",
+  RV32_DIAG("Identity-mapped Linux DMA RAM: 0x%08x-0x%08x\n",
          GUEST_DMA_BASE, GUEST_PHYS_END - 1u);
 
   /*
@@ -497,9 +670,9 @@ int psram_init(void) {
    * pages before exposing them to userspace.  Avoiding this redundant pass
    * also leaves more memory bandwidth for LCD initialization.
    */
-  printf("PSRAM guest aperture reserved successfully!\n");
+  RV32_DIAG("PSRAM guest aperture reserved successfully!\n");
 #if CONFIG_RV32_HOST_BULK_BUFFERS_PSRAM
-  printf("Reserved host PSRAM auxiliary pool: %u KiB\n",
+  RV32_DIAG("Reserved host PSRAM auxiliary pool: %u KiB\n",
          (unsigned int)(HOST_AUXILIARY_SIZE / 1024u));
 #endif
 
@@ -780,23 +953,34 @@ int HostDmaCacheSync(uint32_t guest_physical_address, size_t length,
                          length, flags) == ESP_OK ? 0 : -1;
 }
 
+void HostRestart(bool download) {
+  if (download) {
+    /* Volatile boot selection, not an eFuse change. A full system reset
+     * lets ROM reinitialize the USB download peripheral after Linux DWC2. */
+    REG_SET_BIT(LP_SYSTEM_REG_SYS_CTRL_REG, LP_SYSTEM_REG_FORCE_DOWNLOAD_BOOT);
+    esp_rom_software_reset_system();
+    __builtin_unreachable();
+  }
+  esp_restart();
+}
+
 bool verify_kernel_header(void) {
   static uint8_t header[64];
 
-  printf("\n=== Verifying Kernel Header ===\n");
+  RV32_DIAG("\n=== Verifying Kernel Header ===\n");
   if (psram_read(KERNEL_LOAD_OFFSET, header, sizeof(header)) < 0)
     return false;
 
-  printf("First 64 bytes of loaded kernel:\n");
+  RV32_DIAG("First 64 bytes of loaded kernel:\n");
   for (int i = 0; i < 64; i++) {
-    printf("%02x ", header[i]);
+    RV32_DIAG("%02x ", header[i]);
     if ((i + 1) % 16 == 0)
-      printf("\n");
+      RV32_DIAG("\n");
   }
-  printf("\n");
+  RV32_DIAG("\n");
 
   uint32_t first_instr = *(uint32_t *)header;
-  printf("First instruction: 0x%08lx\n", (unsigned long)first_instr);
+  RV32_DIAG("First instruction: 0x%08lx\n", (unsigned long)first_instr);
   return (!memcmp(&header[0x30], "RISCV", 5));
 }
 
@@ -813,7 +997,7 @@ int load_images(int ram_size, int *kern_len) {
   size_t partition_size;
   size_t kernel_payload_size = KERNEL_FLASH_SIZE;
 
-  printf("\n=== Loading Kernel from Flash ===\n");
+  RV32_DIAG("\n=== Loading Kernel from Flash ===\n");
 
   kernel_partition = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "kernel");
@@ -838,11 +1022,11 @@ int load_images(int ram_size, int *kern_len) {
   if (err != ESP_OK)
     return -1;
 
-  printf("Kernel text offset: 0x%llx\n",
+  RV32_DIAG("Kernel text offset: 0x%llx\n",
          (unsigned long long)text_offset);
-  printf("Kernel image size:   %llu bytes\n",
+  RV32_DIAG("Kernel image size:   %llu bytes\n",
          (unsigned long long)image_size);
-  printf("Kernel flash payload: %zu bytes\n", kernel_payload_size);
+  RV32_DIAG("Kernel flash payload: %zu bytes\n", kernel_payload_size);
 
   if (text_offset != KERNEL_LOAD_OFFSET) {
     printf("ERROR: Expected a 32-bit S-mode Image with text offset "
@@ -865,10 +1049,10 @@ int load_images(int ram_size, int *kern_len) {
 
   partition_size = kernel_payload_size;
 
-  printf("Found kernel partition:\n");
-  printf("  Label: %s\n", kernel_partition->label);
-  printf("  Address: 0x%lx\n", (unsigned long)kernel_partition->address);
-  printf("  Size: %zu bytes (%.2f MB)\n", partition_size,
+  RV32_DIAG("Found kernel partition:\n");
+  RV32_DIAG("  Label: %s\n", kernel_partition->label);
+  RV32_DIAG("  Address: 0x%lx\n", (unsigned long)kernel_partition->address);
+  RV32_DIAG("  Size: %zu bytes (%.2f MB)\n", partition_size,
          partition_size / (1024.0 * 1024.0));
 
   if ((uint64_t)KERNEL_LOAD_OFFSET + image_size > (size_t)ram_size) {
@@ -887,8 +1071,8 @@ int load_images(int ram_size, int *kern_len) {
   /* Clear the complete effective Image area, including BSS, on every boot. */
   memset(psram_base + KERNEL_LOAD_OFFSET, 0, (size_t)image_size);
 
-  printf("\nLoading kernel from flash to PSRAM...\n");
-  printf("This will take a moment...\n");
+  RV32_DIAG("\nLoading kernel from flash to PSRAM...\n");
+  RV32_DIAG("This will take a moment...\n");
 
   addr = 0;
   size_t remaining = partition_size;
@@ -909,11 +1093,11 @@ int load_images(int ram_size, int *kern_len) {
       remaining -= chunk;
   }
 
-  printf("\nKernel loaded successfully from flash!\n");
-  printf("Total loaded: %zu bytes (%.2f MB)\n", partition_size,
+  RV32_DIAG("\nKernel loaded successfully from flash!\n");
+  RV32_DIAG("Total loaded: %zu bytes (%.2f MB)\n", partition_size,
          partition_size / (1024.0 * 1024.0));
 
-  printf("\n=== Loading DTB from Flash ===\n");
+  RV32_DIAG("\n=== Loading DTB from Flash ===\n");
 
   dtb_partition = esp_partition_find_first(
       ESP_PARTITION_TYPE_DATA,
@@ -953,7 +1137,7 @@ int load_images(int ram_size, int *kern_len) {
   }
 #endif
 
-  printf("DTB size: %zu bytes\n", dtb_size);
+  RV32_DIAG("DTB size: %zu bytes\n", dtb_size);
 
   if ((uint64_t)DTB_LOAD_OFFSET + dtb_size > (size_t)ram_size) {
     printf("ERROR: DTB does not fit in guest RAM\n");
@@ -991,14 +1175,14 @@ int load_images(int ram_size, int *kern_len) {
     return -1;
   }
 
-  printf("DTB loaded at guest address 0x%08x\n",
+  RV32_DIAG("DTB loaded at guest address 0x%08x\n",
         GUEST_PHYS_BASE + DTB_LOAD_OFFSET);
 
 
-  printf("%s\n",
-          verify_kernel_header()
-              ? "Verified RISCV magic header"
-              : "Couldn't find RISCV magic header!");
+  if (!verify_kernel_header())
+    printf("WARNING: Couldn't find RISCV magic header!\n");
+  else
+    RV32_DIAG("Verified RISCV magic header\n");
 
   return 0;
 }

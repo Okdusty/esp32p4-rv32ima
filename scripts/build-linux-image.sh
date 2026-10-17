@@ -114,6 +114,9 @@ config="$linux_dir/scripts/config"
 "$config" --file "$linux_dir/.config" --enable ARCH_RV32I
 "$config" --file "$linux_dir/.config" --enable MMU
 "$config" --file "$linux_dir/.config" --enable RISCV_SBI
+"$config" --file "$linux_dir/.config" --enable POWER_RESET
+"$config" --file "$linux_dir/.config" --enable POWER_RESET_SYSCON
+"$config" --file "$linux_dir/.config" --enable POWER_RESET_SYSCON_POWEROFF
 "$config" --file "$linux_dir/.config" --disable SMP
 "$config" --file "$linux_dir/.config" --enable FB_RV32_PV
 "$config" --file "$linux_dir/.config" --enable FB_TILEBLITTING
@@ -158,6 +161,11 @@ config="$linux_dir/scripts/config"
 "$config" --file "$linux_dir/.config" --enable VFAT_FS
 "$config" --file "$linux_dir/.config" --enable EXFAT_FS
 "$config" --file "$linux_dir/.config" --enable EXT4_FS
+# The read-only flash disk (desktop) is an LZ4-compressed EROFS image, and
+# the X server's event loop requires epoll.
+"$config" --file "$linux_dir/.config" --enable EROFS_FS
+"$config" --file "$linux_dir/.config" --enable EROFS_FS_ZIP
+"$config" --file "$linux_dir/.config" --enable EPOLL
 "$config" --file "$linux_dir/.config" --enable NLS_CODEPAGE_437
 "$config" --file "$linux_dir/.config" --enable NLS_ISO8859_1
 "$config" --file "$linux_dir/.config" --enable NLS_UTF8
@@ -166,11 +174,16 @@ make -C "$linux_dir" ARCH=riscv CROSS_COMPILE="$cross_prefix" olddefconfig
 
 # scripts/config records requests even when a symbol's dependencies are not
 # met.  Fail here instead of producing an Image that silently lacks the
-# standard guest driver expected by CONFIG_RV32_VIRTIO_GPU firmware.
+# standard guest drivers expected by the reset and display firmware.
 for required in \
+  CONFIG_POWER_RESET_SYSCON=y \
+  CONFIG_POWER_RESET_SYSCON_POWEROFF=y \
   CONFIG_DRM=y \
   CONFIG_DRM_VIRTIO_GPU=y \
-  CONFIG_DRM_VIRTIO_GPU_KMS=y; do
+  CONFIG_DRM_VIRTIO_GPU_KMS=y \
+  CONFIG_EROFS_FS=y \
+  CONFIG_EROFS_FS_ZIP=y \
+  CONFIG_EPOLL=y; do
   if ! grep -qx "$required" "$linux_dir/.config"; then
     echo "error: Linux configuration did not retain $required" >&2
     exit 1

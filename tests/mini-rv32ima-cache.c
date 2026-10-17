@@ -13,6 +13,7 @@ static uint32_t linear_publish_end;
 static uint32_t linear_publish_calls;
 static uint32_t linear_publish_bytes;
 static uint32_t linear_publish_count;
+static uint32_t linear_access_count;
 
 static void publish_linear_mmio(uint32_t start, uint32_t end,
 				uint32_t calls, uint32_t bytes)
@@ -28,6 +29,7 @@ static void publish_linear_mmio(uint32_t start, uint32_t end,
 #define MINIRV32_LINEAR_MMIO_BASE 0x11800000u
 #define MINIRV32_LINEAR_MMIO_SIZE sizeof(linear_mmio)
 #define MINIRV32_LINEAR_MMIO_HOST linear_mmio
+#define MINIRV32_LINEAR_MMIO_ACCESS() (++linear_access_count)
 #define MINIRV32_LINEAR_MMIO_PUBLISH(start, end, calls, bytes) \
 	publish_linear_mmio((start), (end), (calls), (bytes))
 #define MINIRV32_PERF_STATS
@@ -176,6 +178,7 @@ static void test_linear_mmio_aperture(uint8_t *image)
 	linear_publish_calls = 0;
 	linear_publish_bytes = 0;
 	linear_publish_count = 0;
+	linear_access_count = 0;
 	put32(image, 0u, encode_store(0u, 6u, 8u, 1u));
 	put32(image, 4u, encode_store(1u, 6u, 9u, 2u));
 	put32(image, 8u, encode_store(2u, 6u, 10u, 4u));
@@ -202,6 +205,7 @@ static void test_linear_mmio_aperture(uint8_t *image)
 	assert(state.regs[14] == 0x0000cdefu);
 	assert(state.regs[15] == 0x12345678u);
 	assert(linear_publish_count == 1u);
+	assert(linear_access_count == 8u);
 	assert(linear_publish_start == 1u);
 	assert(linear_publish_end == 8u);
 	assert(linear_publish_calls == 3u);

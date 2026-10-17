@@ -40,31 +40,31 @@ int test_main(void)
 		return 1;
 	for (uint32_t i = 0; i < BENCH_ITERATIONS; i++)
 		bench_data[i] = 0x12345678u;
-	jit_runtime.regs = regs;
-	jit_runtime.chain_instruction_limit = BENCH_ITERATIONS * 3u;
-	jit_runtime.loop_iterations = BENCH_ITERATIONS;
-	jit_invalidate_memory_pages();
+	jit_rt->regs = regs;
+	jit_rt->chain_instruction_limit = BENCH_ITERATIONS * 3u;
+	jit_rt->loop_iterations = BENCH_ITERATIONS;
+	jit_invalidate_memory_pages(jit_rt);
 	for (uint32_t page = 0; page < sizeof(bench_data) / 4096u; page++) {
 		uint32_t tag = (BENCH_BASE >> 12) + page;
 		uint32_t index = tag & (RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u);
-		jit_runtime.read_pages[index] = (struct rv32_native_jit_read_page) {
+		jit_rt->read_pages[index] = (struct rv32_native_jit_read_page) {
 			.virtual_page = tag,
 			.host_bias = (uint32_t)(uintptr_t)bench_data - BENCH_BASE,
 		};
-		jit_runtime.write_pages[index] = (struct rv32_native_jit_write_page) {
+		jit_rt->write_pages[index] = (struct rv32_native_jit_write_page) {
 			.virtual_page = tag,
 			.host_bias = (uint32_t)(uintptr_t)bench_data - BENCH_BASE,
 			.linear_page_start = UINT32_MAX,
 		};
 	}
 	for (uint32_t repeat = 0; repeat < BENCH_REPEATS; repeat++) {
-		jit_runtime.chain_executed = 0u;
+		jit_rt->chain_executed = 0u;
 		regs[2] = BENCH_BASE + BENCH_ITERATIONS * JIT_BENCH_WIDTH;
 		regs[3] = 0x12345678u;
 		regs[4] = BENCH_BASE;
 		if (rv32_native_jit_enter((jit_block_fn)(uintptr_t)jit_entry_code(0u),
-					 &jit_runtime) != 0u ||
-		    jit_runtime.chain_executed != BENCH_ITERATIONS * 3u ||
+					 jit_rt) != 0u ||
+		    jit_rt->chain_executed != BENCH_ITERATIONS * 3u ||
 		    regs[4] != regs[2])
 			return 2;
 	}

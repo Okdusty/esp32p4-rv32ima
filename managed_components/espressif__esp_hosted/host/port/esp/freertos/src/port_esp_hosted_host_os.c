@@ -12,7 +12,9 @@
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_private/esp_cache_private.h"
 #include "freertos/portmacro.h"
+#include "freertos/idf_additions.h"
 #include "esp_macros.h"
 #include "esp_wifi.h"
 #include "port_esp_hosted_host_config.h"
@@ -131,9 +133,16 @@ void *hosted_malloc_align(size_t size, size_t align)
 
 #if CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM
 	/* On targets where GDMA can reach PSRAM through cache (e.g. ESP32-P4),
-	 * prefer DMA-capable SPIRAM to preserve scarce internal RAM. */
-	ptr = heap_caps_aligned_alloc(align, size,
-			MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	 * prefer DMA-capable SPIRAM to preserve scarce internal RAM. The transport
+	 * requests 64-byte alignment, but P4 can have 128-byte cache lines. SDIO
+	 * rejects a larger-than-one-block transfer from a merely 64-aligned PSRAM
+	 * address; small packets can hide this because IDF uses a bounce buffer. */
+	size_t cache_alignment = 0;
+	if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &cache_alignment) == ESP_OK) {
+		size_t external_alignment = align > cache_alignment ? align : cache_alignment;
+		ptr = heap_caps_aligned_alloc(external_alignment, size,
+				MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+	}
 #endif
 	if (!ptr) {
 		ptr = heap_caps_aligned_alloc(align, size,
@@ -175,31 +184,14 @@ void *hosted_thread_create(const char *tname, uint32_t tprio, uint32_t tstack_si
 		ESP_LOGE(TAG, "Failed to allocate thread handle\n");
 		return NULL;
 	}
+	*thread_handle = NULL;
 
 #if H_DFLT_TASK_FROM_SPIRAM
-	StaticTask_t *task_buffer = heap_caps_calloc(1, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-	if (!task_buffer) {
-		ESP_LOGE(TAG, "Failed to allocate task buffer");
-		HOSTED_FREE(thread_handle);
-		return NULL;
-	}
-	StackType_t *thread_stack = heap_caps_malloc(tstack_size, MALLOC_CAP_SPIRAM);
-	if (!thread_stack) {
-		ESP_LOGE(TAG, "Failed to allocate thread stack");
-		heap_caps_free(task_buffer);
-		HOSTED_FREE(thread_handle);
-		return NULL;
-	}
-
-	task_created = pdTRUE;
-	*thread_handle = xTaskCreateStaticPinnedToCore((void (*)(void *))start_routine,
-			tname, tstack_size, sr_arg, tprio, thread_stack,
-			task_buffer, 1);
-	if (!*thread_handle) {
-		heap_caps_free(thread_stack);
-		heap_caps_free(task_buffer);
-		task_created = pdFALSE;
-	}
+	/* The SDK keeps the TCB internal and owns the external stack allocation.
+	 * Pair with vTaskDeleteWithCaps below so transport restarts reclaim both. */
+	task_created = xTaskCreatePinnedToCoreWithCaps(
+			(void (*)(void *))start_routine, tname, tstack_size, sr_arg,
+			tprio, thread_handle, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 #else
 	task_created = xTaskCreatePinnedToCore((void (*)(void *))start_routine,
 			tname, tstack_size, sr_arg, tprio, thread_handle, 1);
@@ -231,7 +223,11 @@ int hosted_thread_cancel(void *thread_handle)
 
 	thread_hdl = (thread_handle_t *)thread_handle;
 
+#if H_DFLT_TASK_FROM_SPIRAM
+	vTaskDeleteWithCaps(*thread_hdl);
+#else
 	vTaskDelete(*thread_hdl);
+#endif
 
 	HOSTED_FREE(thread_handle);
 	return RET_OK;

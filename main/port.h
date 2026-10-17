@@ -33,7 +33,11 @@ struct host_cache_stats {
 uint64_t GetTimeMicroseconds();
 int HostInputInit(void);
 int HostConsoleInit(void);
+int HostBrownoutInit(void);
 int HostConsoleWrite(const void *buffer, size_t length);
+#ifdef ESP_PLATFORM
+void HostRestart(bool download) __attribute__((noreturn));
+#endif
 void HostEnableGuestRamPrefetch(const void *base, size_t size);
 void HostCacheStatsReset(void);
 void HostCacheStatsReadAndReset(struct host_cache_stats *stats);

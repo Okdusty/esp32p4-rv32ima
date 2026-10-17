@@ -1,8 +1,42 @@
 [mapping:main]
 archive: libmain.a
 entries:
-    uc-rv32ima (noflash)
-    cache (noflash)
-    dwc2_passthrough (noflash)
-    port-esp (noflash)
-    rv32_native_jit (noflash)
+    if RV32_PSRAM_EMULATOR_STATE = y:
+        uc-rv32ima (default)
+        cache (default)
+        dwc2_passthrough (default)
+        port-esp (default)
+        rv32_native_jit (default)
+    else:
+        uc-rv32ima (noflash)
+        cache (noflash)
+        dwc2_passthrough (noflash)
+        port-esp (noflash)
+        rv32_native_jit (noflash)
+    # Reporting runs once per interval. Keep its formatting code out of
+    # scarce executable SRAM while retaining the emulator's hot loop there.
+    if RV32_EMULATOR_PERF_STATS = y:
+        uc-rv32ima:EmulatorPerfReport (default)
+    if RV32_HOST_PERF_STATS = y:
+        uc-rv32ima:HostPerfReport (default)
+    # Compile-time and init-only JIT code runs from the cached PSRAM text like
+    # the rest of the firmware; the executable internal RAM it would occupy
+    # goes to the hot-code arena instead.  app_main stays internal: the
+    # interpreter loop is inlined into it.
+    rv32_native_jit:rv32_native_jit_init (default)
+    rv32_native_jit:jit_self_test (default)
+    rv32_native_jit:jit_self_test_chain_results (default)
+    rv32_native_jit:jit_self_test_native_dispatch (default)
+    rv32_native_jit:jit_self_test_interior_loops (default)
+    rv32_native_jit:jit_compile_with_entry_values (default)
+    rv32_native_jit:jit_emit_load (default)
+    rv32_native_jit:jit_emit_store (default)
+    rv32_native_jit:jit_emit_amo (default)
+    rv32_native_jit:jit_emit_two_page_store_stubs (default)
+    rv32_native_jit:jit_emit_deferred_memory_stubs (default)
+    rv32_native_jit:jit_emit_persistent_memory_guard (default)
+    rv32_native_jit:jit_emit_interior_backedge (default)
+    rv32_native_jit:jit_emit_linear_dirty_helper (default)
+    rv32_native_jit:jit_emit_group_fast_address (default)
+    rv32_native_jit:jit_install_code (default)
+    port-esp:load_images (default)

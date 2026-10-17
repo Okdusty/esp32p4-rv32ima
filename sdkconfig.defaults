@@ -2,12 +2,18 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
+# Normal firmware: host diagnostics and intrusive profiling are opt-in.
+CONFIG_RV32_DIAGNOSTIC_LOGS=n
+CONFIG_RV32_EMULATOR_PERF_STATS=n
+CONFIG_RV32_HOST_PERF_STATS=n
+CONFIG_RV32_CACHE_PERF_STATS=n
+
 CONFIG_SPI_MASTER_IN_IRAM=y
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
 
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
-CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
 
 # Waveshare's ESP32-P4 module uses pre-v3 silicon. ESP-IDF 6.1 defaults to
 # mutually incompatible v3.1+ silicon unless this family is selected.
@@ -94,3 +100,15 @@ CONFIG_RV32_WIFI_SSID="SSID"
 CONFIG_RV32_WIFI_PASSWORD="12345"
 CONFIG_RV32_WIFI_LOW_LATENCY=y
 CONFIG_RV32_WIFI_HT40=y
+
+# The firmware rides through supply dips itself (HostBrownoutInit).
+# CONFIG_ESP_BROWNOUT_DET is not set
+
+# A hung CPU1 (UART, Wi-Fi, display and dip-check tasks) reports the hog
+# task and restarts.  CPU0 runs the emulator nonstop, so its idle task is
+# not watched.
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y

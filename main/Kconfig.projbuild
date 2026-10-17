@@ -1,5 +1,37 @@
 menu "RV32 emulator"
 
+config RV32_DIAGNOSTIC_LOGS
+	bool "Enable host diagnostic logs"
+	default n
+	help
+	  Print detailed startup, reset, PSRAM, kernel-header and bridge messages.
+	  When disabled, ESP-IDF component logs are also lowered to warnings.
+	  The guest console is unaffected.
+
+config RV32_DEBUG_DISPLAY
+	bool "Trace display ownership transitions"
+	depends on RV32_DIAGNOSTIC_LOGS
+	default y
+	help
+	  Print terminal release/takeover timestamps and input byte counts.
+
+config RV32_DEBUG_USB
+	bool "Trace USB controller state"
+	depends on RV32_DIAGNOSTIC_LOGS
+	default y
+	help
+	  Poll and print DWC2 register/link state, count physical interrupts,
+	  and report a powered port without a connected device. Disable to
+	  remove this diagnostic polling and interrupt-counter overhead.
+
+config RV32_DEBUG_CSR
+	bool "Trace unhandled guest CSR accesses"
+	depends on RV32_DIAGNOSTIC_LOGS
+	default n
+	help
+	  Print the first twenty unexpected reads and writes. Guest debug-console
+	  CSRs keep their normal output regardless of this trace setting.
+
 config RV32_GUEST_RAM_PREFETCH
 	bool "Enable ESP32-P4 L2 sequential prefetch for guest RAM"
 	default y
@@ -24,17 +56,91 @@ config RV32_NATIVE_JIT
 	depends on IDF_TARGET_ESP32P4 && !ESP_SYSTEM_MEMPROT
 	default n
 	help
-	  Translate frequently repeated RV32 user-mode integer basic blocks into native
+	  Translate frequently repeated RV32 integer basic blocks into native
 	  ESP32-P4 RV32 code stored in a bounded PSRAM arena and internal hot tier.
 	  Loads and stores validate new pages through checked callbacks, then reuse
 	  small tagged host-pointer caches for aligned accesses. Sv32 permissions,
 	  uncached DMA pages and MMIO faults retain normal emulator semantics.
-	  Kernel, atomic and privileged operations continue through the interpreter.
+	  Atomic, CSR, trap-return and machine-mode code continue through the
+	  interpreter.
 
 	  ESP-IDF memory protection intentionally prevents writable executable
 	  allocations. Disable Component config -> ESP System Settings -> Memory
 	  protection before enabling this experimental option. Leave it disabled
 	  when writable executable memory is not acceptable.
+
+config RV32_NATIVE_JIT_SUPERVISOR
+	bool "Also translate supervisor-mode (kernel) code"
+	depends on RV32_NATIVE_JIT
+	default y
+	help
+	  Run hot Linux kernel regions natively as well as user regions. User
+	  code, the kernel, and the kernel with SUM set keep separate data-page
+	  caches, so traps switch caches instead of flushing them.
+
+config RV32_NATIVE_JIT_RAM_REFILL
+	bool "Resume native execution after ordinary RAM mapping refills"
+	depends on RV32_NATIVE_JIT
+	default y
+	help
+	  Refill a missing RAM page mapping from native code and retry the access
+	  without leaving the region. Faults, uncached memory and MMIO still exit.
+
+config RV32_NATIVE_JIT_SPLIT_LOAD_PAGES
+	bool "Split native load groups predicted to span guest pages"
+	depends on RV32_NATIVE_JIT
+	default y
+	help
+	  Use the entry values of unchanged base registers to end load groups at
+	  guest page boundaries, avoiding repeated exits from a group's one-page
+	  guard. Every load keeps its own runtime checks.
+
+config RV32_JIT_EXIT_TRACE
+	bool "Log native JIT checked exits and rejected candidates"
+	depends on RV32_NATIVE_JIT
+	default n
+	help
+	  Aggregate checked memory exits by guest PC, instruction, SATP, address
+	  and reason, and count rejected candidates and RAM refills. Prints up to
+	  eight hot sites per interval. Perturbs timing; leave it off when
+	  measuring performance.
+
+config RV32_JIT_EXIT_TRACE_INTERVAL_MS
+	int "JIT exit log interval (milliseconds)"
+	depends on RV32_JIT_EXIT_TRACE
+	range 1000 60000
+	default 2000
+
+config RV32_PSRAM_EMULATOR_STATE
+	bool "Place emulator code and large state in PSRAM (experimental)"
+	depends on RV32_NATIVE_JIT && SPIRAM_XIP_FROM_PSRAM
+	select SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY
+	default n
+	help
+	  Move the emulator's ordinary code and compiler scratch to PSRAM, and
+	  CPU state and JIT directories too unless RV32_HOT_STATE_INTERNAL is set.
+	  Frees internal SRAM for a 512 KiB L2 cache, but can be slower.
+
+config RV32_HOT_STATE_INTERNAL
+	bool "Keep CPU and JIT dispatch state in internal SRAM"
+	depends on RV32_PSRAM_EMULATOR_STATE
+	default y if CACHE_L2_CACHE_256KB
+	default n
+	help
+	  Keep guest CPU state, the native block directory, successor links and
+	  hot-code directory in internal SRAM while compiler scratch stays in
+	  PSRAM. Costs about 94 KiB of internal SRAM, which the 512 KiB L2
+	  configuration may not have.
+
+config RV32_EXPERIMENT_PANIC_DOWNLOAD
+	bool "Enter ROM download mode after an experimental panic"
+	depends on RV32_PSRAM_EMULATOR_STATE && ESP_SYSTEM_PANIC_PRINT_REBOOT
+	default y
+	help
+	  Reboot into ROM download mode on a panic, skipping the panic report, and
+	  report DMA heap availability around the startup pool reservation. Meant
+	  for allocator failures before app_main, when Linux cannot request a
+	  recovery reboot.
 
 config RV32_EMULATOR_PERF_STATS
 	bool "Enable RV32 emulator performance counters"
@@ -396,6 +502,14 @@ config RV32_DISPLAY_FLUSH_INTERVAL_MS
 	  blanking window. A non-zero value is available only for bandwidth and
 	  timing experiments and increases visible latency.
 
+config RV32_DISPLAY_ASYNC_GUEST
+	bool "Continue guest computation during framebuffer presentation"
+	depends on RV32_DISPLAY_ACCEL
+	default n
+	help
+	  While CPU1 holds the framebuffer snapshot, keep running the guest and
+	  wait for the snapshot only when it next touches framebuffer pixels.
+
 config RV32_DISPLAY_LEGACY_QUIET_MS
 	int "Legacy mmap framebuffer quiet period (ms)"
 	depends on RV32_DISPLAY_ACCEL
@@ -485,6 +599,23 @@ config RV32_GUEST_DROPBEAR
 	  Generate an Ed25519 host key when needed and start Dropbear on port 22.
 	  Disable this to skip both key generation and SSH server startup. The
 	  package remains available in the initramfs for manual testing.
+
+config RV32_FLASH_ROFS
+	bool "Serve a read-only guest filesystem from flash (desktop)"
+	default n
+	help
+	  Flash a read-only filesystem image into the 16 MiB "rofs" partition
+	  and expose it as a virtio disk, which the guest mounts at /opt. Files
+	  are read from flash on demand and cost no guest RAM. Disable for the
+	  image without the desktop.
+
+config RV32_FLASH_ROFS_IMAGE
+	string "Read-only filesystem image (absolute, or relative to the project)"
+	depends on RV32_FLASH_ROFS
+	default "build/guest/rofs-desktop.erofs"
+	help
+	  Built by scripts/build-desktop-rofs.sh or scripts/build-rofs.sh. If it
+	  is missing, the partition keeps whatever was flashed before.
 
 endmenu
 

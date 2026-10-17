@@ -19,21 +19,28 @@
 #include "sdkconfig.h"
 #include "esp_cpu.h"
 #include "esp_rom_sys.h"
+#include "esp_rom_serial_output.h"
 #include "esp_system.h"
+#include "esp_log.h"
 #endif
 
-#if CONFIG_RV32_HOST_PERF_STATS
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#if CONFIG_RV32_HOST_PERF_STATS
 #include "freertos/idf_additions.h"
 #endif
 
 #include "port.h"
+#include "rv32_diagnostics.h"
+#include "rv32_memory_placement.h"
+#include "reset_protocol.h"
 #if CONFIG_RV32_CACHE_PERF_STATS
 #include "host_cache_profile.h"
 #endif
 #include "cache.h"
 #include "display_bridge.h"
 #include "dwc2_passthrough.h"
+#include "rv32_host_wake.h"
 #include "psram.h"
 #include "pv_console_protocol.h"
 #if CONFIG_RV32_NATIVE_JIT
@@ -41,16 +48,17 @@
 #endif
 #include "virtio_console_bridge.h"
 #include "virtio_blk_bridge.h"
+#include "virtio_flash_bridge.h"
 #include "virtio_gpu_bridge.h"
 #include "virtio_net_bridge.h"
 
 static uint32_t ram_amt = GUEST_RAM_SIZE;
 static uint8_t *guest_ram;
 static uint8_t *linear_mmio_host;
+static uint32_t guest_reset_mode;
 
 #define EMULATOR_BATCH_INSTRUCTIONS 32768
 #define USB_STATUS_INTERVAL_US 500000u
-#define EMULATOR_DEBUG_CSR 0
 
 #if CONFIG_RV32_EMULATOR_PERF_STATS
 #define MINIRV32_PERF_STATS
@@ -84,6 +92,9 @@ static void HandleOtherCSRWrite(uint8_t *image, uint16_t csrno, uint32_t value);
 static int32_t HandleOtherCSRRead(uint8_t *image, uint16_t csrno);
 static void MiniSleep(void);
 
+volatile uint32_t rv32_host_wake;
+#define MINIRV32_HOST_WAKE_PENDING() (rv32_host_wake != 0u)
+
 #define MINIRV32WARN(x...) printf(x);
 #define MINI_RV32_RAM_SIZE ram_amt
 #define MINIRV32_IMPLEMENTATION
@@ -95,13 +106,60 @@ static void MiniSleep(void);
 #define MINIRV32_DECODED_BLOCK_CACHE
 #endif
 #if CONFIG_RV32_NATIVE_JIT
+/* Most probes land on heads that are still cold.  Skip RV32_JIT_PROBE_SKIP
+ * visits after each failed probe and let the next one count them all, so a
+ * head compiles after the same number of guest visits at an eighth of the
+ * probe cost.  A fresh region is entered at most that many visits late. */
+#define RV32_JIT_PROBE_SKIP 7u
+struct rv32_jit_probe_filter {
+	uint32_t guest_pc;
+	uint32_t skips;
+};
+static struct rv32_jit_probe_filter rv32_jit_probe_filter[256];
+
+static inline const struct rv32_native_jit_result *RV32JitTryFiltered(
+	uint32_t physical_offset, uint32_t guest_pc, uint32_t limit,
+	uint32_t context)
+{
+	struct rv32_jit_probe_filter *entry =
+		&rv32_jit_probe_filter[(guest_pc >> 2) & 255u];
+	uint32_t weight = 1u;
+	const struct rv32_native_jit_result *result;
+
+	if (entry->guest_pc == guest_pc) {
+		if (entry->skips != 0u) {
+			entry->skips--;
+			return NULL;
+		}
+		weight = RV32_JIT_PROBE_SKIP + 1u;
+	}
+#if CONFIG_RV32_HOST_PERF_STATS
+	result = rv32_native_jit_try_profiled(physical_offset, guest_pc, limit,
+					      context, weight);
+#else
+	result = rv32_native_jit_try_weighted(physical_offset, guest_pc, limit,
+					      context, weight);
+#endif
+	if (result == NULL) {
+		entry->guest_pc = guest_pc;
+		entry->skips = RV32_JIT_PROBE_SKIP;
+	} else if (entry->guest_pc == guest_pc) {
+		entry->guest_pc = UINT32_MAX;
+	}
+	return result;
+}
 #define MINIRV32_NATIVE_JIT_TRY(physical_offset, guest_pc, limit, context) \
-	rv32_native_jit_try((physical_offset), (guest_pc), (limit), (context))
+	RV32JitTryFiltered((physical_offset), (guest_pc), (limit), (context))
 #define MINIRV32_NATIVE_JIT_FLUSH() rv32_native_jit_flush()
 #define MINIRV32_NATIVE_JIT_MEMORY_FLUSH() \
 	rv32_native_jit_memory_cache_flush()
 #define MINIRV32_NATIVE_JIT_MEMORY_FLUSH_PAGE(virtual_address) \
 	rv32_native_jit_memory_cache_flush_page((virtual_address))
+#define MINIRV32_NATIVE_JIT_CACHE_RAM_PAGE(offset, va, context, write) \
+	rv32_native_jit_seed_ram_page((offset), (va), (context), (write))
+#if CONFIG_RV32_NATIVE_JIT_SUPERVISOR
+#define MINIRV32_NATIVE_JIT_MAX_PRIVILEGE 1u
+#endif
 #endif
 /* Per-instruction trap tracing is prohibitively expensive on the emulator. */
 #define MINIRV32_POSTEXEC(...) do { } while (0)
@@ -109,19 +167,13 @@ static void MiniSleep(void);
 #define MINIRV32_HANDLE_MEM_STORE_CONTROL(addy, val) \
 	do { \
 		size_t control_width = 1u << (MINIRV32_DECODE_FUNCT3() & 3u); \
-		if (display_bridge_contains((addy), control_width)) { \
-			display_bridge_store((addy), (val), control_width); \
-		} else if (HandleControlStore((addy), (val), control_width)) { \
+		if (HandleControlStore((addy), (val), control_width)) \
 			return (val); \
-		} \
 	} while (0)
 #define MINIRV32_HANDLE_MEM_LOAD_CONTROL(addy, rval) \
 	do { \
 		size_t control_width = 1u << (MINIRV32_DECODE_FUNCT3() & 3u); \
-		if (display_bridge_contains((addy), control_width)) \
-			rval = display_bridge_load((addy), control_width); \
-		else \
-			rval = HandleControlLoad((addy), control_width); \
+		rval = HandleControlLoad((addy), control_width); \
 		switch (MINIRV32_DECODE_FUNCT3()) { \
 		case 0: rval = (int8_t)rval; break; \
 		case 1: rval = (int16_t)rval; break; \
@@ -140,19 +192,25 @@ static void MiniSleep(void);
 #define MINIRV32_LINEAR_MMIO_BASE DISPLAY_FB_GUEST_BASE
 #define MINIRV32_LINEAR_MMIO_SIZE DISPLAY_FB_SIZE
 #define MINIRV32_LINEAR_MMIO_HOST linear_mmio_host
+#if CONFIG_RV32_DISPLAY_ASYNC_GUEST
+#define MINIRV32_LINEAR_MMIO_ACCESS() display_bridge_guest_framebuffer_access()
+#endif
 #define MINIRV32_LINEAR_MMIO_PUBLISH(start, end, calls, bytes) \
 	display_bridge_mark_framebuffer_dirty((start), (end), (calls), (bytes))
 #endif
+/* The USB controller and the PLIC first: interrupt handlers hit them most. */
 #define MINIRV32_IS_MMIO_ADDRESS(address) \
-	(((address) >= 0x10000000u && (address) < 0x12000200u) || \
+	(((address) >= 0x50000000u && (address) < 0x50040000u) || \
+	 ((address) >= 0x0c000000u && (address) < 0x0c400000u) || \
+	 ((address) >= 0x10000000u && (address) < 0x12000200u) || \
 	 ((address) >= VIRTIO_CONSOLE_GUEST_BASE && \
 	  (address) < VIRTIO_CONSOLE_GUEST_BASE + VIRTIO_CONSOLE_GUEST_SIZE) || \
 	 ((address) >= VIRTIO_BLK_GUEST_BASE && \
 	  (address) < VIRTIO_BLK_GUEST_BASE + VIRTIO_BLK_GUEST_SIZE) || \
+	 ((address) >= VIRTIO_FLASH_GUEST_BASE && \
+	  (address) < VIRTIO_FLASH_GUEST_BASE + VIRTIO_FLASH_GUEST_SIZE) || \
 	 ((address) >= VIRTIO_GPU_GUEST_BASE && \
-	  (address) < VIRTIO_GPU_GUEST_BASE + VIRTIO_GPU_GUEST_SIZE) || \
-	 ((address) >= 0x0c000000u && (address) < 0x0c400000u) || \
-	 ((address) >= 0x50000000u && (address) < 0x50040000u))
+	  (address) < VIRTIO_GPU_GUEST_BASE + VIRTIO_GPU_GUEST_SIZE))
 #define MINIRV32_LOAD4_UNCACHED(ofs) MiniRV32Load4Uncached(ofs)
 #define MINIRV32_LOAD2_UNCACHED(ofs) MiniRV32Load2Uncached(ofs)
 #define MINIRV32_LOAD1_UNCACHED(ofs) MiniRV32Load1Uncached(ofs)
@@ -283,7 +341,155 @@ void DumpState(struct MiniRV32IMAState *core)
 		regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31] );
 }
 
-struct MiniRV32IMAState core __attribute__((aligned(128)));
+RV32_HOT_STATE_BSS struct MiniRV32IMAState core __attribute__((aligned(128)));
+
+/* Stall reporter.  It runs on CPU1, so it still reports when the emulator
+ * core is stuck, and prints through ROM output, which polls the UART FIFO
+ * instead of depending on the UART task.  Three conditions: the emulator
+ * loop stops iterating; a USB interrupt was forwarded to the guest and never
+ * completed (the guest spins inside its handler while the loop keeps
+ * running); or heavy forwarded USB traffic.  After the second report of a
+ * hang it restarts the chip, since nothing else recovers the guest. */
+#define EMULATOR_WATCH_STALL_S    2u
+#define EMULATOR_WATCH_RESTART_S  12u
+#define EMULATOR_WATCH_USB_PER_S  100u
+#define EMULATOR_WATCH_USB_EVERY  5u
+#define EMULATOR_WATCH_PC_SAMPLES 8u
+
+static volatile uint32_t emulator_loops;
+static uint32_t plic_enable;
+static uint32_t plic_threshold;
+static uint32_t plic_priority[];
+static volatile uint32_t plic_claims[];
+static volatile uint32_t plic_completes[];
+static volatile uint32_t plic_last_claimed;
+static inline uint32_t plic_pending_sources(void);
+static uint32_t plic_claim(void);
+
+static void emulator_watch_dump(const char *what, uint32_t loops,
+				uint32_t instructions,
+				const struct dwc2_passthrough_stats *now,
+				const struct dwc2_passthrough_stats *last)
+{
+	uint32_t samples[EMULATOR_WATCH_PC_SAMPLES];
+
+	esp_rom_printf("[Host] %s loops/s=%u insn/s=%u pc=%08x priv=%u wfi=%u "
+		       "usb/s phys=%u fwd=%u done=%u pend=%u\r\n", what,
+		       (unsigned)loops, (unsigned)instructions,
+		       (unsigned)core.pc, (unsigned)(core.extraflags & 3u),
+		       (unsigned)((core.extraflags >> 2) & 1u),
+		       (unsigned)(now->physical - last->physical),
+		       (unsigned)(now->forwarded - last->forwarded),
+		       (unsigned)(now->completed - last->completed),
+		       (unsigned)now->pending);
+	{
+		struct dwc2_passthrough_channel_stats ch;
+
+		dwc2_passthrough_channel_stats(&ch);
+		esp_rom_printf("[USB] xfers=%u in=%u bytes=%u inval=%u nak=%u stall=%u "
+			       "err=%u tgl=%u ovr=%u last ep%u len%u "
+			       "%02x%02x%02x%02x%02x%02x%02x%02x\r\n",
+			       (unsigned)ch.completions, (unsigned)ch.in_completions,
+			       (unsigned)ch.in_bytes, (unsigned)ch.invalidations,
+			       (unsigned)ch.naks, (unsigned)ch.stalls,
+			       (unsigned)ch.errors, (unsigned)ch.toggle_errors,
+			       (unsigned)ch.frame_overruns, (unsigned)ch.last_in_ep,
+			       (unsigned)ch.last_in_len, ch.last_in_data[0],
+			       ch.last_in_data[1], ch.last_in_data[2],
+			       ch.last_in_data[3], ch.last_in_data[4],
+			       ch.last_in_data[5], ch.last_in_data[6],
+			       ch.last_in_data[7]);
+	}
+	if (strcmp(what, "USB load") == 0)
+		return;
+	esp_rom_printf("[Host] mstatus=%08x sie=%08x sip=%08x stvec=%08x "
+		       "sepc=%08x scause=%08x stval=%08x satp=%08x\r\n",
+		       (unsigned)core.mstatus, (unsigned)core.sie,
+		       (unsigned)core.sip, (unsigned)core.stvec,
+		       (unsigned)core.sepc, (unsigned)core.scause,
+		       (unsigned)core.stval, (unsigned)core.satp);
+	for (uint32_t i = 0; i < EMULATOR_WATCH_PC_SAMPLES; i++) {
+		samples[i] = core.pc;
+		esp_rom_delay_us(3000);
+	}
+	esp_rom_printf("[Host] pc samples %08x %08x %08x %08x %08x %08x %08x "
+		       "%08x ra=%08x sp=%08x\r\n", (unsigned)samples[0],
+		       (unsigned)samples[1], (unsigned)samples[2],
+		       (unsigned)samples[3], (unsigned)samples[4],
+		       (unsigned)samples[5], (unsigned)samples[6],
+		       (unsigned)samples[7], (unsigned)core.regs[1],
+		       (unsigned)core.regs[2]);
+	esp_rom_printf("[PLIC] enable=%08x threshold=%u pending=%08x claim-now=%u "
+		       "last=%u prio=%u,%u,%u,%u,%u,%u,%u\r\n",
+		       (unsigned)plic_enable, (unsigned)plic_threshold,
+		       (unsigned)plic_pending_sources(), (unsigned)plic_claim(),
+		       (unsigned)plic_last_claimed, (unsigned)plic_priority[1],
+		       (unsigned)plic_priority[2], (unsigned)plic_priority[3],
+		       (unsigned)plic_priority[4], (unsigned)plic_priority[5],
+		       (unsigned)plic_priority[6], (unsigned)plic_priority[7]);
+	esp_rom_printf("[PLIC] claims none=%u src1..7=%u,%u,%u,%u,%u,%u,%u "
+		       "completes=%u,%u,%u,%u,%u,%u,%u\r\n",
+		       (unsigned)plic_claims[0], (unsigned)plic_claims[1],
+		       (unsigned)plic_claims[2], (unsigned)plic_claims[3],
+		       (unsigned)plic_claims[4], (unsigned)plic_claims[5],
+		       (unsigned)plic_claims[6], (unsigned)plic_claims[7],
+		       (unsigned)plic_completes[1], (unsigned)plic_completes[2],
+		       (unsigned)plic_completes[3], (unsigned)plic_completes[4],
+		       (unsigned)plic_completes[5], (unsigned)plic_completes[6],
+		       (unsigned)plic_completes[7]);
+	dwc2_passthrough_dump();
+}
+
+static void emulator_watch_task(void *argument)
+{
+	struct dwc2_passthrough_stats last, now;
+	uint32_t last_loops = emulator_loops;
+	uint32_t last_instructions = core.cyclel;
+	uint32_t stalled = 0;
+	uint32_t stuck = 0;
+	uint32_t busy = 0;
+
+	(void)argument;
+	dwc2_passthrough_stats(&last);
+	for (;;) {
+		uint32_t loops;
+		uint32_t instructions;
+		uint32_t hung;
+		const char *what = NULL;
+
+		vTaskDelay(pdMS_TO_TICKS(1000));
+		loops = emulator_loops;
+		instructions = core.cyclel;
+		dwc2_passthrough_stats(&now);
+		stalled = loops == last_loops ? stalled + 1u : 0u;
+		stuck = now.pending && now.completed == last.completed ?
+				stuck + 1u : 0u;
+		busy = now.forwarded - last.forwarded >= EMULATOR_WATCH_USB_PER_S ?
+				busy + 1u : 0u;
+		hung = stalled > stuck ? stalled : stuck;
+		if (stalled >= EMULATOR_WATCH_STALL_S)
+			what = "EMULATOR STALLED";
+		else if (stuck >= EMULATOR_WATCH_STALL_S)
+			what = "GUEST STUCK IN USB IRQ";
+		else if (busy != 0u && busy % EMULATOR_WATCH_USB_EVERY == 1u)
+			what = "USB load";
+		if (what != NULL &&
+		    (hung < EMULATOR_WATCH_STALL_S ||
+		     (hung - EMULATOR_WATCH_STALL_S) % EMULATOR_WATCH_USB_EVERY == 0u))
+			emulator_watch_dump(what, loops - last_loops,
+					    instructions - last_instructions,
+					    &now, &last);
+		if (hung >= EMULATOR_WATCH_RESTART_S) {
+			esp_rom_printf("[Host] %s for %us; restarting\r\n", what,
+				       (unsigned)hung);
+			esp_rom_output_tx_wait_idle(CONFIG_ESP_CONSOLE_UART_NUM);
+			esp_restart();
+		}
+		last_loops = loops;
+		last_instructions = instructions;
+		last = now;
+	}
+}
 
 #if CONFIG_RV32_NATIVE_JIT
 static uint32_t RV32JitMemoryWidth(uint32_t funct3, bool load)
@@ -331,6 +537,36 @@ static inline void RV32JitCacheWritePage(
 			 __ATOMIC_RELEASE);
 }
 
+#if CONFIG_RV32_NATIVE_JIT_RAM_REFILL
+static bool IRAM_ATTR RV32JitRefillRam(
+	struct rv32_native_jit_runtime *runtime, uint32_t address, uint32_t access)
+{
+	struct MiniRV32IMAState *state = runtime->opaque;
+	bool write = (access & 8u) != 0u;
+	uint32_t width = RV32JitMemoryWidth(access & 7u, !write);
+	int fault = 0;
+	int uncached = 0;
+
+	if (width == 0u || (address & (width - 1u)) != 0u ||
+	    runtime->memory_context != MiniRV32NativeMemoryContext(state))
+		return false;
+	uint32_t physical = MiniRV32Translate(state, runtime->image, address,
+		write ? ACCESS_WRITE : ACCESS_READ, &fault, &uncached);
+	if (fault || uncached || physical < MINIRV32_RAM_IMAGE_OFFSET)
+		return false;
+	uint32_t offset = physical - MINIRV32_RAM_IMAGE_OFFSET;
+	if (ram_amt < 0x1000u || (offset & ~0xfffu) > ram_amt - 0x1000u)
+		return false;
+	/* Only publish the mapping; generated code retries the access itself. */
+	if (write)
+		RV32JitCacheWritePage(runtime, address, runtime->image + offset,
+				     UINT32_MAX, 0u);
+	else
+		RV32JitCacheReadPage(runtime, address, runtime->image + offset);
+	return true;
+}
+#endif
+
 static uint32_t IRAM_ATTR RV32JitMemoryLoad(
 	struct rv32_native_jit_runtime *runtime,
 	uint32_t virtual_address, uint32_t descriptor)
@@ -361,6 +597,8 @@ static uint32_t IRAM_ATTR RV32JitMemoryLoad(
 	if (physical_address >= MINIRV32_RAM_IMAGE_OFFSET) {
 		offset = physical_address - MINIRV32_RAM_IMAGE_OFFSET;
 		if (offset < ram_amt && width <= ram_amt - offset) {
+			RV32_JIT_TRACE_MEMORY(runtime, uncached ?
+				RV32_JIT_TRACE_MEMORY_UNCACHED : RV32_JIT_TRACE_MEMORY_RAM);
 			if (uncached) {
 				if (width == 4u)
 					value = MiniRV32Load4Uncached(offset);
@@ -395,6 +633,8 @@ static uint32_t IRAM_ATTR RV32JitMemoryLoad(
 	    width <= MINIRV32_LINEAR_MMIO_SIZE - offset) {
 		const uint8_t *source = linear_mmio_host + offset;
 
+		RV32_JIT_TRACE_MEMORY(runtime, RV32_JIT_TRACE_MEMORY_FRAMEBUFFER);
+		MINIRV32_LINEAR_MMIO_ACCESS();
 		if (width == 4u)
 			memcpy(&value, source, sizeof(value));
 		else if (width == 2u) {
@@ -419,6 +659,7 @@ static uint32_t IRAM_ATTR RV32JitMemoryLoad(
 #endif
 
 	if (MINIRV32_IS_MMIO_ADDRESS(physical_address)) {
+		RV32_JIT_TRACE_MEMORY(runtime, RV32_JIT_TRACE_MEMORY_DEVICE);
 		/* Let the interpreter perform side-effecting device accesses exactly
 		 * once.  Earlier native instructions remain committed. */
 		rv32_native_jit_memory_exit(runtime, descriptor, 0u, 0u);
@@ -458,6 +699,8 @@ static uint32_t IRAM_ATTR RV32JitMemoryStore(
 	if (physical_address >= MINIRV32_RAM_IMAGE_OFFSET) {
 		offset = physical_address - MINIRV32_RAM_IMAGE_OFFSET;
 		if (offset < ram_amt && width <= ram_amt - offset) {
+			RV32_JIT_TRACE_MEMORY(runtime, uncached ?
+				RV32_JIT_TRACE_MEMORY_UNCACHED : RV32_JIT_TRACE_MEMORY_RAM);
 			if (uncached) {
 				if (width == 4u)
 					MiniRV32Store4Uncached(offset, value);
@@ -488,6 +731,8 @@ static uint32_t IRAM_ATTR RV32JitMemoryStore(
 	    width <= MINIRV32_LINEAR_MMIO_SIZE - offset) {
 		uint8_t *destination = linear_mmio_host + offset;
 
+		RV32_JIT_TRACE_MEMORY(runtime, RV32_JIT_TRACE_MEMORY_FRAMEBUFFER);
+		MINIRV32_LINEAR_MMIO_ACCESS();
 		if (width == 4u)
 			memcpy(destination, &value, sizeof(value));
 		else if (width == 2u)
@@ -514,12 +759,59 @@ static uint32_t IRAM_ATTR RV32JitMemoryStore(
 #endif
 
 	if (MINIRV32_IS_MMIO_ADDRESS(physical_address)) {
+		RV32_JIT_TRACE_MEMORY(runtime, RV32_JIT_TRACE_MEMORY_DEVICE);
 		rv32_native_jit_memory_exit(runtime, descriptor, 0u, 0u);
 		return 1u;
 	}
 	rv32_native_jit_memory_exit(runtime, descriptor, 8u,
 				    virtual_address);
 	return 1u;
+}
+#endif
+
+#if CONFIG_RV32_JIT_EXIT_TRACE
+static uint32_t JitTraceAddressSpace(void) { return core.satp; }
+static uint64_t jit_trace_last_time;
+static RV32_STATE_BSS struct rv32_jit_trace_snapshot jit_trace_snapshot;
+
+static __attribute__((noinline, noclone)) void JitTraceReport(uint64_t now)
+{
+	uint64_t elapsed = now - jit_trace_last_time;
+	if (elapsed < (uint64_t)CONFIG_RV32_JIT_EXIT_TRACE_INTERVAL_MS * 1000u)
+		return;
+	jit_trace_last_time = now;
+	struct rv32_jit_trace_snapshot *s = &jit_trace_snapshot;
+	rv32_jit_trace_take(s);
+	uint64_t exits = 0u, cycles = 0u, candidates = 0u;
+	for (uint32_t i = 0; i < RV32_JIT_TRACE_REASON_COUNT; i++) {
+		if (i < RV32_JIT_TRACE_UNSUPPORTED) {
+			exits += s->reasons[i].count;
+			cycles += s->reasons[i].cycles;
+		} else candidates += s->reasons[i].count;
+	}
+	if (!exits && !candidates && !s->refills.count) return;
+	printf("JIT-EXIT at-us=%" PRIu64 " us=%" PRIu64 " checked=%" PRIu64 " callback-cycles=%" PRIu64
+	       " candidates=%" PRIu64 " refill=%" PRIu64 "/%" PRIu64
+	       " refill-cycles=%" PRIu64 " dropped=%" PRIu64 "/%" PRIu64 "\n",
+	       now, elapsed, exits, cycles, candidates, s->refill_resumes,
+	       s->refills.count, s->refills.cycles, s->dropped.count, s->dropped.cycles);
+	for (uint32_t i = 0; i < RV32_JIT_TRACE_REASON_COUNT; i++) {
+		if (s->reasons[i].count)
+			printf("JIT-REASON %s count=%" PRIu64 " cycles=%" PRIu64 "\n",
+			       rv32_jit_trace_reason_name(i), s->reasons[i].count,
+			       s->reasons[i].cycles);
+	}
+	for (uint32_t i = 0; i < RV32_JIT_TRACE_TOP; i++) {
+		const struct rv32_jit_trace_record *r = &s->top[i];
+		if (!r->total.count) break;
+		printf("JIT-SITE %s pc=%08" PRIx32 " phys-off=%08" PRIx32
+		       " insn=%08" PRIx32 " satp=%08" PRIx32
+		       " va=%08" PRIx32 "..%08" PRIx32 " trap=%" PRIu32
+		       " count=%" PRIu64 " cycles=%" PRIu64 "\n",
+		       rv32_jit_trace_reason_name(r->reason), r->pc, r->physical_offset,
+		       r->instruction, r->satp, r->first_address, r->last_address,
+		       r->trap, r->total.count, r->total.cycles);
+	}
 }
 #endif
 
@@ -539,7 +831,7 @@ static void EmulatorPerfStart(uint64_t current_time)
 	virtio_net_bridge_perf_snapshot(&emulator_perf_last_net);
 	virtio_blk_bridge_perf_snapshot(&emulator_perf_last_blk);
 }
-static void EmulatorPerfReport(uint64_t current_time)
+static __attribute__((noinline, noclone)) void EmulatorPerfReport(uint64_t current_time)
 {
 	uint64_t elapsed_us = current_time - emulator_perf_last_time;
 	uint64_t guest_cycle = ((uint64_t)core.cycleh << 32) | core.cyclel;
@@ -729,7 +1021,7 @@ static void HostPerfStart(uint64_t current_time)
 #endif
 }
 
-static void HostPerfReport(uint64_t current_time)
+static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_time)
 {
 	uint64_t elapsed_us = current_time - host_perf_last_time;
 	uint64_t guest_cycle;
@@ -819,6 +1111,10 @@ static void HostPerfReport(uint64_t current_time)
 	       display->framebuffer_guest_wait_max_us,
 	       display->framebuffer_snapshot_wait_us,
 	       display->framebuffer_snapshot_wait_max_us);
+	printf("[Display async] compute-slices=%" PRIu32
+	       " pixel-access-waits=%" PRIu32 "\n",
+	       display->framebuffer_async_slices,
+	       display->framebuffer_access_waits);
 	#define DISPLAY_AVG_CYCLES(total, count) \
 		((count) ? (total) / (count) : 0u)
 	printf("[Display cycles] dispatch=%" PRIu32 " total/%" PRIu32
@@ -906,6 +1202,45 @@ static void HostPerfReport(uint64_t current_time)
 		       jit->compiled_blocks - host_perf_last_jit.compiled_blocks,
 		       jit->rejected_blocks - host_perf_last_jit.rejected_blocks,
 		       jit->replacements - host_perf_last_jit.replacements);
+		printf("[JIT boundaries] window=%" PRIu64 " us cpu=%u MHz; "
+		       "C-try=%" PRIu64 " C-enter=%" PRIu64
+		       " blocks=%" PRIu64 " links=%" PRIu64
+		       "; inclusive-cycles=%" PRIu64 " native-cycles=%" PRIu64
+		       " compile-cycles=%" PRIu64 " resolve-cycles=%" PRIu64
+		       " probes=%" PRIu64 "/%" PRIu64 " cycles\n",
+		       elapsed_us, CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+		       jit->dispatch_attempts - host_perf_last_jit.dispatch_attempts,
+		       jit->native_entries - host_perf_last_jit.native_entries,
+		       calls, native_links,
+		       jit->dispatch_cycles - host_perf_last_jit.dispatch_cycles,
+		       jit->native_cycles - host_perf_last_jit.native_cycles,
+		       jit->compile_cycles - host_perf_last_jit.compile_cycles,
+		       jit->resolve_cycles - host_perf_last_jit.resolve_cycles,
+		       jit->probe_count - host_perf_last_jit.probe_count,
+		       jit->probe_cycles - host_perf_last_jit.probe_cycles);
+		{
+			static const char *const classes[RV32_NATIVE_JIT_UNSUPPORTED_CLASSES] = {
+				"ecall", "xret", "wfi", "sfence", "fencei", "cbo",
+				"time", "satp", "csr", "lrsc", "amo", "other",
+			};
+
+			printf("[JIT unsupported] probes:");
+			for (uint32_t c = 0; c < RV32_NATIVE_JIT_UNSUPPORTED_CLASSES; c++)
+				printf(" %s=%" PRIu64, classes[c],
+				       jit->unsupported_probes[c] -
+					       host_perf_last_jit.unsupported_probes[c]);
+			printf(" | cuts:");
+			for (uint32_t c = 0; c < RV32_NATIVE_JIT_UNSUPPORTED_CLASSES; c++)
+				printf(" %s=%" PRIu64, classes[c],
+				       jit->unsupported_cuts[c] -
+					       host_perf_last_jit.unsupported_cuts[c]);
+			printf("\n");
+		}
+		printf("[JIT RAM refill] attempts=%" PRIu64 " resumed=%" PRIu64
+		       " cycles=%" PRIu64 "\n",
+		       jit->ram_refill_attempts - host_perf_last_jit.ram_refill_attempts,
+		       jit->ram_refill_resumes - host_perf_last_jit.ram_refill_resumes,
+		       jit->ram_refill_cycles - host_perf_last_jit.ram_refill_cycles);
 		printf("[JIT compile] guest=%" PRIu64 " native=%" PRIu64
 		       " words; max=%" PRIu32 "/%" PRIu32
 		       "; reject collect=%" PRIu32 " size=%" PRIu32
@@ -923,17 +1258,26 @@ static void HostPerfReport(uint64_t current_time)
 			       host_perf_last_jit.rejected_codegen,
 			       jit->rejected_publish -
 				       host_perf_last_jit.rejected_publish);
-		printf("[JIT trace] joined=%" PRIu64 " jumps in %" PRIu32
-		       " regions; max=%" PRIu32 "; cross-page=%" PRIu32
-		       " regions/%" PRIu64 " chains; native-link=%" PRIu64 "\n",
-		       jit->traced_jumps - host_perf_last_jit.traced_jumps,
-		       jit->traced_regions - host_perf_last_jit.traced_regions,
-		       jit->max_traced_jumps,
-		       jit->cross_page_regions -
-			       host_perf_last_jit.cross_page_regions,
-		       jit->cross_page_chains -
-			       host_perf_last_jit.cross_page_chains,
-		       native_links);
+		{
+			static uint32_t last_fast_dispatches;
+			uint32_t fast_dispatches =
+				rv32_native_jit_fast_dispatch_count();
+
+			printf("[JIT trace] joined=%" PRIu64 " jumps in %" PRIu32
+			       " regions; max=%" PRIu32 "; cross-page=%" PRIu32
+			       " regions/%" PRIu64 " chains; native-link=%" PRIu64
+			       " fast-dispatch=%" PRIu32 "\n",
+			       jit->traced_jumps - host_perf_last_jit.traced_jumps,
+			       jit->traced_regions - host_perf_last_jit.traced_regions,
+			       jit->max_traced_jumps,
+			       jit->cross_page_regions -
+				       host_perf_last_jit.cross_page_regions,
+			       jit->cross_page_chains -
+				       host_perf_last_jit.cross_page_chains,
+			       native_links,
+			       fast_dispatches - last_fast_dispatches);
+			last_fast_dispatches = fast_dispatches;
+		}
 		printf("[JIT cache] resident=%" PRIu32 "/%" PRIu32
 		       " KiB head=%" PRIu32 "/%" PRIu32
 		       " KiB; evict arena=%" PRIu32 " tag=%" PRIu32
@@ -1010,10 +1354,14 @@ void app_main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef ESP_PLATFORM
+	if (!CONFIG_RV32_DIAGNOSTIC_LOGS)
+		esp_log_level_set("*", ESP_LOG_WARN);
 	/* The ROM banner precedes application UART setup and can be unreadable
 	 * at our console baud. Report the SDK's saved reset classification plus
 	 * raw core reasons once, without changing watchdog/reset behavior. */
-	printf("Reset diagnostic: idf=%u raw_cpu0=0x%x",
+	/* Always visible: an unexplained restart is otherwise only classified in
+	 * the ROM banner, which prints at the ROM baud rate. */
+	printf("Reset reason: idf=%u raw_cpu0=0x%x",
 	       (unsigned int)esp_reset_reason(),
 	       (unsigned int)esp_rom_get_reset_reason(0));
 #if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
@@ -1021,7 +1369,7 @@ void app_main(void)
 #endif
 	printf("\n");
 #endif
-	printf("psram init\n");
+	RV32_DIAG("psram init\n");
 
 	if (psram_init() < 0) {
 		printf("failed to init psram\n");
@@ -1042,31 +1390,51 @@ void app_main(void)
 		printf("WARNING: C6/virtio-net bridge initialization failed\n");
 	if (HostConsoleInit() < 0)
 		printf("WARNING: Asynchronous UART console unavailable\n");
+	if (HostBrownoutInit() < 0)
+		printf("WARNING: Brownout ride-through unavailable\n");
+	if (xTaskCreatePinnedToCore(emulator_watch_task, "emu_watch", 3072,
+				    NULL, tskIDLE_PRIORITY + 3u, NULL,
+				    CONFIG_FREERTOS_NUMBER_OF_CORES > 1 ? 1 : 0) !=
+	    pdPASS)
+		printf("WARNING: Emulator stall reporter unavailable\n");
 	if (virtio_console_bridge_init() < 0)
 		printf("WARNING: virtio-console bridge initialization failed\n");
 	if (virtio_blk_bridge_init() < 0)
 		printf("WARNING: microSD/virtio-blk bridge unavailable\n");
+	if (virtio_flash_bridge_init() < 0)
+		printf("WARNING: read-only flash disk unavailable\n");
 	if (virtio_gpu_bridge_init() < 0)
 		printf("WARNING: virtio-gpu bridge unavailable\n");
 #if CONFIG_RV32_NATIVE_JIT
 	if (!rv32_native_jit_init()) {
-		printf("ERROR: Native RV32 JIT initialization/self-test failed\n");
+		printf("ERROR: Native RV32 JIT initialization/self-test failed (group %" PRIu32 ")\n",
+		       rv32_native_jit_self_test_failure);
+#ifdef ESP_PLATFORM
+		/* Stay flashable: a halted emulator cannot run rv32-reboot. */
+		printf("Entering ROM download mode for recovery\n");
+		GuestUartFlush();
+		HostRestart(true);
+#endif
 		return;
 	}
 	{
-		struct rv32_native_jit_stats stats;
+		/* ~1 KiB: keep it off the 3.5 KiB main-task stack. */
+		static struct rv32_native_jit_stats stats;
 
 		rv32_native_jit_get_stats(&stats);
-		printf("Native RV32 JIT ready: self-tested, %u two-way region tags in a %" PRIu32 " KiB adaptive executable L2 arena + %" PRIu32 " KiB internal hot tier; ready-region chaining, one shared ABI frame\n",
+		RV32_DIAG("Native RV32 JIT ready: self-tested, %u two-way region tags in a %" PRIu32 " KiB adaptive executable L2 arena + %" PRIu32 " KiB internal hot tier; ready-region chaining, one shared ABI frame\n",
 		       RV32_NATIVE_JIT_CACHE_SLOTS,
 		       stats.arena_capacity_bytes / 1024u,
 		       stats.hot_arena_capacity_bytes / 1024u);
 	}
 #endif
 
-	printf("\nLoading kernel from flash...\n");
+	RV32_DIAG("\nLoading kernel from flash...\n");
 
+#ifndef ESP_PLATFORM
 	restart:
+#endif
+	guest_reset_mode = RV32_RESET_NORMAL;
 
 	if (load_images(ram_amt, NULL) < 0)
 		return;
@@ -1087,10 +1455,42 @@ void app_main(void)
 #if CONFIG_RV32_NATIVE_JIT
 	rv32_native_jit_bind(core.regs, guest_ram, &core,
 			     RV32JitMemoryLoad, RV32JitMemoryStore);
+#if CONFIG_RV32_NATIVE_JIT_RAM_REFILL
+	rv32_native_jit_set_ram_refill(RV32JitRefillRam);
+#endif
+	{
+#define RV32_CSR_OFFSET(field) \
+	((int32_t)offsetof(struct MiniRV32IMAState, field) - \
+	 (int32_t)offsetof(struct MiniRV32IMAState, regs))
+		const struct rv32_native_jit_csr_layout csr_layout = {
+			.sstatus = RV32_CSR_OFFSET(mstatus),
+			.sie = RV32_CSR_OFFSET(sie),
+			.stvec = RV32_CSR_OFFSET(stvec),
+			.sscratch = RV32_CSR_OFFSET(sscratch),
+			.sepc = RV32_CSR_OFFSET(sepc),
+			.scause = RV32_CSR_OFFSET(scause),
+			.stval = RV32_CSR_OFFSET(stval),
+			.sip = RV32_CSR_OFFSET(sip),
+			.satp = RV32_CSR_OFFSET(satp),
+			.extraflags = RV32_CSR_OFFSET(extraflags),
+		};
+#undef RV32_CSR_OFFSET
+		rv32_native_jit_set_csr_layout(&csr_layout);
+	}
+#if CONFIG_RV32_NATIVE_JIT_SUPERVISOR
+	rv32_native_jit_set_kernel_linear_map(MINIRV32_KERNEL_LINEAR_BASE,
+		MINI_RV32_RAM_SIZE - MINIRV32_KERNEL_LINEAR_PHYS_OFFSET);
+#endif
 #endif
 
 	uint64_t lastTime = GetTimeMicroseconds();
+#if CONFIG_RV32_JIT_EXIT_TRACE
+	rv32_jit_trace_start(JitTraceAddressSpace);
+	jit_trace_last_time = lastTime;
+#endif
+#if CONFIG_RV32_DEBUG_USB
 	uint64_t last_usb_status = lastTime;
+#endif
 	int instrs_per_flip = EMULATOR_BATCH_INSTRUCTIONS;
 #if CONFIG_RV32_EMULATOR_PERF_STATS
 	EmulatorPerfStart(lastTime);
@@ -1103,7 +1503,7 @@ void app_main(void)
 	HostCacheProfileStart();
 #endif
 	printf("RV32IMA starting\n");
-	printf("Initial PC: 0x%08" PRIx32 "\n", core.pc);
+	RV32_DIAG("Initial PC: 0x%08" PRIx32 "\n", core.pc);
 
 	while (1) {
 		int ret;
@@ -1112,21 +1512,35 @@ void app_main(void)
 
 		if (elapsedUs > 100000) elapsedUs = 100000;
 		lastTime = currentTime;
+		emulator_loops = emulator_loops + 1u;
+		rv32_host_wake = 0u;
 		GuestUartFlushIfDue(currentTime);
 		virtio_console_bridge_poll();
 		UpdatePlatformInterrupts(&core);
+#if CONFIG_RV32_DEBUG_USB
 		if (currentTime - last_usb_status >= USB_STATUS_INTERVAL_US) {
 			dwc2_passthrough_service();
 			last_usb_status = currentTime;
 		}
+#endif
 
-		display_bridge_guest_slice_begin();
+		if (!display_bridge_guest_slice_begin()) {
+#if CONFIG_RV32_NATIVE_JIT && CONFIG_RV32_DISPLAY_ACCEL
+			/* The next pixel access reacquires the surface through the
+			 * checked helper before a native mapping returns. */
+			rv32_native_jit_memory_cache_flush_host_range(
+				linear_mmio_host, DISPLAY_FB_SIZE);
+#endif
+		}
 		ret = MiniRV32IMAStep(&core, guest_ram, 0, elapsedUs,
 				       instrs_per_flip);
 		/* A fenced writer publishes explicitly. Legacy mmap writers publish
 		 * after their configured quiet period, so timer-interrupt slices inside
 		 * a scanline copy cannot expose a partially completed frame. */
 		display_bridge_guest_slice_end();
+#if CONFIG_RV32_JIT_EXIT_TRACE
+		JitTraceReport(GetTimeMicroseconds());
+#endif
 #if CONFIG_RV32_EMULATOR_PERF_STATS
 		EmulatorPerfReport(currentTime);
 #endif
@@ -1150,7 +1564,13 @@ void app_main(void)
 			case 3:
 				break;
 			case 0x7777:
+				GuestUartFlush();
+#ifdef ESP_PLATFORM
+				HostRestart(guest_reset_mode == RV32_RESET_DOWNLOAD);
+#else
 				goto restart;
+#endif
+				break;
 			case 0x5555:
 				GuestUartFlush();
 				printf("POWEROFF@0x%" PRIu32 "%"PRIu32"\n", core.cycleh, core.cyclel);
@@ -1278,7 +1698,8 @@ static void GuestParavirtualConsoleWrite(uint32_t virtual_address,
 #define PLIC_CONSOLE_SOURCE    VIRTIO_CONSOLE_PLIC_SOURCE
 #define PLIC_BLOCK_SOURCE      VIRTIO_BLK_PLIC_SOURCE
 #define PLIC_GPU_SOURCE        VIRTIO_GPU_PLIC_SOURCE
-#define PLIC_SOURCE_COUNT      6u
+#define PLIC_FLASH_SOURCE      VIRTIO_FLASH_PLIC_SOURCE
+#define PLIC_SOURCE_COUNT      7u
 #define PLIC_PENDING_BASE      0x00001000u
 #define PLIC_ENABLE_BASE       0x00002000u
 #define PLIC_CONTEXT_BASE      0x00200000u
@@ -1287,49 +1708,69 @@ static void GuestParavirtualConsoleWrite(uint32_t virtual_address,
 #define SIP_SEIP               (1u << 9)
 
 static uint32_t plic_priority[PLIC_SOURCE_COUNT + 1u] =
-	{ 0, 1, 1, 1, 1, 1, 1 };
+	{ 0, 1, 1, 1, 1, 1, 1, 1 };
 static uint32_t plic_enable;
+/* Diagnostics for the stall reporter: claims and completions per source,
+ * claims that found nothing, and the last source handed out. */
+static volatile uint32_t plic_claims[PLIC_SOURCE_COUNT + 1u];
+static volatile uint32_t plic_completes[PLIC_SOURCE_COUNT + 1u];
+static volatile uint32_t plic_last_claimed;
 static uint32_t plic_threshold;
+
+/* Once the virtio console's input queue is live it owns host UART RX, so
+ * ttyS0 must neither report nor consume those bytes.  Transmit stays with
+ * ttyS0: /dev/console writes drain only through THRE interrupts. */
+static inline bool uart_rx_ready(void)
+{
+	return !virtio_console_bridge_owns_uart_rx() && IsKBHit();
+}
 
 static bool uart_interrupt_pending(void)
 {
-	if (virtio_console_bridge_owns_uart_rx())
-		return false;
-	if ((uart_ier & UART_IER_RDI) && IsKBHit())
+	if ((uart_ier & UART_IER_RDI) && uart_rx_ready())
 		return true;
 
 	return (uart_ier & UART_IER_THRI) && uart_thre_irq_pending;
 }
 
-static bool plic_source_pending(uint32_t source)
+/* Bit n set while source n is pending.  The device getters are inline reads
+ * of each bridge's interrupt status; the UART check, which may consult the
+ * host UART driver, comes last. */
+static inline uint32_t plic_pending_sources(void)
 {
-	if (source == PLIC_UART_SOURCE)
-		return uart_interrupt_pending();
-	if (source == PLIC_USB_SOURCE)
-		return dwc2_passthrough_irq_pending();
-	if (source == PLIC_NET_SOURCE)
-		return virtio_net_bridge_irq_pending();
-	if (source == PLIC_CONSOLE_SOURCE)
-		return virtio_console_bridge_irq_pending();
-	if (source == PLIC_BLOCK_SOURCE)
-		return virtio_blk_bridge_irq_pending();
-	if (source == PLIC_GPU_SOURCE)
-		return virtio_gpu_bridge_irq_pending();
-	return false;
+	uint32_t pending = 0;
+
+	if (dwc2_passthrough_irq_pending())
+		pending |= 1u << PLIC_USB_SOURCE;
+	if (virtio_net_bridge_irq_pending())
+		pending |= 1u << PLIC_NET_SOURCE;
+	if (virtio_console_bridge_irq_pending())
+		pending |= 1u << PLIC_CONSOLE_SOURCE;
+	if (virtio_blk_bridge_irq_pending())
+		pending |= 1u << PLIC_BLOCK_SOURCE;
+	if (virtio_gpu_bridge_irq_pending())
+		pending |= 1u << PLIC_GPU_SOURCE;
+	if (virtio_flash_bridge_irq_pending())
+		pending |= 1u << PLIC_FLASH_SOURCE;
+	if (uart_interrupt_pending())
+		pending |= 1u << PLIC_UART_SOURCE;
+	return pending;
 }
 
 static uint32_t plic_claim(void)
 {
+	uint32_t candidates = plic_pending_sources() & plic_enable;
 	uint32_t best_source = 0;
 	uint32_t best_priority = plic_threshold;
 
-	for (uint32_t source = 1; source <= PLIC_SOURCE_COUNT; source++) {
-		if ((plic_enable & (1u << source)) &&
-		    plic_source_pending(source) &&
-		    plic_priority[source] > best_priority) {
+	while (candidates != 0u) {
+		uint32_t source = (uint32_t)__builtin_ctz(candidates);
+
+		if (plic_priority[source] > best_priority) {
 			best_source = source;
 			best_priority = plic_priority[source];
 		}
+		candidates &= candidates - 1u;
 	}
 	return best_source;
 }
@@ -1347,15 +1788,8 @@ static uint32_t PlicLoad(uint32_t addy)
 	    offset <= PLIC_SOURCE_COUNT * sizeof(uint32_t))
 		return plic_priority[offset / sizeof(uint32_t)];
 
-	if (offset == PLIC_PENDING_BASE) {
-		uint32_t pending = 0;
-
-		for (uint32_t source = 1; source <= PLIC_SOURCE_COUNT; source++) {
-			if (plic_source_pending(source))
-				pending |= 1u << source;
-		}
-		return pending;
-	}
+	if (offset == PLIC_PENDING_BASE)
+		return plic_pending_sources();
 
 	if (offset == PLIC_ENABLE_BASE)
 		return plic_enable;
@@ -1363,9 +1797,14 @@ static uint32_t PlicLoad(uint32_t addy)
 	if (offset == PLIC_CONTEXT_BASE + PLIC_CONTEXT_THRESHOLD)
 		return plic_threshold;
 
-	if (offset == PLIC_CONTEXT_BASE + PLIC_CONTEXT_CLAIM)
-		/* Both emulated devices are level-triggered. */
-		return plic_claim();
+	if (offset == PLIC_CONTEXT_BASE + PLIC_CONTEXT_CLAIM) {
+		/* Every emulated source is level-triggered. */
+		uint32_t source = plic_claim();
+
+		plic_claims[source] = plic_claims[source] + 1u;
+		plic_last_claimed = source;
+		return source;
+	}
 
 	return 0;
 }
@@ -1381,9 +1820,11 @@ static void PlicStore(uint32_t addy, uint32_t val)
 		plic_enable = val;
 	} else if (offset == PLIC_CONTEXT_BASE + PLIC_CONTEXT_THRESHOLD) {
 		plic_threshold = val;
-	} else if (offset == PLIC_CONTEXT_BASE + PLIC_CONTEXT_CLAIM &&
-		   val == PLIC_USB_SOURCE) {
-		dwc2_passthrough_irq_complete();
+	} else if (offset == PLIC_CONTEXT_BASE + PLIC_CONTEXT_CLAIM) {
+		if (val <= PLIC_SOURCE_COUNT)
+			plic_completes[val] = plic_completes[val] + 1u;
+		if (val == PLIC_USB_SOURCE)
+			dwc2_passthrough_irq_complete();
 	}
 }
 
@@ -1397,9 +1838,23 @@ static void UpdatePlatformInterrupts(struct MiniRV32IMAState *state)
 	}
 }
 
+/* Same test as every bridge's contains(): the whole access lies inside. */
+static inline bool MmioRangeContains(uint32_t addy, size_t width,
+				     uint32_t base, uint32_t size)
+{
+	return width != 0 && width <= sizeof(uint32_t) && addy >= base &&
+	       addy - base <= size - width;
+}
+
 static uint32_t HandleControlStore(
 	uint32_t addy, uint32_t val, size_t width)
 {
+	if (addy == RV32_RESET_BASE + RV32_RESET_MODE_OFFSET &&
+	    width == sizeof(uint32_t)) {
+		/* Invalid requests disarm a previously selected download boot. */
+		guest_reset_mode = val == RV32_RESET_DOWNLOAD ? val : RV32_RESET_NORMAL;
+		return 0;
+	}
 	if (addy == RV32_PV_CONSOLE_BASE + RV32_PV_CONSOLE_POINTER_OFFSET &&
 	    width == sizeof(uint32_t)) {
 		pv_console_pointer = val;
@@ -1411,38 +1866,43 @@ static uint32_t HandleControlStore(
 		return 0;
 	}
 
-	if (display_bridge_contains(addy, width)) {
-		display_bridge_store(addy, val, width);
-		return 0;
-	}
-
-	if (dwc2_passthrough_contains(addy, width)) {
+	/* Interrupt handlers touch the USB controller and the PLIC far more often
+	 * than anything else; the virtio range tests are inline. */
+	if (MmioRangeContains(addy, width, DWC2_GUEST_BASE, DWC2_GUEST_SIZE)) {
 		dwc2_passthrough_store(addy, val, width);
 		return 0;
 	}
-
-	if (virtio_net_bridge_contains(addy, width)) {
+	if (addy >= PLIC_BASE && addy < PLIC_BASE + PLIC_SIZE) {
+		PlicStore(addy, val);
+		return 0;
+	}
+	if (MmioRangeContains(addy, width, VIRTIO_NET_GUEST_BASE,
+			      VIRTIO_NET_GUEST_SIZE)) {
 		virtio_net_bridge_store(addy, val, width);
 		return 0;
 	}
-
-	if (virtio_console_bridge_contains(addy, width)) {
+	if (MmioRangeContains(addy, width, VIRTIO_CONSOLE_GUEST_BASE,
+			      VIRTIO_CONSOLE_GUEST_SIZE)) {
 		virtio_console_bridge_store(addy, val, width);
 		return 0;
 	}
-
-	if (virtio_blk_bridge_contains(addy, width)) {
+	if (MmioRangeContains(addy, width, VIRTIO_BLK_GUEST_BASE,
+			      VIRTIO_BLK_GUEST_SIZE)) {
 		virtio_blk_bridge_store(addy, val, width);
 		return 0;
 	}
-
-	if (virtio_gpu_bridge_contains(addy, width)) {
+	if (MmioRangeContains(addy, width, VIRTIO_FLASH_GUEST_BASE,
+			      VIRTIO_FLASH_GUEST_SIZE)) {
+		virtio_flash_bridge_store(addy, val, width);
+		return 0;
+	}
+	if (MmioRangeContains(addy, width, VIRTIO_GPU_GUEST_BASE,
+			      VIRTIO_GPU_GUEST_SIZE)) {
 		virtio_gpu_bridge_store(addy, val, width);
 		return 0;
 	}
-
-	if (addy >= PLIC_BASE && addy < PLIC_BASE + PLIC_SIZE) {
-		PlicStore(addy, val);
+	if (display_bridge_contains(addy, width)) {
+		display_bridge_store(addy, val, width);
 		return 0;
 	}
 
@@ -1478,6 +1938,12 @@ static uint32_t HandleControlStore(
 
 static uint32_t HandleControlLoad(uint32_t addy, size_t width)
 {
+	if (width == sizeof(uint32_t)) {
+		if (addy == RV32_RESET_BASE + RV32_RESET_MAGIC_OFFSET)
+			return RV32_RESET_MAGIC;
+		if (addy == RV32_RESET_BASE + RV32_RESET_MODE_OFFSET)
+			return guest_reset_mode;
+	}
 	if (width == sizeof(uint32_t) &&
 	    addy == RV32_PV_CONSOLE_BASE + RV32_PV_CONSOLE_MAGIC_OFFSET)
 		return RV32_PV_CONSOLE_MAGIC;
@@ -1485,37 +1951,38 @@ static uint32_t HandleControlLoad(uint32_t addy, size_t width)
 	    addy == RV32_PV_CONSOLE_BASE + RV32_PV_CONSOLE_MAX_LENGTH_OFFSET)
 		return RV32_PV_CONSOLE_MAX_LENGTH;
 
-	if (display_bridge_contains(addy, width))
-		return display_bridge_load(addy, width);
-
-	if (dwc2_passthrough_contains(addy, width))
+	if (MmioRangeContains(addy, width, DWC2_GUEST_BASE, DWC2_GUEST_SIZE))
 		return dwc2_passthrough_load(addy, width);
-
-	if (virtio_net_bridge_contains(addy, width))
-		return virtio_net_bridge_load(addy, width);
-
-	if (virtio_console_bridge_contains(addy, width))
-		return virtio_console_bridge_load(addy, width);
-
-	if (virtio_blk_bridge_contains(addy, width))
-		return virtio_blk_bridge_load(addy, width);
-
-	if (virtio_gpu_bridge_contains(addy, width))
-		return virtio_gpu_bridge_load(addy, width);
-
 	if (addy >= PLIC_BASE && addy < PLIC_BASE + PLIC_SIZE)
 		return PlicLoad(addy);
+	if (MmioRangeContains(addy, width, VIRTIO_NET_GUEST_BASE,
+			      VIRTIO_NET_GUEST_SIZE))
+		return virtio_net_bridge_load(addy, width);
+	if (MmioRangeContains(addy, width, VIRTIO_CONSOLE_GUEST_BASE,
+			      VIRTIO_CONSOLE_GUEST_SIZE))
+		return virtio_console_bridge_load(addy, width);
+	if (MmioRangeContains(addy, width, VIRTIO_BLK_GUEST_BASE,
+			      VIRTIO_BLK_GUEST_SIZE))
+		return virtio_blk_bridge_load(addy, width);
+	if (MmioRangeContains(addy, width, VIRTIO_FLASH_GUEST_BASE,
+			      VIRTIO_FLASH_GUEST_SIZE))
+		return virtio_flash_bridge_load(addy, width);
+	if (MmioRangeContains(addy, width, VIRTIO_GPU_GUEST_BASE,
+			      VIRTIO_GPU_GUEST_SIZE))
+		return virtio_gpu_bridge_load(addy, width);
+	if (display_bridge_contains(addy, width))
+		return display_bridge_load(addy, width);
 
     switch (addy) {
         case 0x10000000:
 			if (uart_lcr & 0x80)
 				return uart_divisor & 0xff;
-			return IsKBHit() ? ReadKBByte() : 0;
+			return uart_rx_ready() ? ReadKBByte() : 0;
         case 0x10000001:
             if (uart_lcr & 0x80) return (uart_divisor >> 8) & 0xFF;
             return uart_ier;
 		case 0x10000002:
-			if ((uart_ier & UART_IER_RDI) && IsKBHit())
+			if ((uart_ier & UART_IER_RDI) && uart_rx_ready())
 				return 0xC4; /* FIFO enabled, received data available. */
 			if ((uart_ier & UART_IER_THRI) && uart_thre_irq_pending) {
 				uart_thre_irq_pending = false;
@@ -1525,7 +1992,7 @@ static uint32_t HandleControlLoad(uint32_t addy, size_t width)
         case 0x10000003: return uart_lcr;
         case 0x10000004: return uart_mcr;
         case 0x10000005:
-          return 0x60 | (IsKBHit() ? 1 : 0);
+          return 0x60 | (uart_rx_ready() ? 1 : 0);
         case 0x10000006: return 0x00;
         case 0x10000007: return uart_scratch;
     }
@@ -1535,7 +2002,7 @@ static void HandleOtherCSRWrite(uint8_t *image, uint16_t csrno, uint32_t value)
 {
 	uint32_t ptrstart, ptrend;
 
-	#if EMULATOR_DEBUG_CSR
+	#if CONFIG_RV32_DEBUG_CSR
 	if (csrno != 0x136 && csrno != 0x137 && csrno != 0x138 &&
 		csrno != 0x139 && csrno != 0x3a0 && csrno != 0x3b0 && csrno != 0xf14) {
 		static int csr_write_count = 0;
@@ -1587,7 +2054,7 @@ static int32_t HandleOtherCSRRead(uint8_t *image, uint16_t csrno)
 			result = ReadKBByte();
 	}
 
-	#if EMULATOR_DEBUG_CSR
+	#if CONFIG_RV32_DEBUG_CSR
 	if (csrno != 0x140 && csrno != 0xC00 && csrno != 0x3a0 &&
 		csrno != 0x3b0 && csrno != 0xf14 && result == 0) {
 		static int csr_warn_count = 0;

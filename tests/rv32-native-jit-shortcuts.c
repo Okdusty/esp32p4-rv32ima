@@ -86,7 +86,7 @@ static bool test_access(bool store, uint32_t width, uint32_t scenario)
 	uint32_t trap_address = 0u;
 	uint32_t dirty_start = UINT32_MAX;
 	uint32_t dirty_end = 0u;
-	struct rv32_native_jit_runtime *runtime = &jit_runtime;
+	struct rv32_native_jit_runtime *runtime = jit_rt;
 
 	switch (scenario) {
 	case 1: address++; break;                 /* initially misaligned */
@@ -155,7 +155,7 @@ static bool test_access(bool store, uint32_t width, uint32_t scenario)
 		.sites = jit_memory_sites[0], .site_count = jit_entries[0].memory_site_count,
 		.result = { .executed = UINT32_MAX, .linear_dirty_start = UINT32_MAX },
 	};
-	jit_invalidate_memory_pages();
+	jit_invalidate_memory_pages(jit_rt);
 	for (uint32_t page = 0; page < 2u; page++) {
 		if ((pages & (1u << page)) == 0u) continue;
 		uint32_t tag = (TEST_DATA >> 12) + page;
@@ -210,7 +210,7 @@ static bool test_link_endpoint_promotion(void)
 	    !jit_compile(target_slot, (const uint8_t *)program, 64u, TEST_PC + 64u, 3u))
 		return false;
 	rv32_native_jit_bind(regs, (uint8_t *)program, NULL, fault_load, fault_store);
-	jit_runtime.memory_context = 0u;
+	jit_rt->memory_context = 0u;
 	jit_links[source_slot].expected_next_pc = TEST_PC + 64u;
 	jit_links[source_slot].packed_target = jit_pack_link_target(target_slot, &jit_entries[target_slot]);
 	jit_hot_entries[target_slot].calls = JIT_HOT_LOOP_ADMIT_CALLS - 1u;

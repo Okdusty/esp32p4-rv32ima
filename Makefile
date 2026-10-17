@@ -1,5 +1,5 @@
-.PHONY: guest guest-rootfs guest-image guest-dtb guest-verify test \
-	test-emulator clean distclean
+.PHONY: guest guest-rootfs guest-image guest-dtb guest-desktop guest-verify test \
+	test-emulator test-reboot test-palette clean distclean
 
 guest:
 	./scripts/build-guest.sh
@@ -13,13 +13,22 @@ guest-image:
 guest-dtb:
 	./scripts/build-dtb.sh all
 
+guest-desktop:
+	./scripts/build-desktop-rofs.sh
+
 guest-verify:
 	./scripts/verify-guest-image.py main/Image
 
-test: test-emulator
+test: test-emulator test-reboot test-palette
 
 test-emulator:
 	./scripts/test-emulator.sh
+
+test-reboot:
+	./scripts/test-reboot.sh
+
+test-palette:
+	./scripts/test-rgb565.sh
 
 clean:
 	./scripts/clean-guest.sh clean

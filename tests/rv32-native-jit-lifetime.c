@@ -43,7 +43,7 @@ static bool lifetime_execute(bool linked, uint32_t value)
 {
 	uint32_t regs[32];
 	uint32_t expected[32];
-	struct rv32_native_jit_runtime *runtime = &jit_runtime;
+	struct rv32_native_jit_runtime *runtime = jit_rt;
 
 	for (uint32_t i = 0u; i < 32u; i++)
 		regs[i] = expected[i] = 0x12340000u + i;
