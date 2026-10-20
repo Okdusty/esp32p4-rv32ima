@@ -82,7 +82,12 @@ static void dwc2_track_hcint(uint32_t channel, uint32_t hcint)
 	uint32_t remaining = USB_DWC_HS.host_chans[channel].hctsiz_reg.val &
 			     0x7ffffu;
 	bool in = (track->hcchar >> 15) & 1u;
+	uint32_t ep = (track->hcchar >> 11) & 0xfu;
 
+	if (in && (hcint & DWC2_HCINT_NAK))
+		channel_stats.ep_nak[ep]++;
+	if (in && (hcint & DWC2_HCINT_FRMOVRUN))
+		channel_stats.ep_ovr[ep]++;
 	if (hcint & DWC2_HCINT_XFERCOMPL) {
 		channel_stats.completions++;
 		if (in && programmed > remaining) {
@@ -93,6 +98,7 @@ static void dwc2_track_hcint(uint32_t channel, uint32_t hcint)
 
 			channel_stats.in_bytes += received;
 			channel_stats.in_completions++;
+			channel_stats.ep_in[ep]++;
 			if (esp_ptr_external_ram((void *)track->hcdma) &&
 			    esp_cache_msync((void *)start, end - start,
 					    ESP_CACHE_MSYNC_FLAG_DIR_M2C |
@@ -363,7 +369,9 @@ uint32_t dwc2_passthrough_load(uint32_t address, size_t width)
 	uint32_t shift = (address & 3u) * 8u;
 	uint32_t value;
 
-	if (!dwc2_passthrough_contains(address, width))
+	/* Without the passthrough (USB port on CPU1) the registers are not
+	 * Linux's to touch. */
+	if (!initialized || !dwc2_passthrough_contains(address, width))
 		return 0;
 #if CONFIG_RV32_DEBUG_USB
 	guest_read_seen = true;
@@ -393,7 +401,7 @@ void dwc2_passthrough_store(uint32_t address, uint32_t value, size_t width)
 	uint32_t shift;
 	uint32_t mask;
 
-	if (!dwc2_passthrough_contains(address, width))
+	if (!initialized || !dwc2_passthrough_contains(address, width))
 		return;
 #if CONFIG_RV32_DEBUG_USB
 	guest_write_seen = true;

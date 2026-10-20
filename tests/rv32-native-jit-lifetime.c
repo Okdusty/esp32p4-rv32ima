@@ -24,19 +24,22 @@ static bool lifetime_train_target(void)
 {
 	for (uint32_t i = 0u; i < JIT_LINK_CONFIRMATIONS; i++)
 		jit_observe_link(0u, LIFETIME_PC + 0x100u, 1u, &jit_entries[1]);
-	/* A second real source has an unconfirmed observation of this target. */
+	/* A second real source observes this target once per call.  Its
+	 * candidate outlives evictions of the target, so after enough calls it
+	 * publishes a link of its own; every eviction below must clear that. */
 	jit_observe_link(3u, LIFETIME_PC + 0x100u, 1u, &jit_entries[1]);
-	return jit_links[0].packed_target != 0u &&
-		jit_link_candidates[3].candidate_target != 0u;
+	return jit_links[0].packed_target != 0u;
 }
 
+/* Link candidates (training references) are never executed or published:
+ * a confirmed candidate publishes the target found at that moment.  So
+ * promotion and eviction leave them alone, and only the published link must
+ * follow the code. */
 static bool lifetime_target_points_to(const uint32_t *code)
 {
 	uint32_t pointer = (uint32_t)(uintptr_t)code;
 	return jit_link_target_pointer(jit_links[0].packed_target) == pointer &&
-		jit_links[0].expected_next_pc == LIFETIME_PC + 0x100u &&
-		jit_link_target_pointer(jit_link_candidates[3].candidate_target) == pointer &&
-		jit_link_candidates[3].candidate_next_pc == LIFETIME_PC + 0x100u;
+		jit_links[0].expected_next_pc == LIFETIME_PC + 0x100u;
 }
 
 static bool lifetime_execute(bool linked, uint32_t value)
@@ -125,8 +128,8 @@ static int test_lifetime(void)
 		    !lifetime_execute(true, value))
 			return 30;
 		/* Recompile one other loop until its cold bytes overwrite the target.
-		 * Removing the authoritative cold copy must invalidate its hot copy,
-		 * both published and training references, before any bytes are reused. */
+		 * Removing the authoritative cold copy must invalidate its hot copy
+		 * and every published reference before any bytes are reused. */
 		for (uint32_t i = 0u;
 		     i <= jit_loop_code_units && jit_entries[1].state == JIT_ENTRY_READY;
 		     i++) {
@@ -136,7 +139,7 @@ static int test_lifetime(void)
 		if (jit_entries[1].state == JIT_ENTRY_READY ||
 		    jit_hot_entries[1].location != 0u ||
 		    jit_links[0].packed_target != 0u ||
-		    jit_link_candidates[3].candidate_target != 0u ||
+		    jit_links[3].packed_target != 0u ||
 		    jit_entries[0].state != JIT_ENTRY_READY ||
 		    !lifetime_execute(false, 0u))
 			return 32;
@@ -148,9 +151,19 @@ static int test_lifetime(void)
 	    !jit_promote_hot_code(1u, &jit_entries[1], true) ||
 	    jit_compile(1u, (const uint8_t *)unsupported, 0u, LIFETIME_PC + 0x100u, 3u) ||
 	    jit_links[0].packed_target != 0u ||
-	    jit_link_candidates[3].candidate_target != 0u ||
+	    jit_links[3].packed_target != 0u ||
 	    jit_hot_entries[1].location != 0u || !lifetime_execute(false, 0u))
 		return 40;
+	/* Source 3 still holds an observation of the retired code.  Confirming it
+	 * must publish the current region, never the stale pointer. */
+	if (!lifetime_compile_loop(1u, LIFETIME_PC + 0x100u, 11u))
+		return 44;
+	for (uint32_t i = 0u; i < JIT_LINK_CONFIRMATIONS; i++)
+		jit_observe_link(3u, LIFETIME_PC + 0x100u, 1u, &jit_entries[1]);
+	if (jit_link_target_pointer(jit_links[3].packed_target) !=
+		    (uint32_t)(uintptr_t)jit_entry_code(1u) ||
+	    jit_links[3].expected_next_pc != LIFETIME_PC + 0x100u)
+		return 45;
 	if (jit_stats.hot_promotions < LIFETIME_HOT_PAIRS * 2u ||
 	    jit_stats.hot_evictions < LIFETIME_HOT_PAIRS ||
 	    jit_stats.arena_evictions < LIFETIME_COLD_CYCLES || jit_stats.arena_wraps == 0u)

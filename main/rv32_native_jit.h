@@ -70,6 +70,9 @@ struct rv32_native_jit_runtime {
 	uint32_t chain_executed;
 	uint32_t chain_blocks;
 	uint32_t chain_links;
+	/* Set by rv32_native_jit_dispatch when the directory has no ready region
+	 * for this exit target, so C does not search for it again. */
+	uint32_t dispatch_miss_pc;
 	struct rv32_native_jit_read_page
 		read_pages[RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES];
 	struct rv32_native_jit_write_page
@@ -152,6 +155,8 @@ struct rv32_native_jit_stats {
 	uint32_t arena_evictions;
 	uint32_t tag_evictions;
 	uint32_t arena_wraps;
+	uint32_t translation_flushes;	/* links, jump cache, exec pages */
+	uint32_t fences;		/* guest FENCE.I */
 	uint32_t hot_promotions;
 	uint32_t hot_evictions;
 	uint32_t hot_arena_wraps;
@@ -170,6 +175,26 @@ struct rv32_native_jit_stats {
 	uint32_t profile_discarded_guest_instructions;
 	struct rv32_native_jit_region_stats
 		profile_top_regions[RV32_NATIVE_JIT_PROFILE_TOP_REGIONS];
+	/* CONFIG_RV32_NATIVE_JIT_ASYNC_COMPILE: heads queued for the other core,
+	 * regions installed from it, results dropped because a flush came
+	 * first, because the head had compiled meanwhile or because its set
+	 * was full, heads left interpreted while the queue was full, and
+	 * compiles done here instead (traces crossing pages). */
+	uint32_t async_submitted;
+	uint32_t async_installed;
+	uint32_t async_stale;
+	uint32_t async_duplicates;
+	uint32_t async_set_full;
+	uint32_t async_queue_full;
+	uint32_t async_local;
+	uint64_t async_worker_cycles;
+	/* Emulator-core cost of installing regions (HOST_PERF_STATS): whole
+	 * installs, the jit_forget_entry calls within them, and cache publish. */
+	uint64_t install_cycles;
+	uint64_t forget_cycles;
+	uint64_t publish_cycles;
+	uint32_t installs;
+	uint32_t forgets;
 };
 
 /*
@@ -179,6 +204,10 @@ struct rv32_native_jit_stats {
  * Sv32, uncached DMA or MMIO rules.  Machine-mode contexts are never native.
  */
 bool rv32_native_jit_init(void);
+/* Starts the CPU1 compile worker (CONFIG_RV32_NATIVE_JIT_ASYNC_COMPILE);
+ * call after bind and the CSR layout, before execution.  Without it, or if
+ * it cannot start, regions compile on the calling core. */
+void rv32_native_jit_start_async_compiler(void);
 void rv32_native_jit_bind(
 	uint32_t *guest_regs, uint8_t *guest_ram, void *opaque,
 	uint32_t (*load)(struct rv32_native_jit_runtime *runtime,
@@ -226,6 +255,24 @@ const struct rv32_native_jit_result *rv32_native_jit_try_profiled(
 	uint32_t instruction_limit, uint32_t memory_context,
 	uint32_t warm_weight);
 void rv32_native_jit_flush(void);
+/* FENCE.I: rv32_native_jit_flush, or with CONFIG_RV32_NATIVE_JIT_KEEP_KERNEL
+ * only the user regions unless kernel code was written since the last
+ * flush. */
+void rv32_native_jit_fence(void);
+/* A write mapping of the guest RAM page at physical_offset was just made. */
+void rv32_native_jit_note_write_page(uint32_t physical_offset);
+#if CONFIG_RV32_GUEST_HLE
+/* Runs guest library routine `kind` (guest_hle.h) on the host for the
+ * current supervisor call and returns true, or returns false having changed
+ * nothing that the guest's own code would not also change. */
+typedef bool (*rv32_native_jit_hle_fn)(uint32_t kind);
+void rv32_native_jit_set_hle(rv32_native_jit_hle_fn run, uint32_t ram_size);
+#endif
+#if CONFIG_RV32_GUEST_PROFILE
+/* Credits every resident region's entry counter to the guest profile and
+ * clears it.  Runs on the emulator core. */
+void rv32_native_jit_profile_fold_live(void);
+#endif
 void rv32_native_jit_memory_cache_flush(void);
 void rv32_native_jit_memory_cache_flush_page(uint32_t virtual_address);
 /* Call only between native executions. Revoke all cached data translations

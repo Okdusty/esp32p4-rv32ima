@@ -81,6 +81,34 @@ and the kernel with SUM set keep separate data-page caches, so system calls
 and interrupts switch caches instead of flushing them. Machine mode, CSR,
 atomic and trap-return instructions stay in the interpreter.
 
+With **Compile native regions on the second core** (on by default), CPU1
+compiles: the emulator core queues a hot block, keeps interpreting it, and
+installs the finished region a moment later, so compiling no longer stops
+the guest ([measurements](docs/jit-async-compile-2026-10-18.md)).
+
+With **Keep kernel regions across FENCE.I** (on by default), the `fence.i`
+that Linux issues after mapping each new executable user page drops only
+compiled user code: kernel code, its links and every warm-up count stay (a
+write to the kernel's own text still discards everything). Kernel and user
+code take separate halves of the code arena, so the user code compiled after
+each fence cannot push kernel code out, and context switches keep the kernel's
+native links ([measurements](docs/jit-cpu0-overheads-2026-10-19.md)).
+
+### USB port
+
+**USB port** (RV32 Linux hardware bridges) chooses who drives the USB host
+port. With **Linux (any USB device)**, the default, the guest's dwc2 driver
+owns the controller: memory sticks, hubs, keyboards and mice all work, but
+every USB interrupt runs through the emulated kernel (about 1.2 ms each), so an
+idle mouse alone takes a sixth of the guest's CPU. With **Keyboard and mouse
+on CPU1**, ESP-IDF's USB host and HID drivers read boot-protocol keyboards and
+mice (also through a hub) on CPU1 and hand keys, buttons, motion and wheels
+to Linux as one virtio-input device (`/dev/input/event0`, used by the console
+and by X); idle devices cost the guest nothing, mouse motion reaches it at
+most 100 times a second, and Caps/Num/Scroll Lock go back to the keyboard.
+Other USB devices are not available to Linux in that mode. Either way, plug
+devices in before power-up: plugging in or out resets the board.
+
 ### Read-only desktop disk
 
 The 32 MiB layout adds a 16 MiB `rofs` partition that Linux sees as a
@@ -88,14 +116,19 @@ read-only virtio disk and mounts at `/opt`. Build the image, then enable
 **Serve a read-only guest filesystem from flash** in menuconfig:
 
 ```sh
-make guest-desktop   # Buildroot: Xorg, Window Maker, xterm, xeyes, vim, ...
+make guest-desktop   # Buildroot: Xorg, Window Maker, xterm, vim, curl, fastfetch, ...
 idf.py build flash
 ```
 
-On the guest, `/opt/start-desktop` starts Window Maker on the display (with a
-USB keyboard and mouse) and `/opt/vim` runs vim from the shell. With the option
-off, the disk is absent and the firmware is the plain console image.
-`scripts/build-rofs.sh DIR` packs any other directory instead.
+On the guest, `startx` starts Window Maker on the display (with a USB keyboard
+and mouse). It runs `~/.xinitrc`, which mounts the disk's writable
+directories, starts X in the disk with chroot and, under X, is the session
+(the background is `themes/pattern.xbm`). The desktop shares root's home with
+the shell, so `~/.config/fastfetch` (the logo from `themes/logo.txt`) applies
+to both. `/opt` is on the shell's `PATH`, so `vim`, `curl` and `fastfetch` run
+the disk's programs. With the option off, the disk is absent and the firmware
+is the plain console image. `scripts/build-rofs.sh DIR` packs any other
+directory instead.
 
 ### Guest reboot and download mode
 
@@ -111,8 +144,9 @@ changes made there are lost on restart.
 ### SSH and file transfers
 
 The guest uses the static address `192.168.1.220/24` with gateway
-`192.168.1.1` (set in `guest/rv32-init.c`) and runs Dropbear with an SFTP
-server:
+`192.168.1.1` (set in `guest/rv32-init.c`), sets its clock once from
+`pool.ntp.org` at boot (there is no RTC, and HTTPS needs the date), and runs
+Dropbear with an SFTP server:
 
 ```sh
 ./scripts/guest-ssh 'uptime'
@@ -218,6 +252,36 @@ For custom images, use `make guest*` and `scripts/verify-guest-image.py`. Memory
   Configure its SPI controller, clock, SCLK, MOSI, CS, DC, reset, backlight,
   offsets, inversion, and orientation through `idf.py menuconfig`. The default
   pin assignment is only a starting point; match it to your module and board.
+
+- For a monochrome OLED or LCD supported by
+  [U8g2](https://github.com/olikraus/u8g2) (SH1106, SSD1306, SSD1309, SH1107,
+  SSD1322, ST7565/ST7567, ST7920, PCD8544, ...), select:
+
+  ```text
+  CONFIG_RV32_U8G2_DISPLAY=y
+  ```
+
+  Then pick the display in the top-level **U8g2 display** menu: its
+  controller, then the panel (size, U8g2 module name and bus, for example
+  `128x64 noname (I2C)` for a 1.3" SH1106 OLED), the orientation, pixel
+  inversion and contrast, and the I2C or 4-wire SPI pins. Size, bus and the
+  default I2C address follow from the panel; the panel's help shows its
+  [U8g2 setup function](https://github.com/olikraus/u8g2/wiki/u8g2setupc).
+
+  The panel list covers every display of the vendored U8g2
+  (`components/u8g2`, without its font tables) that has an I2C or SPI bus. It
+  is generated from U8g2's sources each time ESP-IDF configures the project.
+  The firmware writes the panel geometry into the Linux device tree at boot,
+  so no extra DTB is needed.
+
+  Each configure also saves the chosen display and wiring as a preset,
+  `build/u8g2/display.defaults`. Copy it next to `sdkconfig.defaults` and list
+  it after that file to start another configuration with the same display, as
+  with `guest/configs/`:
+
+  ```sh
+  idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;display.defaults" reconfigure
+  ```
 
 - Choose a partition table that matches the physical flash size. The current
   OpenWrt `Image` fits in either layout. Flash size does not change the amount

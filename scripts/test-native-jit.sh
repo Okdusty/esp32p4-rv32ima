@@ -14,7 +14,7 @@ native_run=${RV32_RUN:-riscv32-unknown-linux-gnu-run}
 # replacement and whole-cache flush while checking incoming native pointers.
 # The backedge fixture sweeps all branch conditions, PC encodings and budgets.
 if [ "$#" -eq 0 ]; then
-	set -- shortcuts lifetime backedges initial-values page-fences two-page-stores shared-pages host-range ram-refill exit-trace split-load-pages supervisor hoisted-stores atomics csr
+	set -- shortcuts lifetime backedges initial-values page-fences two-page-stores shared-pages host-range ram-refill exit-trace split-load-pages supervisor fence-keep hoisted-stores atomics csr
 fi
 for native_mode in production profile; do
 	if [ "$native_mode" = production ]; then native_stats=0; else native_stats=1; fi
@@ -64,6 +64,8 @@ for native_mode in production profile; do
 			printf 'Native JIT %s: split page loads, renderer globals, six-page region, faults, remaps, widths, refills and budgets passed\n' "$native_mode"
 		elif [ "$native_fixture" = supervisor ]; then
 			printf 'Native JIT %s: kernel linear/page-table regions, U/S/SUM banks, links, exec tags, fences, M-mode exclusion and interpreter dispatch passed\n' "$native_mode"
+		elif [ "$native_fixture" = fence-keep ]; then
+			printf 'Native JIT %s: kernel regions kept across FENCE.I, user regions dropped, kernel-text writes flush passed\n' "$native_mode"
 		elif [ "$native_fixture" = hoisted-stores ]; then
 			printf 'Native JIT %s: hoisted store group dirty report with clobbered t1 passed\n' "$native_mode"
 		fi

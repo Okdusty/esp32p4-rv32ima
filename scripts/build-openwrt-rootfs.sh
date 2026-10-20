@@ -86,6 +86,9 @@ rm -f \
   "$openwrt_dir/files/root/.ssh/authorized_keys"
 cp -a "$repo_root/guest/openwrt/overlay/." "$openwrt_dir/"
 cp -a "$repo_root/guest/openwrt/files/." "$openwrt_dir/files/"
+# root/.config/fastfetch/config.jsonc draws the theme's ASCII logo.
+install -D -m 0644 "$repo_root/themes/logo.txt" \
+  "$openwrt_dir/files/root/.config/fastfetch/logo.txt"
 install -d -m 0755 "$openwrt_dir/files/etc"
 printf '%s\n' "$guest_console" >"$openwrt_dir/files/etc/rv32-console"
 printf '%s\n' "$guest_dropbear" >"$openwrt_dir/files/etc/rv32-dropbear"

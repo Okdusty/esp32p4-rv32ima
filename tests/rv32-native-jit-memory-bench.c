@@ -28,7 +28,6 @@ int test_main(void)
 	};
 	/* Initialize the standalone arena without counting the entire startup
 	 * correctness suite as benchmark work. BSS starts cleared in this harness. */
-	jit_memory_sites = jit_memory_sites_storage;
 	jit_warm = jit_warm_storage;
 	jit_link_candidates = jit_link_candidate_storage;
 	jit_code_arena = heap_caps_aligned_calloc(JIT_CODE_ALIGNMENT, 1u,

@@ -117,8 +117,8 @@
 			reg = <0x00 0x0c000000 0x00 0x00400000>;
 			#interrupt-cells = <1>;
 			interrupt-controller;
-			/* UART, USB, net, console, SD, GPU and read-only flash. */
-			riscv,ndev = <7>;
+			/* UART, USB, net, console, SD, GPU, read-only flash and input. */
+			riscv,ndev = <8>;
 			interrupts-extended = <&cpu_intc 9>;
 		};
 
@@ -161,6 +161,15 @@
 			reg = <0x00 0x12300000 0x00 0x00000200>;
 			interrupt-parent = <&plic>;
 			interrupts = <6>;
+		};
+
+		/* Keyboard and mouse that CPU1 reads from the USB port.  While Linux
+		 * drives the USB controller itself this slot reports device ID 0. */
+		virtio_input: virtio@12500000 {
+			compatible = "virtio,mmio";
+			reg = <0x00 0x12500000 0x00 0x00000200>;
+			interrupt-parent = <&plic>;
+			interrupts = <8>;
 		};
 
 		usb@50000000 {

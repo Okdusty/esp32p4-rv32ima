@@ -6,9 +6,9 @@
 # 0x0009000 - 0x000F000 : NVS
 # 0x000F000 - 0x0010000 : PHY init
 # 0x0010000 - 0x0110000 : Application (1MB)
-# 0x0110000 - 0x0FF0000 : Kernel Image (14.875MB)
-# 0x0FF0000 - 0x1000000 : DTB (64KB)
-# 0x1000000 - 0x2000000 : Read-only guest filesystem, e.g. desktop (16MB)
+# 0x0110000 - 0x0910000 : Kernel Image (8MB)
+# 0x0910000 - 0x0920000 : DTB (64KB)
+# 0x0920000 - 0x2000000 : Read-only guest filesystem, e.g. desktop (22.875MB)
 
 #nvs,      data, nvs,     0x9000,    0x6000,
 #phy_init, data, phy,     0xf000,    0x1000,
@@ -20,6 +20,6 @@
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 factory,  app,  factory, 0x10000,  0x100000,
-kernel,   data, 0x58,    0x110000, 0xEE0000,
-dtb,      data, 0x58,    0xFF0000, 0x10000,
-rofs,     data, 0x59,    0x1000000, 0x1000000,
+kernel,   data, 0x58,    0x110000, 0x800000,
+dtb,      data, 0x58,    0x910000, 0x10000,
+rofs,     data, 0x59,    0x920000, 0x16E0000,

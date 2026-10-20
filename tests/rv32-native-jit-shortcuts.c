@@ -152,7 +152,7 @@ static bool test_access(bool store, uint32_t width, uint32_t scenario)
 		.loop_iterations = budget / 4u,
 		.chain_executed = 13u, .chain_instruction_limit = 13u + budget,
 		.dirty_epoch = 1u,
-		.sites = jit_memory_sites[0], .site_count = jit_entries[0].memory_site_count,
+		.sites = jit_slot_sites(0), .site_count = jit_entries[0].memory_site_count,
 		.result = { .executed = UINT32_MAX, .linear_dirty_start = UINT32_MAX },
 	};
 	jit_invalidate_memory_pages(jit_rt);
@@ -213,6 +213,7 @@ static bool test_link_endpoint_promotion(void)
 	jit_rt->memory_context = 0u;
 	jit_links[source_slot].expected_next_pc = TEST_PC + 64u;
 	jit_links[source_slot].packed_target = jit_pack_link_target(target_slot, &jit_entries[target_slot]);
+	jit_link_targets[target_slot] = 1u;
 	jit_hot_entries[target_slot].calls = JIT_HOT_LOOP_ADMIT_CALLS - 1u;
 	regs[2] = 4u;
 	result = rv32_native_jit_try(0u, TEST_PC, 99u, 0u);

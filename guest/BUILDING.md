@@ -37,7 +37,9 @@ This performs the following reproducible pipeline:
 
 The ESP-IDF CMake build selects the correct DTB from
 `CONFIG_RV32_WIFI_BRIDGE` and the selected display backend, and registers both
-the kernel and DTB partitions in the normal `idf.py flash` operation.
+the kernel and DTB partitions in the normal `idf.py flash` operation. U8g2
+panels use the SSD1306 128x64 DTB; at boot the firmware writes the configured
+panel geometry into its framebuffer node.
 
 For isolated configuration testing, append one of the defaults in
 `guest/configs/` after the project defaults. For example, a headless build is:

@@ -47,15 +47,21 @@ rv32_native_jit_enter:
 
     .size   rv32_native_jit_enter, .-rv32_native_jit_enter
 
-/* Native same-page dispatch for a region's normal exit.
- *   a1 = next guest pc, t3 = this region's physical page offset,
- *   t4 = this region's virtual page (pc & ~0xfff), a5 = this region's slot,
- *   t1 = miss return address.  Same-page targets use the region's page;
- *   other pages go through the validated exec-page cache.
- * Keeps a0, a1, t1, t5, t6, s10, s11.  On a hit it tail-jumps to the target's
- * native chain entry exactly like a confirmed link; on a miss it returns to
- * the region, which then publishes its result to the C dispatcher.  The
- * lookup, budget, wake, hot-code and promotion-counter rules mirror
+/* Native dispatch for a region's normal exit.
+ *   a1 = next guest pc, a5 = this region's slot, t1 = its link's expected pc
+ *   (UINT32_MAX when empty), t3 = miss return address.
+ * The jump cache answers targets seen before under the current translations;
+ * otherwise, once a fresh region's first exits have gone to C (the learning
+ * budget), same-page targets use the region's page, other pages the
+ * validated exec-page cache, and a hit is added to the jump cache.  A target
+ * found for a region with an empty link becomes its link (never the region
+ * itself, as in jit_observe_link), so links return after the translation
+ * flushes that clear them.  Targets check the
+ * instruction budget at their own chain entry.
+ * Keeps a1, a6, a7, t5, t6, s10, s11; s9 is free between regions.  On a hit
+ * it tail-jumps to the target's native chain entry exactly like a confirmed
+ * link; on a miss it returns to the region, which then publishes its result
+ * to the C dispatcher.  The lookup, wake, hot-code and promotion-counter rules mirror
  * rv32_native_jit_try and jit_dispatch_code; the table layout is defined in
  * rv32_native_jit.c next to struct rv32_native_jit_dispatch_table. */
     .align  2
@@ -63,6 +69,34 @@ rv32_native_jit_enter:
     .type   rv32_native_jit_dispatch, @function
 rv32_native_jit_dispatch:
     la      a3, rv32_native_jit_dispatch_table
+    srli    t0, a1, 2                   /* jump cache index */
+    srli    a2, a1, 10
+    xor     t0, t0, a2
+    andi    t0, t0, 255
+    slli    t0, t0, 3
+    lw      a4, 64(a3)                  /* this privilege's jump cache */
+    add     a4, a4, t0
+    lw      a2, 0(a4)
+    bne     a2, a1, 13f
+    lw      t2, 4(a4)                   /* target code */
+    lw      a2, 16(a3)                  /* host wake word */
+    lw      a2, 0(a2)
+    bnez    a2, 9f
+    addi    a2, t1, 1
+    bnez    a2, 18f                     /* this region's link is in use */
+    lw      a2, 0(a3)                   /* entries */
+    slli    a4, a5, 4
+    add     a2, a2, a4
+    lw      a2, 4(a2)                   /* this region's guest pc */
+    beq     a2, a1, 18f                 /* a loop keeps its wake checks */
+    lw      a2, 68(a3)                  /* links */
+    slli    a4, a5, 3
+    add     a2, a2, a4
+    sw      t2, 0(a2)
+    sw      a1, 4(a2)
+18:
+    jalr    x0, 20(t2)                  /* native chain entry */
+13:
     lw      a2, 52(a3)                  /* link learning budget */
     add     a2, a2, a5
     lbu     a4, 0(a2)
@@ -71,10 +105,20 @@ rv32_native_jit_dispatch:
     sb      a4, 0(a2)
     j       9f
 10:
+    mv      a0, a5                      /* this region's slot */
+    lw      a4, 0(a3)                   /* entries */
+    slli    a2, a5, 4
+    add     a4, a4, a2                  /* this region's entry */
+    lw      s9, 0(a4)                   /* physical offset */
+    lw      t4, 4(a4)                   /* guest pc */
+    srli    a2, t4, 12
+    slli    a2, a2, 12
+    sub     t0, t4, a2                  /* page offset */
+    sub     s9, s9, t0                  /* physical page offset */
+    mv      t4, a2                      /* virtual page */
     srli    t0, a1, 12
     slli    t0, t0, 12
     beq     t0, t4, 11f                 /* same page as this region */
-    j       9f                          /* cross-page targets return to C */
     /* Another page: only a mapping the Sv32 execute path already validated
      * in this memory context may be chained, exactly as jit_resolve_exec_offset. */
     srli    t0, a1, 12                  /* virtual page */
@@ -96,7 +140,7 @@ rv32_native_jit_dispatch:
     j       12f
 11:
     xor     t0, a1, t4                  /* page offset */
-    add     t2, t3, t0                  /* physical offset */
+    add     t2, s9, t0                  /* physical offset */
 12:
     srli    t0, t2, 2
     srli    a2, t2, 9
@@ -108,24 +152,22 @@ rv32_native_jit_dispatch:
     lw      a2, 28(a3)                  /* set mask */
     and     t0, t0, a2
     lw      a4, 0(a3)                   /* entries */
-    slli    t0, t0, 5                   /* set * 2 ways * 16 bytes */
+    slli    t0, t0, 6                   /* set * 4 ways * 16 bytes */
     add     a4, a4, t0
+    addi    t0, a4, 64                  /* end of the set */
+1:
     lw      a2, 0(a4)
-    bne     a2, t2, 1f
+    bne     a2, t2, 3f
     lw      a2, 4(a4)
-    bne     a2, a1, 1f
+    bne     a2, a1, 3f
     lbu     a2, 9(a4)
     addi    a2, a2, -1                  /* JIT_ENTRY_READY */
     beqz    a2, 2f
-1:
+3:
     addi    a4, a4, 16
-    lw      a2, 0(a4)
-    bne     a2, t2, 9f
-    lw      a2, 4(a4)
-    bne     a2, a1, 9f
-    lbu     a2, 9(a4)
-    addi    a2, a2, -1
-    bnez    a2, 9f
+    bne     a4, t0, 1b
+    sw      a1, 92(t6)                  /* runtime->dispatch_miss_pc */
+    jr      t3
 2:
     lw      a2, 16(a3)                  /* host wake word */
     lw      a2, 0(a2)
@@ -133,20 +175,13 @@ rv32_native_jit_dispatch:
     lbu     a5, 8(a4)                   /* guest_instruction_count */
     sub     t0, s11, s10                /* remaining budget */
     bltu    t0, a5, 9f
-    lbu     a2, 11(a4)                  /* loops_to_start */
-    beqz    a2, 3f
-    lw      a2, 32(a3)                  /* loop wake budget */
-    bltu    t0, a2, 4f
-    mv      t0, a2
-4:
-    divu    t0, t0, a5
-    lw      a2, 24(a3)
-    add     a2, a2, t6
-    sw      t0, 0(a2)                   /* runtime->loop_iterations */
-3:
     lw      a2, 0(a3)
     sub     a5, a4, a2
     srli    a5, a5, 4                   /* slot */
+    lw      a2, 72(a3)                  /* link targets: below may publish it */
+    add     a2, a2, a5
+    li      t0, 1
+    sb      t0, 0(a2)
     lw      a2, 4(a3)                   /* hot entries */
     slli    t0, a5, 2
     add     a2, a2, t0
@@ -179,19 +214,45 @@ rv32_native_jit_dispatch:
     beq     t0, a5, 9f
 71:
     sh      t0, 2(a2)
+    lhu     t0, 12(a4)                  /* code_unit */
+    slli    t0, t0, 7
+    lw      a5, 8(a3)
+    add     t0, t0, a5
+    j       17f                         /* counting: keep coming here */
 6:
     lhu     t0, 12(a4)                  /* code_unit */
     slli    t0, t0, 7
     lw      a5, 8(a3)
     add     t0, t0, a5
 8:
+    srli    a5, a1, 2                   /* remember the target */
+    srli    a2, a1, 10
+    xor     a5, a5, a2
+    andi    a5, a5, 255
+    slli    a5, a5, 3
+    lw      a2, 64(a3)
+    add     a2, a2, a5
+    sw      a1, 0(a2)
+    sw      t0, 4(a2)
+    addi    a2, t1, 1
+    bnez    a2, 17f                     /* this region's link is in use */
+    lw      a2, 0(a3)                   /* entries */
+    slli    a0, a0, 4
+    add     a2, a2, a0
+    lw      a4, 4(a2)                   /* this region's guest pc */
+    beq     a4, a1, 17f                 /* a loop keeps its wake checks */
+    srli    a0, a0, 1                   /* slot * 8 */
+    lw      a2, 68(a3)                  /* links */
+    add     a2, a2, a0
+    sw      t0, 0(a2)
+    sw      a1, 4(a2)
+17:
     lw      a2, 20(a3)
     addi    a2, a2, 1
     sw      a2, 20(a3)                  /* fast dispatch counter */
-    addi    t0, t0, 16                  /* native chain entry */
-    jr      t0
+    jalr    x0, 20(t0)                  /* native chain entry */
 9:
-    jr      t1
+    jr      t3
     .size   rv32_native_jit_dispatch, .-rv32_native_jit_dispatch
 
 /* Cold RAM mapping refill: t4 = link, t6 = runtime, a1 = guest address,

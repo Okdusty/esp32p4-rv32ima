@@ -65,6 +65,21 @@ else
   echo "error: Linux DWC2 FIFO patch is neither applicable nor already applied" >&2
   exit 1
 fi
+# The emulator pays per guest instruction and per call into the JIT's
+# region transitions, so the hot kernel paths (mm, scheduler, timekeeping,
+# locking, entry, VFS, EROFS, block, riscv mm and the tree/array libraries)
+# are built at -O2 while the rest of the kernel stays -Os to fit the 8 MiB
+# kernel partition.  lib/math, lib/lz4 and arch/riscv/lib keep their flags:
+# the firmware's host routines match those functions by instruction words.
+hot_o2_patch="$repo_root/linux-rv32-hot-o2.patch"
+if git -C "$linux_dir" apply --reverse --check "$hot_o2_patch" >/dev/null 2>&1; then
+  :
+elif git -C "$linux_dir" apply --check "$hot_o2_patch"; then
+  git -C "$linux_dir" apply "$hot_o2_patch"
+else
+  echo "error: Linux hot-path -O2 patch is neither applicable nor already applied" >&2
+  exit 1
+fi
 cp "$repo_root/guest/linux/rv32-pvfb.c" \
   "$linux_dir/drivers/video/fbdev/rv32-pvfb.c"
 
@@ -161,11 +176,17 @@ config="$linux_dir/scripts/config"
 "$config" --file "$linux_dir/.config" --enable VFAT_FS
 "$config" --file "$linux_dir/.config" --enable EXFAT_FS
 "$config" --file "$linux_dir/.config" --enable EXT4_FS
-# The read-only flash disk (desktop) is an LZ4-compressed EROFS image, and
-# the X server's event loop requires epoll.
+# With the USB port in keyboard-and-mouse mode the firmware reads them on CPU1
+# and presents a virtio-input device instead of the DWC2 controller.
+"$config" --file "$linux_dir/.config" --enable INPUT_EVDEV
+"$config" --file "$linux_dir/.config" --enable VIRTIO_INPUT
+# The read-only flash disk (desktop) is an LZ4-compressed EROFS image, the X
+# server's event loop requires epoll, and curl creates an eventfd for every
+# transfer.
 "$config" --file "$linux_dir/.config" --enable EROFS_FS
 "$config" --file "$linux_dir/.config" --enable EROFS_FS_ZIP
 "$config" --file "$linux_dir/.config" --enable EPOLL
+"$config" --file "$linux_dir/.config" --enable EVENTFD
 "$config" --file "$linux_dir/.config" --enable NLS_CODEPAGE_437
 "$config" --file "$linux_dir/.config" --enable NLS_ISO8859_1
 "$config" --file "$linux_dir/.config" --enable NLS_UTF8
@@ -183,7 +204,9 @@ for required in \
   CONFIG_DRM_VIRTIO_GPU_KMS=y \
   CONFIG_EROFS_FS=y \
   CONFIG_EROFS_FS_ZIP=y \
-  CONFIG_EPOLL=y; do
+  CONFIG_EPOLL=y \
+  CONFIG_EVENTFD=y \
+  CONFIG_VIRTIO_INPUT=y; do
   if ! grep -qx "$required" "$linux_dir/.config"; then
     echo "error: Linux configuration did not retain $required" >&2
     exit 1

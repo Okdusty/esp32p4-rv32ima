@@ -98,7 +98,6 @@ int test_main(void)
 		{ 0x80000000u, 0u, 1 }, { 1u, 0u, -1 },
 		{ UINT32_MAX, UINT32_MAX - 2u, -1 },
 	};
-	jit_memory_sites = jit_memory_sites_storage;
 	jit_warm = jit_warm_storage;
 	jit_link_candidates = jit_link_candidate_storage;
 	jit_code_arena = heap_caps_aligned_calloc(JIT_CODE_ALIGNMENT, 1u,

@@ -41,8 +41,14 @@ struct dwc2_passthrough_channel_stats {
 	uint32_t last_in_ep;
 	uint32_t last_in_len;
 	uint8_t last_in_data[8];
+	/* Per endpoint number (IN channels only): completions with data, NAKs,
+	 * frame overruns.  Shows whether a quiet device is even being polled. */
+	uint32_t ep_in[16];
+	uint32_t ep_nak[16];
+	uint32_t ep_ovr[16];
 };
 void dwc2_passthrough_channel_stats(struct dwc2_passthrough_channel_stats *stats);
+#define dwc2_passthrough_stats_channels dwc2_passthrough_channel_stats
 /* Print the global and per-channel host registers through ROM output. */
 void dwc2_passthrough_dump(void);
 

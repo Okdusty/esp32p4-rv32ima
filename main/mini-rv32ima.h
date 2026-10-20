@@ -69,6 +69,18 @@
 	#error "MINIRV32_TLB_ENTRIES must be a power of two"
 #endif
 
+/* Guest execution profile hooks; see guest_profile.h.  Arguments are not
+ * evaluated unless a port defines them. */
+#ifndef MINIRV32_PROFILE_INSTRUCTION
+#define MINIRV32_PROFILE_INSTRUCTION(pc, offset, privilege) do { } while (0)
+#endif
+#ifndef MINIRV32_PROFILE_REASON
+#define MINIRV32_PROFILE_REASON(reason) do { } while (0)
+#endif
+#ifndef MINIRV32_PROFILE_FALLTHROUGH
+#define MINIRV32_PROFILE_FALLTHROUGH() do { } while (0)
+#endif
+
 #ifndef MINIRV32_POSTEXEC
 	#define MINIRV32_POSTEXEC(...);
 #endif
@@ -92,6 +104,12 @@
 
 #ifndef MINIRV32_HANDLE_CACHE_OP
 	#define MINIRV32_HANDLE_CACHE_OP(...);
+#endif
+
+/* Called with the RAM offset of a page the interpreter just mapped for
+ * stores (not on its kernel linear-map path). */
+#ifndef MINIRV32_NOTE_WRITE_PAGE
+	#define MINIRV32_NOTE_WRITE_PAGE(offset) do { } while (0)
 #endif
 
 /* Optional direct mapping for one host-backed MMIO memory aperture.  This is
@@ -1059,6 +1077,9 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 		count = 0;
 	}
 	else // No timer interrupt?  Execute a bunch of instructions.
+	#ifdef MINIRV32_CONTINUE_AFTER_TRAP
+	continue_after_trap:
+	#endif
 	for( ; icount < count; icount++ )
 	{
 		uint32_t ir = 0;
@@ -1136,6 +1157,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 			#endif
 
 			if (__builtin_expect(jit_result->trap != 0u, 0)) {
+				MINIRV32_PROFILE_REASON(RV32_PROFILE_NATIVE_TRAP);
 				pc = jit_result->next_pc;
 				trap = jit_result->trap;
 				rval = jit_result->trap_value;
@@ -1149,6 +1171,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 			}
 			if (__builtin_expect(jit_result->executed != 0u, 0)) {
 				uint32_t native_source_pc = pc;
+
+				MINIRV32_PROFILE_REASON(RV32_PROFILE_NATIVE_EXIT);
 
 				pc = jit_result->next_pc;
 				/* Let the successor become a candidate too, not only loop
@@ -1178,6 +1202,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 			native_jit_done:;
 		}
 		#endif
+
+		MINIRV32_PROFILE_INSTRUCTION(pc, ofs_pc, CSR(extraflags) & 3u);
 
 		/* Consume this slot before execution.  A taken control transfer below
 		 * replaces the budget with the distance from its target to the end of
@@ -1369,6 +1395,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 						 * even with the probe filter (measured 2026-10). */
 						native_jit_candidate_pc =
 							(CSR(extraflags) & 3u) ? UINT32_MAX : pc + 4u;
+						if (CSR(extraflags) & 3u)
+							MINIRV32_PROFILE_FALLTHROUGH();
 					}
 					#endif
 					break;
@@ -1620,6 +1648,8 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							MINI_RV32_RAM_SIZE - 0x1000u) {
 							write_ram_offset_bias = write_physical_page -
 								MINIRV32_RAM_IMAGE_OFFSET - virtual_page;
+							MINIRV32_NOTE_WRITE_PAGE(write_physical_page -
+								MINIRV32_RAM_IMAGE_OFFSET);
 						#ifdef MINIRV32_NATIVE_JIT_CACHE_RAM_PAGE
 							if ((CSR(extraflags) & 3u) <=
 							    MINIRV32_NATIVE_JIT_MAX_PRIVILEGE)
@@ -2058,6 +2088,7 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							SETCSR(pc, pc + 4);
 							return 1;
 						} else if (csrno == 0x102) { /* SRET */
+							MINIRV32_PROFILE_REASON(RV32_PROFILE_XRET);
 							uint32_t status = CSR(mstatus);
 							uint32_t new_priv =
 								(status & (1u << 8)) ? 1u : 0u;
@@ -2086,6 +2117,11 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							read_virtual_page = UINT32_MAX;
 							write_virtual_page = UINT32_MAX;
 							pc = CSR(sepc) - 4;
+							#if defined(MINIRV32_CONTINUE_AFTER_TRAP) && \
+							    defined(MINIRV32_NATIVE_JIT_TRY)
+							/* Probe the return target, as after a jump. */
+							native_jit_candidate_pc = CSR(sepc);
+							#endif
 							if (MiniRV32SupervisorInterruptCause(state))
 								count = icount + 1;
 						} else if ((csrno & 0xff) == 0x02) { /* MRET */
@@ -2211,6 +2247,10 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 							(CSR(extraflags) >> 3 !=
 							 (ofs & 0x1fffffff));
 						dowrite = !rval;
+						/* Any SC drops the reservation; Linux's trap return
+						 * relies on that to break an interrupted LR/SC.  An
+						 * all-ones offset matches no RAM offset. */
+						CSR(extraflags) |= ~7u;
 						break;
 					case 0b00001: /* AMOSWAP.W */
 						break;
@@ -2317,8 +2357,10 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 		/* Interrupt setup backed pc up by four; recover the interrupted PC. */
 		uint32_t trap_pc = is_interrupt ? pc + 4 : pc;
 
+		MINIRV32_PROFILE_REASON(RV32_PROFILE_TRAP);
 		/* Emulate S-mode SBI calls directly instead of entering OpenSBI. */
 		if (!is_interrupt && cause == 9 && old_priv == 1) {
+			MINIRV32_PROFILE_REASON(RV32_PROFILE_SBI);
 			MiniRV32HandleSBI(state);
 			pc = trap_pc + 4;
 			trap = 0;
@@ -2379,6 +2421,29 @@ MINIRV32_DECORATE int32_t MiniRV32IMAStep(
 				pc = base;
 
 			trap = 0;
+			#ifdef MINIRV32_CONTINUE_AFTER_TRAP
+			/* A system call or page fault from U-mode enters the kernel
+			 * within this batch: the host's per-batch device and timer
+			 * service has nothing new for it, and native code may run the
+			 * handler from its first instruction. */
+			if (!is_interrupt && old_priv == 0u && icount + 1 < count &&
+			    !MINIRV32_HOST_WAKE_PENDING()) {
+				icount++; /* the trapping attempt */
+				kernel_linear_limit = (CSR(satp) & 0x80000000u) ?
+					(MINI_RV32_RAM_SIZE -
+					 MINIRV32_KERNEL_LINEAR_PHYS_OFFSET) : 0u;
+				exec_page_budget = 0;
+				#ifdef MINIRV32_DECODED_BLOCK_CACHE
+				decoded_ptr = &decoded_refill_entry;
+				#endif
+				read_virtual_page = UINT32_MAX;
+				write_virtual_page = UINT32_MAX;
+				#ifdef MINIRV32_NATIVE_JIT_TRY
+				native_jit_candidate_pc = pc;
+				#endif
+				goto continue_after_trap;
+			}
+			#endif
 		} else {
 			/* Retain M-mode trap behavior for future M-mode use. */
 			SETCSR(mcause, encoded_cause);

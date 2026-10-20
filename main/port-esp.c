@@ -44,8 +44,10 @@
 #include "soc/cache_reg.h"
 #include "soc/soc.h"
 #endif
+#include "display_bridge.h"
 #include "dwc2_passthrough.h"
 #include "port.h"
+#include "usb_hid_input.h"
 #include "psram.h"
 
 #define FLASH_COPY_CHUNK_SIZE (64u * 1024u)
@@ -159,6 +161,52 @@ void HostCacheStatsReadAndReset(struct host_cache_stats *stats)
 #endif
 }
 
+#if CONFIG_RV32_DISPLAY_ACCEL
+static void write_be32(uint8_t *destination, uint32_t value)
+{
+  destination[0] = (uint8_t)(value >> 24);
+  destination[1] = (uint8_t)(value >> 16);
+  destination[2] = (uint8_t)(value >> 8);
+  destination[3] = (uint8_t)value;
+}
+
+/* Each display DTB describes one panel size, and U8g2 panels of every size
+ * share the 128x64 one. Write the geometry this firmware renders into the
+ * framebuffer node, so Linux and the display bridge always agree. */
+static bool prepare_linux_framebuffer_property(const char *name,
+                                               uint8_t *value,
+                                               uint32_t length)
+{
+  static const struct {
+    const char *name;
+    uint32_t value;
+  } cells[] = {
+    { "width", DISPLAY_FB_WIDTH },
+    { "height", DISPLAY_FB_HEIGHT },
+    { "stride", DISPLAY_FB_STRIDE },
+    { "mini-rv32ima,staging-offset",
+      DISPLAY_ACCEL_STAGE_GUEST_BASE - DISPLAY_FB_GUEST_BASE },
+    { "mini-rv32ima,fence-offset",
+      DISPLAY_FB_COMMIT_GUEST_BASE - DISPLAY_FB_GUEST_BASE },
+    { "mini-rv32ima,accel-offset",
+      DISPLAY_PV_REG_GUEST_BASE - DISPLAY_FB_GUEST_BASE },
+  };
+
+  /* reg = <0 base 0 size>: two address and two size cells. */
+  if (strcmp(name, "reg") == 0 && length == 4u * sizeof(uint32_t)) {
+    write_be32(value + 3u * sizeof(uint32_t), DISPLAY_FB_APERTURE_SIZE);
+    return true;
+  }
+  for (size_t index = 0; index < sizeof(cells) / sizeof(cells[0]); index++) {
+    if (length == sizeof(uint32_t) && strcmp(name, cells[index].name) == 0) {
+      write_be32(value, cells[index].value);
+      return true;
+    }
+  }
+  return false;
+}
+#endif
+
 static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
 {
   uint32_t struct_offset;
@@ -168,8 +216,17 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
   size_t cursor;
   size_t struct_end;
   bool rng_seeded = false;
+  uint32_t depth = 0;
 #if CONFIG_RV32_USB_FULL_SPEED_ONLY
   bool usb_speed_limited = false;
+#endif
+#if CONFIG_RV32_USB_PORT_HID
+  uint32_t usb_depth = 0;
+  bool usb_hidden = false;
+#endif
+#if CONFIG_RV32_DISPLAY_ACCEL
+  uint32_t framebuffer_depth = 0;
+  bool framebuffer_described = false;
 #endif
 
   if (dtb_size < 40 || read_be32(dtb) != 0xd00dfeedu)
@@ -194,6 +251,18 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
 
       if (terminator == NULL)
         return false;
+      depth++;
+#if CONFIG_RV32_USB_PORT_HID
+      if (usb_depth == 0u &&
+          strcmp((const char *)(dtb + cursor), "usb@50000000") == 0)
+        usb_depth = depth;
+#endif
+#if CONFIG_RV32_DISPLAY_ACCEL
+      if (framebuffer_depth == 0u &&
+          strncmp((const char *)(dtb + cursor), "framebuffer@",
+                  sizeof("framebuffer@") - 1u) == 0)
+        framebuffer_depth = depth;
+#endif
       cursor = ((const uint8_t *)terminator - dtb + 1u + 3u) & ~3u;
     } else if (token == FDT_PROP) {
       uint32_t length;
@@ -233,8 +302,35 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
         usb_speed_limited = true;
       }
 #endif
+#if CONFIG_RV32_USB_PORT_HID
+      /* CPU1 owns the USB controller: no Linux driver may bind it.  The
+       * replacement has the same length, so the DTB keeps its layout. */
+      if (usb_depth != 0u && depth == usb_depth &&
+          strcmp(name, "compatible") == 0 && length == sizeof("snps,dwc2") &&
+          memcmp(dtb + cursor, "snps,dwc2", sizeof("snps,dwc2")) == 0) {
+        memcpy(dtb + cursor, "rv32,none", sizeof("rv32,none"));
+        usb_hidden = true;
+      }
+#endif
+#if CONFIG_RV32_DISPLAY_ACCEL
+      if (framebuffer_depth != 0u && depth == framebuffer_depth &&
+          prepare_linux_framebuffer_property(name, dtb + cursor, length))
+        framebuffer_described = true;
+#endif
       cursor = (cursor + length + 3u) & ~3u;
-    } else if (token == FDT_END_NODE || token == FDT_NOP) {
+    } else if (token == FDT_END_NODE) {
+#if CONFIG_RV32_USB_PORT_HID
+      if (depth == usb_depth)
+        usb_depth = 0;
+#endif
+#if CONFIG_RV32_DISPLAY_ACCEL
+      if (depth == framebuffer_depth)
+        framebuffer_depth = 0;
+#endif
+      if (depth != 0u)
+        depth--;
+      continue;
+    } else if (token == FDT_NOP) {
       continue;
     } else if (token == FDT_END) {
       break;
@@ -250,11 +346,25 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
     printf("WARNING: USB full-speed limit requested, but the DTB has no "
            "maximum-speed property\n");
 #endif
+  (void)depth;
+#if CONFIG_RV32_USB_PORT_HID
+  if (!usb_hidden)
+    printf("WARNING: the DTB has no snps,dwc2 USB node to hide from Linux\n");
+#endif
+#if CONFIG_RV32_DISPLAY_ACCEL
+  if (framebuffer_described)
+    RV32_DIAG("Linux framebuffer described as %ux%u RGB565\n",
+              (unsigned int)DISPLAY_FB_WIDTH, (unsigned int)DISPLAY_FB_HEIGHT);
+#endif
   return rng_seeded;
 }
 
 int HostInputInit(void) {
+#if CONFIG_RV32_USB_PORT_HID
+  return usb_hid_input_init();
+#else
   return dwc2_passthrough_init();
+#endif
 }
 
 static void host_uart_hw_write(const uint8_t *buffer, size_t length)

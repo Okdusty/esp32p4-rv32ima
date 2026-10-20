@@ -6,7 +6,9 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(uc-rv32ima)
 
 set(LINUX_IMAGE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/main/Image")
-if(CONFIG_RV32_SSD1306_DISPLAY)
+# U8g2 panels use the 128x64 description. The firmware writes the configured
+# framebuffer geometry into it at boot (prepare_linux_dtb in port-esp.c).
+if(CONFIG_RV32_SSD1306_DISPLAY OR CONFIG_RV32_U8G2_DISPLAY)
   if(CONFIG_RV32_SSD1306_128X32)
     set(LINUX_DTB_DISPLAY "ssd1306-32")
   else()

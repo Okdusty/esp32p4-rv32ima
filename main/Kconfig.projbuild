@@ -17,7 +17,7 @@ config RV32_DEBUG_DISPLAY
 
 config RV32_DEBUG_USB
 	bool "Trace USB controller state"
-	depends on RV32_DIAGNOSTIC_LOGS
+	depends on RV32_DIAGNOSTIC_LOGS && RV32_USB_PORT_LINUX
 	default y
 	help
 	  Poll and print DWC2 register/link state, count physical interrupts,
@@ -78,6 +78,29 @@ config RV32_NATIVE_JIT_SUPERVISOR
 	  code, the kernel, and the kernel with SUM set keep separate data-page
 	  caches, so traps switch caches instead of flushing them.
 
+config RV32_NATIVE_JIT_KEEP_KERNEL
+	bool "Keep kernel regions across FENCE.I"
+	depends on RV32_NATIVE_JIT_SUPERVISOR
+	default y
+	help
+	  Linux executes FENCE.I after mapping every new executable user page,
+	  dozens of times a second while programs load.  Keep the compiled
+	  kernel regions (and every head's warm-up count) then, and drop only
+	  user regions.  A write mapping to a page that compiled kernel code
+	  came from, as when Linux patches its text for a static key, makes the
+	  next FENCE.I discard everything as before.
+
+config RV32_NATIVE_JIT_ASYNC_COMPILE
+	bool "Compile native regions on the second core"
+	depends on RV32_NATIVE_JIT && !FREERTOS_UNICORE
+	default y
+	help
+	  The emulator core queues hot code for a worker on CPU1 and keeps
+	  interpreting it until the region is ready, instead of stopping to
+	  compile.  Code generation reads only a copy of the collected
+	  instructions; the emulator core installs finished regions, so the
+	  directory, links and code arena still change on one core only.
+
 config RV32_NATIVE_JIT_RAM_REFILL
 	bool "Resume native execution after ordinary RAM mapping refills"
 	depends on RV32_NATIVE_JIT
@@ -94,6 +117,19 @@ config RV32_NATIVE_JIT_SPLIT_LOAD_PAGES
 	  Use the entry values of unchanged base registers to end load groups at
 	  guest page boundaries, avoiding repeated exits from a group's one-page
 	  guard. Every load keeps its own runtime checks.
+
+config RV32_GUEST_HLE
+	bool "Run the guest kernel's memcpy, memset, division and LZ4 on the host"
+	depends on RV32_NATIVE_JIT
+	default y
+	help
+	  Supervisor calls to memcpy, memmove, memset, __div64_32 and the LZ4
+	  block decoder (EROFS decompression) run as host code instead of guest
+	  instructions.  An entry point is used only when the guest code there
+	  is byte-identical to the routine the host replaces (see guest_hle.c),
+	  so another kernel build runs its own code.  Device memory, uncached
+	  pages, faults, overlapping copies and LZ4 blocks the kernel would not
+	  decode in full stay with the guest code.
 
 config RV32_JIT_EXIT_TRACE
 	bool "Log native JIT checked exits and rejected candidates"
@@ -172,6 +208,49 @@ config RV32_CACHE_PERF_STATS
 	  The hardware counters are shared diagnostic resources: do not run another
 	  cache-counter reader/resetter concurrently. Disable after profiling.
 
+config RV32_HOST_PC_SAMPLER
+	bool "Sample the emulator core's PC for a host-side profile"
+	depends on IDF_TARGET_ESP32P4
+	default n
+	help
+	  A GPTimer interrupt on CPU0 records the interrupted PC in address
+	  buckets (internal SRAM, ROM, firmware text in PSRAM, JIT code arena)
+	  and a CPU1 task prints the non-zero buckets as "[PCS]" lines; mapped
+	  onto the firmware ELF they show where the emulator core's time goes.
+	  Costs about 1 % of CPU0 at 5 kHz and 64 KiB of PSRAM. Disable after
+	  profiling.
+
+config RV32_HOST_PC_SAMPLER_HZ
+	int "PC samples per second"
+	depends on RV32_HOST_PC_SAMPLER
+	range 100 20000
+	default 5000
+
+config RV32_HOST_PC_SAMPLER_REPORT_MS
+	int "PC sampler report interval (ms)"
+	depends on RV32_HOST_PC_SAMPLER
+	range 1000 60000
+	default 5000
+
+config RV32_GUEST_PROFILE
+	bool "Profile where guest instructions execute and why code is interpreted"
+	default n
+	help
+	  Count native region entries and loop iterations with emitted counters,
+	  tag every interpreted instruction with the reason the interpreter is
+	  running, sample interpreted guest PCs, and print a report on the host
+	  UART at a fixed interval.
+	  Analysis builds only: it adds work to the interpreter loop and four
+	  instructions to every native region and loop iteration.  That makes
+	  interpretation look dearer than it is, so use it to see where time
+	  goes and judge a change's speedup on firmware without it.
+
+config RV32_GUEST_PROFILE_INTERVAL_S
+	int "Guest profile report interval (s)"
+	depends on RV32_GUEST_PROFILE
+	range 5 600
+	default 30
+
 config RV32_HOST_PERF_STATS
 	bool "Enable host core and display performance counters"
 	default n
@@ -202,8 +281,36 @@ endmenu
 
 menu "RV32 Linux hardware bridges"
 
+choice RV32_USB_PORT
+	prompt "USB port"
+	default RV32_USB_PORT_LINUX
+	help
+	  Who drives the ESP32-P4 USB 2.0 host port.
+
+config RV32_USB_PORT_LINUX
+	bool "Linux (any USB device)"
+	help
+	  Linux's dwc2 driver owns the controller: memory sticks, hubs,
+	  keyboards and mice all work, but every USB interrupt runs through
+	  the emulated kernel (about 1.2 ms each), so an idle mouse polled every
+	  16 ms takes about a sixth of the guest's CPU.
+
+config RV32_USB_PORT_HID
+	bool "Keyboard and mouse on CPU1"
+	# One USB-A port: a keyboard and a mouse together need a hub.
+	select USB_HOST_HUBS_SUPPORTED
+	help
+	  ESP-IDF's USB host and HID drivers read boot-protocol keyboards and
+	  mice on CPU1 and hand keys, buttons, motion and wheels to Linux as a
+	  virtio-input device.  Idle devices cost the guest nothing and mouse
+	  motion reaches it at most 100 times a second.  Other USB devices,
+	  such as memory sticks, are not available to Linux.
+
+endchoice
+
 config RV32_USB_FULL_SPEED_ONLY
 	bool "Limit native USB host to full-speed (compatibility test)"
+	depends on RV32_USB_PORT_LINUX
 	default n
 	help
 	  Limit the ESP32-P4 UTMI host and Linux DWC2 controller to USB
@@ -259,6 +366,20 @@ config RV32_SSD1306_DISPLAY
 	  Render the accelerated Linux console to an external monochrome SSD1306
 	  OLED. The RGB565 virtual surface is converted to the controller's 1-bit
 	  page format on CPU1 and transferred only when its contents change.
+
+config RV32_U8G2_DISPLAY
+	bool "Enable U8g2 monochrome I2C/SPI display bridge"
+	select RV32_DISPLAY_ACCEL
+	help
+	  Render the accelerated Linux console to any monochrome OLED or LCD
+	  that the U8g2 library drives over I2C or 4-wire SPI, for example
+	  SH1106, SSD1306, SSD1309, SH1107, SSD1322, SSD1327, ST7565, ST7567,
+	  ST7920, UC1701 or PCD8544. CPU1 converts the RGB565 surface to U8g2's
+	  1-bit buffer and transfers only the tile rows that changed.
+
+	  Choose the controller, panel, orientation and wiring in the top-level
+	  "U8g2 display" menu. Its panel list is generated from the vendored
+	  U8g2 sources whenever the project is configured.
 
 config RV32_DISPLAY_NONE
 	bool "Headless (UART/SSH only)"

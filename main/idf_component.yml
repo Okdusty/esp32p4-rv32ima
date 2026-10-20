@@ -1,4 +1,8 @@
 dependencies:
-  espressif/esp_hosted: "~2.12.12"
+  # Exact: adding a dependency re-solves the others, and a patch release of
+  # the Wi-Fi bridge should be a deliberate update.
+  espressif/esp_hosted: "2.12.12"
   espressif/esp_wifi_remote: "^1.6.4"
   waveshare/esp_lcd_st7703: "^2.0.0"
+  # Keyboard and mouse on CPU1 (USB port option); pulls in espressif/usb.
+  espressif/usb_host_hid: "^1.0.4"

@@ -42,11 +42,11 @@
  * top of Linux's Image-header prefix for generated host code; the remaining
  * prefix stays available to the virtio-block read cache. */
 #define HOST_JIT_CODE_SIZE (2048u * 1024u)
-/* Per-region memory descriptors consume 512 KiB. Keep the JIT's 24 KiB
- * probation table and 24 KiB cold successor-candidate state beside them. The
- * 16 KiB active successor-link directory stays internal because generated
- * code reads it at every native region transition. */
-#define HOST_JIT_METADATA_SIZE (576u * 1024u)
+/* The JIT's cold successor-candidate state (12 bytes a directory slot).
+ * Per-region memory descriptors live beside their code in the arena; the
+ * active successor-link directory stays internal because generated code
+ * reads it at every native region transition. */
+#define HOST_JIT_METADATA_SIZE (64u * 1024u)
 #define HOST_AUXILIARY_SIZE (128u * 1024u)
 
 int psram_init(void);

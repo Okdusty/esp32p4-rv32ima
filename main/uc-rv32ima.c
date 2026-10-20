@@ -37,6 +37,9 @@
 #if CONFIG_RV32_CACHE_PERF_STATS
 #include "host_cache_profile.h"
 #endif
+#if CONFIG_RV32_HOST_PC_SAMPLER
+#include "host_pc_sampler.h"
+#endif
 #include "cache.h"
 #include "display_bridge.h"
 #include "dwc2_passthrough.h"
@@ -45,11 +48,14 @@
 #include "pv_console_protocol.h"
 #if CONFIG_RV32_NATIVE_JIT
 #include "rv32_native_jit.h"
+#include "guest_hle.h"
+#include "guest_lz4.h"
 #endif
 #include "virtio_console_bridge.h"
 #include "virtio_blk_bridge.h"
 #include "virtio_flash_bridge.h"
 #include "virtio_gpu_bridge.h"
+#include "virtio_input_bridge.h"
 #include "virtio_net_bridge.h"
 
 static uint32_t ram_amt = GUEST_RAM_SIZE;
@@ -97,38 +103,59 @@ volatile uint32_t rv32_host_wake;
 
 #define MINIRV32WARN(x...) printf(x);
 #define MINI_RV32_RAM_SIZE ram_amt
+#include "guest_profile.h"
+#if CONFIG_RV32_GUEST_PROFILE
+#define MINIRV32_PROFILE_INSTRUCTION(pc, offset, privilege) \
+	rv32_profile_interpreted((pc), (offset), (privilege))
+#define MINIRV32_PROFILE_REASON(reason) rv32_profile_set_reason(reason)
+#define MINIRV32_PROFILE_FALLTHROUGH() rv32_profile_fallthrough()
+#endif
 #define MINIRV32_IMPLEMENTATION
 /* The bundled kernel and supported replacement images use aligned, 32-bit
  * RV32IMA instructions.  Skip redundant fetch checks in the hot loop; ports
  * that include mini-rv32ima.h without this define retain strict validation. */
 #define MINIRV32_TRUSTED_32BIT_FETCH
+/* System calls and page faults from user mode enter the kernel without
+ * ending the batch. */
+#define MINIRV32_CONTINUE_AFTER_TRAP
 #if CONFIG_RV32_DECODED_BLOCK_CACHE
 #define MINIRV32_DECODED_BLOCK_CACHE
 #endif
 #if CONFIG_RV32_NATIVE_JIT
 /* Most probes land on heads that are still cold.  Skip RV32_JIT_PROBE_SKIP
  * visits after each failed probe and let the next one count them all, so a
- * head compiles after the same number of guest visits at an eighth of the
+ * head compiles after the same number of guest visits at a sixteenth of the
  * probe cost.  A fresh region is entered at most that many visits late. */
-#define RV32_JIT_PROBE_SKIP 7u
-struct rv32_jit_probe_filter {
-	uint32_t guest_pc;
-	uint32_t skips;
-};
-static struct rv32_jit_probe_filter rv32_jit_probe_filter[256];
+#define RV32_JIT_PROBE_SKIP 15u
+/* Indexed by PC bits 2-11; an entry holds the head's PC bits 12-31, a valid
+ * bit and the visits still to skip.  256 entries of PC and count let kernel
+ * heads evict each other before their skips ran out. */
+#define RV32_JIT_PROBE_FILTER_ENTRIES 1024u
+#define RV32_JIT_PROBE_FILTER_TAG (~(RV32_JIT_PROBE_FILTER_ENTRIES * 4u - 1u))
+#define RV32_JIT_PROBE_FILTER_VALID 16u
+#define RV32_JIT_PROBE_FILTER_COUNT (RV32_JIT_PROBE_FILTER_VALID - 1u)
+_Static_assert((RV32_JIT_PROBE_FILTER_ENTRIES &
+		(RV32_JIT_PROBE_FILTER_ENTRIES - 1u)) == 0u &&
+	       RV32_JIT_PROBE_SKIP < RV32_JIT_PROBE_FILTER_VALID &&
+	       (RV32_JIT_PROBE_FILTER_VALID & RV32_JIT_PROBE_FILTER_TAG) == 0u,
+	       "the skip count and valid bit sit below the PC tag");
+static uint32_t rv32_jit_probe_filter[RV32_JIT_PROBE_FILTER_ENTRIES];
 
 static inline const struct rv32_native_jit_result *RV32JitTryFiltered(
 	uint32_t physical_offset, uint32_t guest_pc, uint32_t limit,
 	uint32_t context)
 {
-	struct rv32_jit_probe_filter *entry =
-		&rv32_jit_probe_filter[(guest_pc >> 2) & 255u];
+	uint32_t *entry = &rv32_jit_probe_filter[(guest_pc >> 2) &
+		(RV32_JIT_PROBE_FILTER_ENTRIES - 1u)];
+	uint32_t tag = (guest_pc & RV32_JIT_PROBE_FILTER_TAG) |
+		RV32_JIT_PROBE_FILTER_VALID;
 	uint32_t weight = 1u;
 	const struct rv32_native_jit_result *result;
 
-	if (entry->guest_pc == guest_pc) {
-		if (entry->skips != 0u) {
-			entry->skips--;
+	if ((*entry & ~RV32_JIT_PROBE_FILTER_COUNT) == tag) {
+		if ((*entry & RV32_JIT_PROBE_FILTER_COUNT) != 0u) {
+			(*entry)--;
+			rv32_profile_set_reason(RV32_PROFILE_FILTERED);
 			return NULL;
 		}
 		weight = RV32_JIT_PROBE_SKIP + 1u;
@@ -140,17 +167,16 @@ static inline const struct rv32_native_jit_result *RV32JitTryFiltered(
 	result = rv32_native_jit_try_weighted(physical_offset, guest_pc, limit,
 					      context, weight);
 #endif
-	if (result == NULL) {
-		entry->guest_pc = guest_pc;
-		entry->skips = RV32_JIT_PROBE_SKIP;
-	} else if (entry->guest_pc == guest_pc) {
-		entry->guest_pc = UINT32_MAX;
-	}
+	if (result == NULL)
+		*entry = tag | RV32_JIT_PROBE_SKIP;
+	else if ((*entry & ~RV32_JIT_PROBE_FILTER_COUNT) == tag)
+		*entry = 0u;
 	return result;
 }
 #define MINIRV32_NATIVE_JIT_TRY(physical_offset, guest_pc, limit, context) \
 	RV32JitTryFiltered((physical_offset), (guest_pc), (limit), (context))
-#define MINIRV32_NATIVE_JIT_FLUSH() rv32_native_jit_flush()
+#define MINIRV32_NATIVE_JIT_FLUSH() rv32_native_jit_fence()
+#define MINIRV32_NOTE_WRITE_PAGE(offset) rv32_native_jit_note_write_page(offset)
 #define MINIRV32_NATIVE_JIT_MEMORY_FLUSH() \
 	rv32_native_jit_memory_cache_flush()
 #define MINIRV32_NATIVE_JIT_MEMORY_FLUSH_PAGE(virtual_address) \
@@ -210,7 +236,9 @@ static inline const struct rv32_native_jit_result *RV32JitTryFiltered(
 	 ((address) >= VIRTIO_FLASH_GUEST_BASE && \
 	  (address) < VIRTIO_FLASH_GUEST_BASE + VIRTIO_FLASH_GUEST_SIZE) || \
 	 ((address) >= VIRTIO_GPU_GUEST_BASE && \
-	  (address) < VIRTIO_GPU_GUEST_BASE + VIRTIO_GPU_GUEST_SIZE))
+	  (address) < VIRTIO_GPU_GUEST_BASE + VIRTIO_GPU_GUEST_SIZE) || \
+	 ((address) >= VIRTIO_INPUT_GUEST_BASE && \
+	  (address) < VIRTIO_INPUT_GUEST_BASE + VIRTIO_INPUT_GUEST_SIZE))
 #define MINIRV32_LOAD4_UNCACHED(ofs) MiniRV32Load4Uncached(ofs)
 #define MINIRV32_LOAD2_UNCACHED(ofs) MiniRV32Load2Uncached(ofs)
 #define MINIRV32_LOAD1_UNCACHED(ofs) MiniRV32Load1Uncached(ofs)
@@ -400,6 +428,32 @@ static void emulator_watch_dump(const char *what, uint32_t loops,
 			       ch.last_in_data[5], ch.last_in_data[6],
 			       ch.last_in_data[7]);
 	}
+	{
+		/* Quiet-device diagnostics: endpoints still polled (NAKs) while no
+		 * data arrives, plus the controller's channel registers, at most
+		 * once a minute. */
+		static struct dwc2_passthrough_channel_stats quiet_ref;
+		static uint32_t quiet_reports;
+		struct dwc2_passthrough_channel_stats ch;
+
+		dwc2_passthrough_stats_channels(&ch);
+		if (ch.in_completions == quiet_ref.in_completions &&
+		    ch.naks - quiet_ref.naks > 200u)
+			quiet_reports++;
+		else
+			quiet_reports = 0;
+		if (quiet_reports != 0u && quiet_reports % 12u == 6u) {
+			esp_rom_printf("[USB] polled without data for %us:", (unsigned)(quiet_reports * 5u));
+			for (uint32_t ep = 1; ep < 16; ep++)
+				if (ch.ep_nak[ep] != 0u || ch.ep_in[ep] != 0u)
+					esp_rom_printf(" ep%u in=%u nak=%u ovr=%u", (unsigned)ep,
+						       (unsigned)ch.ep_in[ep], (unsigned)ch.ep_nak[ep],
+						       (unsigned)ch.ep_ovr[ep]);
+			esp_rom_printf("\r\n");
+			dwc2_passthrough_dump();
+		}
+		quiet_ref = ch;
+	}
 	if (strcmp(what, "USB load") == 0)
 		return;
 	esp_rom_printf("[Host] mstatus=%08x sie=%08x sip=%08x stvec=%08x "
@@ -420,23 +474,25 @@ static void emulator_watch_dump(const char *what, uint32_t loops,
 		       (unsigned)samples[7], (unsigned)core.regs[1],
 		       (unsigned)core.regs[2]);
 	esp_rom_printf("[PLIC] enable=%08x threshold=%u pending=%08x claim-now=%u "
-		       "last=%u prio=%u,%u,%u,%u,%u,%u,%u\r\n",
+		       "last=%u prio=%u,%u,%u,%u,%u,%u,%u,%u\r\n",
 		       (unsigned)plic_enable, (unsigned)plic_threshold,
 		       (unsigned)plic_pending_sources(), (unsigned)plic_claim(),
 		       (unsigned)plic_last_claimed, (unsigned)plic_priority[1],
 		       (unsigned)plic_priority[2], (unsigned)plic_priority[3],
 		       (unsigned)plic_priority[4], (unsigned)plic_priority[5],
-		       (unsigned)plic_priority[6], (unsigned)plic_priority[7]);
-	esp_rom_printf("[PLIC] claims none=%u src1..7=%u,%u,%u,%u,%u,%u,%u "
-		       "completes=%u,%u,%u,%u,%u,%u,%u\r\n",
+		       (unsigned)plic_priority[6], (unsigned)plic_priority[7],
+		       (unsigned)plic_priority[8]);
+	esp_rom_printf("[PLIC] claims none=%u src1..8=%u,%u,%u,%u,%u,%u,%u,%u "
+		       "completes=%u,%u,%u,%u,%u,%u,%u,%u\r\n",
 		       (unsigned)plic_claims[0], (unsigned)plic_claims[1],
 		       (unsigned)plic_claims[2], (unsigned)plic_claims[3],
 		       (unsigned)plic_claims[4], (unsigned)plic_claims[5],
 		       (unsigned)plic_claims[6], (unsigned)plic_claims[7],
+		       (unsigned)plic_claims[8],
 		       (unsigned)plic_completes[1], (unsigned)plic_completes[2],
 		       (unsigned)plic_completes[3], (unsigned)plic_completes[4],
 		       (unsigned)plic_completes[5], (unsigned)plic_completes[6],
-		       (unsigned)plic_completes[7]);
+		       (unsigned)plic_completes[7], (unsigned)plic_completes[8]);
 	dwc2_passthrough_dump();
 }
 
@@ -503,6 +559,16 @@ static uint32_t RV32JitMemoryWidth(uint32_t funct3, bool load)
 	return 0u;
 }
 
+/* A page may be published only into the bank of the live memory context.
+ * Native code stops right after an inline CSR write that changes SUM/MXR,
+ * but a stale bank must never learn a mapping that depends on them. */
+static inline bool RV32JitBankIsCurrent(
+	const struct rv32_native_jit_runtime *runtime)
+{
+	return runtime->memory_context == MiniRV32NativeMemoryContext(
+		(const struct MiniRV32IMAState *)runtime->opaque);
+}
+
 static inline void RV32JitCacheReadPage(
 	struct rv32_native_jit_runtime *runtime, uint32_t virtual_address,
 	const void *host_address)
@@ -511,6 +577,8 @@ static inline void RV32JitCacheReadPage(
 		&runtime->read_pages[(virtual_address >> 12) &
 			(RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u)];
 
+	if (!RV32JitBankIsCurrent(runtime))
+		return;
 	/* The bias converts any address in this translated 4 KiB guest page to
 	 * its corresponding host address with one native ADD.  Publish the tag
 	 * last so generated code can never observe a new tag with an old bias. */
@@ -529,6 +597,8 @@ static inline void RV32JitCacheWritePage(
 		&runtime->write_pages[(virtual_address >> 12) &
 			(RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES - 1u)];
 
+	if (!RV32JitBankIsCurrent(runtime))
+		return;
 	page->host_bias =
 		(uint32_t)(uintptr_t)host_address - virtual_address;
 	page->linear_page_start = linear_page_start;
@@ -558,12 +628,235 @@ static bool IRAM_ATTR RV32JitRefillRam(
 	if (ram_amt < 0x1000u || (offset & ~0xfffu) > ram_amt - 0x1000u)
 		return false;
 	/* Only publish the mapping; generated code retries the access itself. */
-	if (write)
+	if (write) {
+		rv32_native_jit_note_write_page(offset);
 		RV32JitCacheWritePage(runtime, address, runtime->image + offset,
 				     UINT32_MAX, 0u);
+	}
 	else
 		RV32JitCacheReadPage(runtime, address, runtime->image + offset);
 	return true;
+}
+#endif
+
+#if CONFIG_RV32_GUEST_HLE
+/*
+ * Host versions of guest library routines (guest_hle.h).  Each one does the
+ * whole call or declines, leaving it to the guest's own code.  Declining
+ * part way through a copy or fill is safe: the guest code redoes it from the
+ * start and rewrites the same bytes, because the buffers are disjoint.  Only
+ * ordinary cached RAM is touched; device memory, uncached (DMA-coherent)
+ * pages and faults go to the guest code, which handles them as before.
+ */
+static uint8_t *RV32HleMap(uint32_t virtual_address, int access,
+			   uint32_t *span)
+{
+	struct MiniRV32IMAState *state = &core;
+	int fault;
+	int uncached = 0;
+	uint32_t physical = MiniRV32Translate(state, guest_ram, virtual_address,
+					      access, &fault, &uncached);
+	uint32_t offset = physical - MINIRV32_RAM_IMAGE_OFFSET;
+
+	if (fault || uncached || physical < MINIRV32_RAM_IMAGE_OFFSET ||
+	    offset >= ram_amt)
+		return NULL;
+	if (access == ACCESS_WRITE)
+		rv32_native_jit_note_write_page(offset);
+	*span = 0x1000u - (virtual_address & 0xfffu);
+	if (*span > ram_amt - offset)
+		*span = ram_amt - offset;
+	return guest_ram + offset;
+}
+
+/* The kernel's linear map is one contiguous block of guest RAM. */
+static uint8_t *RV32HleLinear(uint32_t virtual_address, uint32_t size)
+{
+	struct MiniRV32IMAState *state = &core;
+	uint32_t linear = virtual_address - MINIRV32_KERNEL_LINEAR_BASE;
+	uint32_t window = ram_amt - MINIRV32_KERNEL_LINEAR_PHYS_OFFSET;
+
+	if ((CSR(extraflags) & 3u) != 1u || !(CSR(satp) & 0x80000000u) ||
+	    linear >= window || size > window - linear)
+		return NULL;
+	return guest_ram + MINIRV32_KERNEL_LINEAR_PHYS_OFFSET + linear;
+}
+
+static bool RV32HleCopy(uint32_t destination, uint32_t source, uint32_t size)
+{
+	while (size != 0u) {
+		uint32_t source_span;
+		uint32_t destination_span;
+		uint32_t chunk;
+		const uint8_t *from = RV32HleMap(source, ACCESS_READ, &source_span);
+		uint8_t *to = from != NULL ?
+			RV32HleMap(destination, ACCESS_WRITE, &destination_span) :
+			NULL;
+
+		if (to == NULL)
+			return false;
+		chunk = size < source_span ? size : source_span;
+		if (chunk > destination_span)
+			chunk = destination_span;
+		memcpy(to, from, chunk);
+		source += chunk;
+		destination += chunk;
+		size -= chunk;
+	}
+	return true;
+}
+
+static bool RV32HleFill(uint32_t destination, uint8_t value, uint32_t size)
+{
+	while (size != 0u) {
+		uint32_t span;
+		uint32_t chunk;
+		uint8_t *to = RV32HleMap(destination, ACCESS_WRITE, &span);
+
+		if (to == NULL)
+			return false;
+		chunk = size < span ? size : span;
+		memset(to, value, chunk);
+		destination += chunk;
+		size -= chunk;
+	}
+	return true;
+}
+
+/* EROFS decompresses up to a few hundred KiB at once; larger calls stay
+ * with the guest decoder. */
+#define RV32_HLE_LZ4_PAGES 65u
+static uint8_t *rv32_hle_lz4_in[RV32_HLE_LZ4_PAGES];
+static uint8_t *rv32_hle_lz4_out[RV32_HLE_LZ4_PAGES];
+
+/* Host address of every guest page of [address, address + size). */
+static bool RV32HleMapPages(uint32_t address, uint32_t size, int access,
+			    uint8_t **pages, uint32_t *count)
+{
+	uint32_t first = address & 0xfffu;
+
+	*count = (first + size + 0xfffu) >> 12;
+	if (size == 0u || size > UINT32_MAX - address ||
+	    *count > RV32_HLE_LZ4_PAGES)
+		return false;
+	for (uint32_t i = 0; i < *count; i++) {
+		uint32_t span;
+
+		pages[i] = RV32HleMap((address & ~0xfffu) + (i << 12), access,
+				      &span);
+		if (pages[i] == NULL || span != 0x1000u)
+			return false;
+	}
+	return true;
+}
+
+/* LZ4_decompress_safe{,_partial}: the result is the output size, or the
+ * call is left to the guest decoder (see guest_lz4.h). */
+static bool RV32HleLz4(uint32_t source, uint32_t destination,
+		       int32_t source_size, int32_t capacity, bool partial)
+{
+	struct guest_lz4_buffer in;
+	struct guest_lz4_buffer out;
+	uint32_t in_pages;
+	uint32_t out_pages;
+	uint32_t source_in_destination = UINT32_MAX;
+
+	if (source_size <= 0 || capacity <= 0 ||
+	    !RV32HleMapPages(source, (uint32_t)source_size, ACCESS_READ,
+			     rv32_hle_lz4_in, &in_pages) ||
+	    !RV32HleMapPages(destination, (uint32_t)capacity, ACCESS_WRITE,
+			     rv32_hle_lz4_out, &out_pages))
+		return false;
+	if (source - destination < (uint32_t)capacity) {
+		/* EROFS in-place: the source starts inside the output mapping. */
+		source_in_destination = source - destination;
+	} else if (destination - source < (uint32_t)source_size) {
+		return false;
+	} else {
+		/* Disjoint addresses may share a page only as the same virtual
+		 * page (EROFS input right after the output); another mapping of
+		 * the same RAM could overlap bytes. */
+		for (uint32_t i = 0; i < in_pages; i++)
+			for (uint32_t j = 0; j < out_pages; j++)
+				if (rv32_hle_lz4_in[i] == rv32_hle_lz4_out[j] &&
+				    (source >> 12) + i != (destination >> 12) + j)
+					return false;
+	}
+	in = (struct guest_lz4_buffer) {
+		rv32_hle_lz4_in, source & 0xfffu, (uint32_t)source_size };
+	out = (struct guest_lz4_buffer) {
+		rv32_hle_lz4_out, destination & 0xfffu, (uint32_t)capacity };
+	if (!guest_lz4_decode(&in, &out, partial, source_in_destination))
+		return false;
+	core.regs[10] = (uint32_t)capacity;
+	rv32_profile_jit_add(RV32_PROFILE_HLE_BYTES, (uint32_t)capacity);
+	return true;
+}
+
+/* rv32_native_jit_hle_fn: a0..a4 are the call's arguments, ra its return. */
+static bool RV32HleRun(uint32_t kind)
+{
+	uint32_t *regs = core.regs;
+	uint32_t a0 = regs[10];
+	uint32_t a1 = regs[11];
+	uint32_t a2 = regs[12];
+
+	switch (kind) {
+	case GUEST_HLE_MEMCPY:
+	case GUEST_HLE_MEMMOVE:
+		if (a2 == 0u)
+			return true;
+		if (a0 - a1 >= a2 && a1 - a0 >= a2) {
+			if (!RV32HleCopy(a0, a1, a2))
+				return false;
+		} else {
+			/* Overlap: memcpy's result is the guest code's own business.
+			 * A move is redone only when it happens in one piece. */
+			uint8_t *to = RV32HleLinear(a0, a2);
+			uint8_t *from = RV32HleLinear(a1, a2);
+
+			if (kind != GUEST_HLE_MEMMOVE || to == NULL || from == NULL)
+				return false;
+			memmove(to, from, a2);
+		}
+		rv32_profile_jit_add(RV32_PROFILE_HLE_BYTES, a2);
+		return true;
+	case GUEST_HLE_MEMSET:
+		if (!RV32HleFill(a0, (uint8_t)a1, a2))
+			return false;
+		rv32_profile_jit_add(RV32_PROFILE_HLE_BYTES, a2);
+		return true;
+	case GUEST_HLE_DIV64_32: {
+		/* *n /= base; return the remainder.  The guest code reads and
+		 * writes *n as two aligned words. */
+		uint32_t span;
+		uint8_t *n;
+		uint64_t dividend;
+		uint64_t quotient;
+
+		if (a1 == 0u || (a0 & 3u) != 0u)
+			return false;
+		n = RV32HleMap(a0, ACCESS_WRITE, &span);
+		if (n == NULL || span < sizeof(dividend))
+			return false;
+		memcpy(&dividend, n, sizeof(dividend));
+		quotient = dividend / a1;
+		memcpy(n, &quotient, sizeof(quotient));
+		regs[10] = (uint32_t)(dividend - quotient * a1);
+		return true;
+	}
+	case GUEST_HLE_LZ4_SAFE:
+		return RV32HleLz4(a0, a1, (int32_t)a2, (int32_t)regs[13], false);
+	case GUEST_HLE_LZ4_SAFE_PARTIAL: {
+		int32_t target = (int32_t)regs[13];
+		int32_t capacity = (int32_t)regs[14];
+
+		return RV32HleLz4(a0, a1, (int32_t)a2,
+				  target < capacity ? target : capacity, true);
+	}
+	default:
+		return false;
+	}
 }
 #endif
 
@@ -699,6 +992,7 @@ static uint32_t IRAM_ATTR RV32JitMemoryStore(
 	if (physical_address >= MINIRV32_RAM_IMAGE_OFFSET) {
 		offset = physical_address - MINIRV32_RAM_IMAGE_OFFSET;
 		if (offset < ram_amt && width <= ram_amt - offset) {
+			rv32_native_jit_note_write_page(offset);
 			RV32_JIT_TRACE_MEMORY(runtime, uncached ?
 				RV32_JIT_TRACE_MEMORY_UNCACHED : RV32_JIT_TRACE_MEMORY_RAM);
 			if (uncached) {
@@ -853,12 +1147,17 @@ static __attribute__((noinline, noclone)) void EmulatorPerfReport(uint64_t curre
 	virtio_net_bridge_perf_snapshot(&net);
 	virtio_blk_bridge_perf_snapshot(&blk);
 	mips_x100 = elapsed_us ? guest_delta * 100u / elapsed_us : 0u;
-	l1_total = (uint64_t)cache_stats.l1_hits + cache_stats.l1_misses;
-	l2_total = (uint64_t)cache_stats.l2_hits + cache_stats.l2_misses;
-	l1_hit_permille = l1_total ?
-		(uint32_t)((uint64_t)cache_stats.l1_hits * 1000u / l1_total) : 0u;
-	l2_hit_permille = l2_total ?
-		(uint32_t)((uint64_t)cache_stats.l2_hits * 1000u / l2_total) : 0u;
+	/* HIT counts every completed access and NXTLVL_RD every line fill; the
+	 * MISS register counts stall time, not misses (ESP32-P4 TRM, cache
+	 * performance counters), so it has no place in a hit rate. */
+	l1_total = cache_stats.l1_hits;
+	l2_total = cache_stats.l2_hits;
+	l1_hit_permille = l1_total > cache_stats.l1_next_reads ?
+		(uint32_t)((l1_total - cache_stats.l1_next_reads) * 1000u /
+			   l1_total) : 0u;
+	l2_hit_permille = l2_total > cache_stats.l2_next_reads ?
+		(uint32_t)((l2_total - cache_stats.l2_next_reads) * 1000u /
+			   l2_total) : 0u;
 	for (unsigned int i = 0; i < 32; i++)
 		opcode_total += core.perf.opcode[i];
 
@@ -1007,9 +1306,65 @@ static uint32_t HostPerfBusyPermille(
 	return 1000u - (uint32_t)(idle_us * 1000u / elapsed_us);
 }
 
+/* The emulator core's own counters, read where this report runs: cycles and
+ * retired instructions, and the ESP32-P4's two branch events (TRM: mhpmevent8
+ * = 6, conditional-branch mispredictions; mhpmevent9 = 7, conditional
+ * branches; counters 0xB08 and 0xB09 with their high halves at 0xB88 and
+ * 0xB89, counting once their mcountinhibit bits are cleared). */
+#define HOST_PERF_COUNTER64(name, low, high) \
+static inline uint64_t name(void) \
+{ \
+	uint32_t lo, hi, hi2; \
+\
+	do { \
+		__asm__ volatile("csrr %0, " #high : "=r"(hi)); \
+		__asm__ volatile("csrr %0, " #low : "=r"(lo)); \
+		__asm__ volatile("csrr %0, " #high : "=r"(hi2)); \
+	} while (hi != hi2); \
+	return ((uint64_t)hi << 32) | lo; \
+}
+HOST_PERF_COUNTER64(HostPerfCpuCycles, 0xB00, 0xB80)
+HOST_PERF_COUNTER64(HostPerfCpuInstructions, 0xB02, 0xB82)
+HOST_PERF_COUNTER64(HostPerfCpuMispredicts, 0xB08, 0xB88)
+HOST_PERF_COUNTER64(HostPerfCpuBranches, 0xB09, 0xB89)
+#undef HOST_PERF_COUNTER64
+enum {
+	HOST_PERF_CPU_CYCLES,
+	HOST_PERF_CPU_INSNS,
+	HOST_PERF_CPU_MISPREDICTS,
+	HOST_PERF_CPU_BRANCHES,
+	HOST_PERF_CPU_COUNTERS
+};
+static uint64_t host_perf_last_cpu[HOST_PERF_CPU_COUNTERS];
+
+static void HostPerfCpuCountersRead(uint64_t *values)
+{
+	values[HOST_PERF_CPU_CYCLES] = HostPerfCpuCycles();
+	values[HOST_PERF_CPU_INSNS] = HostPerfCpuInstructions();
+	values[HOST_PERF_CPU_MISPREDICTS] = HostPerfCpuMispredicts();
+	values[HOST_PERF_CPU_BRANCHES] = HostPerfCpuBranches();
+}
+
+static void HostPerfCpuCountersEnable(void)
+{
+	static bool enabled;
+
+	if (enabled)
+		return;
+	enabled = true;
+	__asm__ volatile("csrw 0x328, %0" : : "r"(6u));
+	__asm__ volatile("csrw 0x329, %0" : : "r"(7u));
+	__asm__ volatile("csrw 0xB08, zero\n\tcsrw 0xB88, zero\n\t"
+			 "csrw 0xB09, zero\n\tcsrw 0xB89, zero");
+	/* CY, IR, HPM8 and HPM9 count. */
+	__asm__ volatile("csrc 0x320, %0" : : "r"(0x305u));
+}
+
 static void HostPerfStart(uint64_t current_time)
 {
 	host_perf_last_time = current_time;
+	HostPerfCpuCountersEnable();
+	HostPerfCpuCountersRead(host_perf_last_cpu);
 	host_perf_last_cycle =
 		((uint64_t)core.cycleh << 32) | core.cyclel;
 	for (BaseType_t cpu = 0; cpu < 2; cpu++)
@@ -1057,6 +1412,29 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 	       busy[0] / 10u, busy[0] % 10u,
 	       busy[1] / 10u, busy[1] % 10u,
 	       mips_x100 / 100u, mips_x100 % 100u);
+	{
+		uint64_t cpu[HOST_PERF_CPU_COUNTERS];
+		uint64_t cycles, insns, branches, mispredicts;
+
+		HostPerfCpuCountersRead(cpu);
+		cycles = cpu[HOST_PERF_CPU_CYCLES] -
+			host_perf_last_cpu[HOST_PERF_CPU_CYCLES];
+		insns = cpu[HOST_PERF_CPU_INSNS] -
+			host_perf_last_cpu[HOST_PERF_CPU_INSNS];
+		mispredicts = cpu[HOST_PERF_CPU_MISPREDICTS] -
+			host_perf_last_cpu[HOST_PERF_CPU_MISPREDICTS];
+		branches = cpu[HOST_PERF_CPU_BRANCHES] -
+			host_perf_last_cpu[HOST_PERF_CPU_BRANCHES];
+		printf("[CPU0 perf] cycles=%" PRIu64 " insns=%" PRIu64
+		       " cpi=%" PRIu64 ".%02" PRIu64 " branches=%" PRIu64
+		       " mispredicts=%" PRIu64 " (%" PRIu64 ".%" PRIu64
+		       "%% of branches)\n",
+		       cycles, insns, insns ? cycles / insns : 0u,
+		       insns ? cycles * 100u / insns % 100u : 0u,
+		       branches, mispredicts,
+		       branches ? mispredicts * 100u / branches : 0u,
+		       branches ? mispredicts * 1000u / branches % 10u : 0u);
+	}
 	printf("[Display perf] worker %" PRIu32 ".%" PRIu32
 	       "%%/%" PRIu32 " us, wake=%" PRIu32 " vsync=%" PRIu32
 	       " cmd=%" PRIu32 " (fill=%" PRIu32 " copy=%" PRIu32
@@ -1258,6 +1636,29 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 			       host_perf_last_jit.rejected_codegen,
 			       jit->rejected_publish -
 				       host_perf_last_jit.rejected_publish);
+		printf("[JIT async] submitted=%" PRIu32 " installed=%" PRIu32
+		       " stale=%" PRIu32 " duplicate=%" PRIu32
+		       " set-full=%" PRIu32 " queue-full=%" PRIu32
+		       " local=%" PRIu32 " worker=%" PRIu64 " cycles\n",
+		       jit->async_submitted - host_perf_last_jit.async_submitted,
+		       jit->async_installed - host_perf_last_jit.async_installed,
+		       jit->async_stale - host_perf_last_jit.async_stale,
+		       jit->async_duplicates -
+			       host_perf_last_jit.async_duplicates,
+		       jit->async_set_full - host_perf_last_jit.async_set_full,
+		       jit->async_queue_full -
+			       host_perf_last_jit.async_queue_full,
+		       jit->async_local - host_perf_last_jit.async_local,
+		       jit->async_worker_cycles -
+			       host_perf_last_jit.async_worker_cycles);
+		printf("[JIT install] installs=%" PRIu32 " cycles=%" PRIu64
+		       " forgets=%" PRIu32 " cycles=%" PRIu64
+		       " publish=%" PRIu64 " cycles\n",
+		       jit->installs - host_perf_last_jit.installs,
+		       jit->install_cycles - host_perf_last_jit.install_cycles,
+		       jit->forgets - host_perf_last_jit.forgets,
+		       jit->forget_cycles - host_perf_last_jit.forget_cycles,
+		       jit->publish_cycles - host_perf_last_jit.publish_cycles);
 		{
 			static uint32_t last_fast_dispatches;
 			uint32_t fast_dispatches =
@@ -1281,13 +1682,17 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 		printf("[JIT cache] resident=%" PRIu32 "/%" PRIu32
 		       " KiB head=%" PRIu32 "/%" PRIu32
 		       " KiB; evict arena=%" PRIu32 " tag=%" PRIu32
-		       " wrap=%" PRIu32 "\n",
+		       " wrap=%" PRIu32 "; flushes tlb=%" PRIu32
+		       " fence=%" PRIu32 "\n",
 		       jit->resident_regions, jit->resident_bytes / 1024u,
 		       jit->arena_head_bytes / 1024u,
 		       jit->arena_capacity_bytes / 1024u,
 		       jit->arena_evictions - host_perf_last_jit.arena_evictions,
 		       jit->tag_evictions - host_perf_last_jit.tag_evictions,
-		       jit->arena_wraps - host_perf_last_jit.arena_wraps);
+		       jit->arena_wraps - host_perf_last_jit.arena_wraps,
+		       jit->translation_flushes -
+			       host_perf_last_jit.translation_flushes,
+		       jit->fences - host_perf_last_jit.fences);
 		printf("[JIT hot] resident=%" PRIu32 "/%" PRIu32
 		       " KiB head=%" PRIu32 "/%" PRIu32
 		       " KiB; promote=%" PRIu32 " (early=%" PRIu32
@@ -1345,6 +1750,7 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 #endif
 	host_perf_last_time = current_time;
 	host_perf_last_cycle = guest_cycle;
+	HostPerfCpuCountersRead(host_perf_last_cpu);
 	for (BaseType_t cpu = 0; cpu < 2; cpu++)
 		host_perf_last_idle[cpu] = idle[cpu];
 }
@@ -1380,6 +1786,11 @@ void app_main(void)
 		printf("failed to map guest RAM\n");
 		return;
 	}
+#if CONFIG_RV32_GUEST_PROFILE
+	/* Before the JIT self-test: generated code embeds the counter addresses. */
+	if (rv32_profile_init(guest_ram, ram_amt) < 0)
+		printf("WARNING: guest profile tables unavailable\n");
+#endif
 	/* Reserve guest RAM first, then allocate the LCD driver's framebuffer. */
 	display_bridge_set_guest_memory(guest_ram, GUEST_PHYS_BASE, ram_amt);
 	display_bridge_init();
@@ -1397,6 +1808,10 @@ void app_main(void)
 				    CONFIG_FREERTOS_NUMBER_OF_CORES > 1 ? 1 : 0) !=
 	    pdPASS)
 		printf("WARNING: Emulator stall reporter unavailable\n");
+#if CONFIG_RV32_GUEST_PROFILE
+	if (rv32_profile_start_reports() < 0)
+		printf("WARNING: guest profile reports unavailable\n");
+#endif
 	if (virtio_console_bridge_init() < 0)
 		printf("WARNING: virtio-console bridge initialization failed\n");
 	if (virtio_blk_bridge_init() < 0)
@@ -1405,6 +1820,8 @@ void app_main(void)
 		printf("WARNING: read-only flash disk unavailable\n");
 	if (virtio_gpu_bridge_init() < 0)
 		printf("WARNING: virtio-gpu bridge unavailable\n");
+	if (virtio_input_bridge_init() < 0)
+		printf("WARNING: virtio-input bridge unavailable\n");
 #if CONFIG_RV32_NATIVE_JIT
 	if (!rv32_native_jit_init()) {
 		printf("ERROR: Native RV32 JIT initialization/self-test failed (group %" PRIu32 ")\n",
@@ -1422,7 +1839,7 @@ void app_main(void)
 		static struct rv32_native_jit_stats stats;
 
 		rv32_native_jit_get_stats(&stats);
-		RV32_DIAG("Native RV32 JIT ready: self-tested, %u two-way region tags in a %" PRIu32 " KiB adaptive executable L2 arena + %" PRIu32 " KiB internal hot tier; ready-region chaining, one shared ABI frame\n",
+		RV32_DIAG("Native RV32 JIT ready: self-tested, %u four-way region tags in a %" PRIu32 " KiB adaptive executable L2 arena + %" PRIu32 " KiB internal hot tier; ready-region chaining, one shared ABI frame\n",
 		       RV32_NATIVE_JIT_CACHE_SLOTS,
 		       stats.arena_capacity_bytes / 1024u,
 		       stats.hot_arena_capacity_bytes / 1024u);
@@ -1450,11 +1867,15 @@ void app_main(void)
 	core.pc = MINIRV32_RAM_IMAGE_OFFSET + KERNEL_LOAD_OFFSET;
 	core.regs[10] = 0; /* a0 = hart ID. */
 	core.regs[11] = MINIRV32_RAM_IMAGE_OFFSET + DTB_LOAD_OFFSET;
-	core.extraflags = 1; /* Supervisor mode. */
+	/* Supervisor mode; every reservation bit set means no LR reservation. */
+	core.extraflags = 1u | ~7u;
 	core.satp = 0;       /* Linux enables Sv32 itself. */
 #if CONFIG_RV32_NATIVE_JIT
 	rv32_native_jit_bind(core.regs, guest_ram, &core,
 			     RV32JitMemoryLoad, RV32JitMemoryStore);
+#if CONFIG_RV32_GUEST_HLE
+	rv32_native_jit_set_hle(RV32HleRun, ram_amt);
+#endif
 #if CONFIG_RV32_NATIVE_JIT_RAM_REFILL
 	rv32_native_jit_set_ram_refill(RV32JitRefillRam);
 #endif
@@ -1481,6 +1902,7 @@ void app_main(void)
 	rv32_native_jit_set_kernel_linear_map(MINIRV32_KERNEL_LINEAR_BASE,
 		MINI_RV32_RAM_SIZE - MINIRV32_KERNEL_LINEAR_PHYS_OFFSET);
 #endif
+	rv32_native_jit_start_async_compiler();
 #endif
 
 	uint64_t lastTime = GetTimeMicroseconds();
@@ -1502,6 +1924,9 @@ void app_main(void)
 	uint64_t last_cache_profile = lastTime;
 	HostCacheProfileStart();
 #endif
+#if CONFIG_RV32_HOST_PC_SAMPLER
+	HostPcSamplerStart();
+#endif
 	printf("RV32IMA starting\n");
 	RV32_DIAG("Initial PC: 0x%08" PRIx32 "\n", core.pc);
 
@@ -1513,6 +1938,7 @@ void app_main(void)
 		if (elapsedUs > 100000) elapsedUs = 100000;
 		lastTime = currentTime;
 		emulator_loops = emulator_loops + 1u;
+		rv32_profile_service(core.cyclel);
 		rv32_host_wake = 0u;
 		GuestUartFlushIfDue(currentTime);
 		virtio_console_bridge_poll();
@@ -1699,7 +2125,8 @@ static void GuestParavirtualConsoleWrite(uint32_t virtual_address,
 #define PLIC_BLOCK_SOURCE      VIRTIO_BLK_PLIC_SOURCE
 #define PLIC_GPU_SOURCE        VIRTIO_GPU_PLIC_SOURCE
 #define PLIC_FLASH_SOURCE      VIRTIO_FLASH_PLIC_SOURCE
-#define PLIC_SOURCE_COUNT      7u
+#define PLIC_INPUT_SOURCE      VIRTIO_INPUT_PLIC_SOURCE
+#define PLIC_SOURCE_COUNT      8u
 #define PLIC_PENDING_BASE      0x00001000u
 #define PLIC_ENABLE_BASE       0x00002000u
 #define PLIC_CONTEXT_BASE      0x00200000u
@@ -1708,7 +2135,7 @@ static void GuestParavirtualConsoleWrite(uint32_t virtual_address,
 #define SIP_SEIP               (1u << 9)
 
 static uint32_t plic_priority[PLIC_SOURCE_COUNT + 1u] =
-	{ 0, 1, 1, 1, 1, 1, 1, 1 };
+	{ 0, 1, 1, 1, 1, 1, 1, 1, 1 };
 static uint32_t plic_enable;
 /* Diagnostics for the stall reporter: claims and completions per source,
  * claims that found nothing, and the last source handed out. */
@@ -1752,6 +2179,8 @@ static inline uint32_t plic_pending_sources(void)
 		pending |= 1u << PLIC_GPU_SOURCE;
 	if (virtio_flash_bridge_irq_pending())
 		pending |= 1u << PLIC_FLASH_SOURCE;
+	if (virtio_input_bridge_irq_pending())
+		pending |= 1u << PLIC_INPUT_SOURCE;
 	if (uart_interrupt_pending())
 		pending |= 1u << PLIC_UART_SOURCE;
 	return pending;
@@ -1901,6 +2330,11 @@ static uint32_t HandleControlStore(
 		virtio_gpu_bridge_store(addy, val, width);
 		return 0;
 	}
+	if (MmioRangeContains(addy, width, VIRTIO_INPUT_GUEST_BASE,
+			      VIRTIO_INPUT_GUEST_SIZE)) {
+		virtio_input_bridge_store(addy, val, width);
+		return 0;
+	}
 	if (display_bridge_contains(addy, width)) {
 		display_bridge_store(addy, val, width);
 		return 0;
@@ -1970,6 +2404,9 @@ static uint32_t HandleControlLoad(uint32_t addy, size_t width)
 	if (MmioRangeContains(addy, width, VIRTIO_GPU_GUEST_BASE,
 			      VIRTIO_GPU_GUEST_SIZE))
 		return virtio_gpu_bridge_load(addy, width);
+	if (MmioRangeContains(addy, width, VIRTIO_INPUT_GUEST_BASE,
+			      VIRTIO_INPUT_GUEST_SIZE))
+		return virtio_input_bridge_load(addy, width);
 	if (display_bridge_contains(addy, width))
 		return display_bridge_load(addy, width);
 
