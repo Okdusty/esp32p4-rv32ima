@@ -1,6 +1,6 @@
 # esp32p4-rv32ima
 
-> Emulated Linux runs at ~77 DMIPS or roughly IBM [RS/6000 (POWER1)](https://en.wikipedia.org/wiki/POWER1)-class tier CPU, ~1/7th the per-MHz of a SiFive E31.
+> Emulated Linux runs at ~77 DMIPS (Dhrystone best-case) — roughly IBM [RS/6000 (POWER1)](https://en.wikipedia.org/wiki/POWER1)-class, ~1/7th the per-MHz of a SiFive E31.
 
 Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on [CNLohr's mini-rv32ima](https://github.com/cnlohr/mini-rv32ima). The ESP32-P4 is currently the only tested target.
 
@@ -12,10 +12,10 @@ Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on
 <img width="400" height="300" alt="20260827_144636" src="https://github.com/user-attachments/assets/ab346992-d67d-4b86-9319-969dcc64a5f5" />
 </div>
 
-### Latest measurements
+### Latest measured times (guest `/proc/uptime`, `measure-ma4-c.txt`)
 
 | workload | guest time |
-| --- | ---: |
+|---|---:|
 | `find /opt` | 4.0s |
 | `cat` libs/bins | 14.7s |
 | `curl` https x2 | 16.0s |
