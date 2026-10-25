@@ -1,15 +1,25 @@
 # esp32p4-rv32ima
 
+> Emulated Linux runs at ~77 DMIPS or roughly IBM [RS/6000 (POWER1)](https://en.wikipedia.org/wiki/POWER1)-class tier CPU, ~1/7th the per-MHz of a SiFive E31.
+
 Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on [CNLohr's mini-rv32ima](https://github.com/cnlohr/mini-rv32ima). The ESP32-P4 is currently the only tested target.
 
 <div align="center"><i>wmaker + xterm + fastfetch</i></div><br>
 <img width="1000" height="500" alt="20261025_034026" src="https://github.com/user-attachments/assets/e490e69e-5481-43dd-a74d-5aa2ed29d3c2" />
 
-
 <div align="center">
 <img width="400" height="300" alt="20260827_142552" src="https://github.com/user-attachments/assets/fc94d895-d524-4a0b-a763-805fbcfaff4c" />
 <img width="400" height="300" alt="20260827_144636" src="https://github.com/user-attachments/assets/ab346992-d67d-4b86-9319-969dcc64a5f5" />
 </div>
+
+### Latest measurements
+
+| workload | guest time |
+| --- | ---: |
+| `find /opt` | 4.0s |
+| `cat` libs/bins | 14.7s |
+| `curl` https x2 | 16.0s |
+| desktop `startx` to quiet | 41s settle (50.4s total) |
 
 ## What changed from Epiczhul's + CNLohr's
 
