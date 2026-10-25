@@ -4,6 +4,9 @@
 
 Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on [CNLohr's mini-rv32ima](https://github.com/cnlohr/mini-rv32ima). The ESP32-P4 is currently the only tested target.
 
+<div align="center"><i>offical doomgeneric</i></div><br>
+<img width="1000" height="500" alt="20261025_034026" src="docs/img/a.gif" />
+
 <div align="center"><i>wmaker + xterm + fastfetch</i></div><br>
 <img width="1000" height="500" alt="20261025_034026" src="https://github.com/user-attachments/assets/e490e69e-5481-43dd-a74d-5aa2ed29d3c2" />
 
@@ -111,7 +114,15 @@ With **Keep kernel regions across FENCE.I** (on by default), the `fence.i` that 
 
 ### USB port
 
-**USB port** (RV32 Linux hardware bridges) chooses who drives the USB host port. With **Linux (any USB device)**, the default, the guest's dwc2 driver owns the controller: memory sticks, hubs, keyboards and mice all work, but every USB interrupt runs through the emulated kernel (about 1.2 ms each), so an idle mouse alone takes a sixth of the guest's CPU. With **Keyboard and mouse on CPU1**, ESP-IDF's USB host and HID drivers read boot-protocol keyboards and mice (also through a hub) on CPU1 and hand keys, buttons, motion and wheels to Linux as one virtio-input device (`/dev/input/event0`, used by the console and by X); idle devices cost the guest nothing, mouse motion reaches it at most 100 times a second, and Caps/Num/Scroll Lock go back to the keyboard. Other USB devices are not available to Linux in that mode. Either way, plug devices in before power-up: plugging in or out resets the board.
+<div align="center"><i>eg schematic if you want to functional usb port that do act as source on this module</i></div><br>
+<div align="center">
+<img width="400" height="300" alt="20261025_034026" src="docs/img/c.jpeg" />
+<br>
+<img width="400" height="500" alt="20261025_034026" src="docs/img/a.jpeg" />
+<img width="400" height="500" alt="20261025_034026" src="docs/img/b.jpeg" />
+</div>
+
+Basically you have to cut the pcb trace of 5.1k pull downs (CC1/CC2) that goes into type-c port 2 (the one directly connects usbd_p/n to esp32p4, unlike first type-c port we need native access to usb not debug uart). Than find 56k resistor, you may also use 2, 100k in parallel tho it may fail, connect both resistors end to source/5v than pull-up cc1/cc2 pins. make sure to feed the type-c cause usb0_5v and usb1_5v are isolated, so you need to wire-up additional 5v provide power through vbus or merge them so that at port 1 you power the board, port2 will be usb host and source.
 
 ### Read-only desktop disk
 
