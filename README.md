@@ -45,7 +45,7 @@ ESP32-P4 (dual-core default)
      On a single-core build every task falls back to CPU0.
 ```
 
-Verified against the code: the emulator loop runs in `app_main` (main task, CPU0); `rv32-net` (`virtio_net_bridge.c:962`), UART TX (`port-esp.c:741`), USB HID (`usb_hid_input.c` `USB_HID_CORE 1`), ESP-Hosted and virtio-blk init (`HostRunOnCpu1`), and the display task (`display_bridge.c:3064`, pinned to the core after `app_main`'s) all run on CPU1.
+All of this is verified against the code: the emulator loop runs in `app_main` on CPU0, while the network bridge, UART, display, USB HID, and JIT compilation tasks are all pinned to CPU1.
 
 ### MMU and supervisor-mode support
 
