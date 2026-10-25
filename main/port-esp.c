@@ -27,6 +27,7 @@
 #include "driver/uart.h"
 #include "driver/uart_vfs.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "hal/uart_ll.h"
@@ -161,7 +162,6 @@ void HostCacheStatsReadAndReset(struct host_cache_stats *stats)
 #endif
 }
 
-#if CONFIG_RV32_DISPLAY_ACCEL
 static void write_be32(uint8_t *destination, uint32_t value)
 {
   destination[0] = (uint8_t)(value >> 24);
@@ -169,6 +169,8 @@ static void write_be32(uint8_t *destination, uint32_t value)
   destination[2] = (uint8_t)(value >> 8);
   destination[3] = (uint8_t)value;
 }
+
+#if CONFIG_RV32_DISPLAY_ACCEL
 
 /* Each display DTB describes one panel size, and U8g2 panels of every size
  * share the 128x64 one. Write the geometry this firmware renders into the
@@ -207,6 +209,77 @@ static bool prepare_linux_framebuffer_property(const char *name,
 }
 #endif
 
+const uint8_t *rv32_xip_host;
+uint32_t rv32_xip_size;
+
+/* The flash MMU (its own 64 MB window at 0x40000000, separate from the
+ * PSRAM MMU) is otherwise unused: the app runs from PSRAM.  Map the whole
+ * "xip" partition once; it stays mapped for the uptime.  SPI1 reads by the
+ * rofs worker keep the cache enabled (esp_flash's mmap lock); erases and
+ * writes elsewhere in flash disable it for their duration. */
+void psram_map_xip_partition(void)
+{
+#if CONFIG_RV32_FLASH_XIP
+  const esp_partition_t *partition = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "xip");
+  esp_partition_mmap_handle_t handle;
+  const void *mapped;
+
+  if (partition == NULL) {
+    printf("WARNING: no 'xip' partition; files are not mapped in place\n");
+    return;
+  }
+  if (partition->address + partition->size > 0x1000000u) {
+    printf("WARNING: the 'xip' partition ends above 16 MiB, beyond the "
+           "quad-flash cache mapping\n");
+    return;
+  }
+  esp_err_t err = esp_partition_mmap(partition, 0, partition->size,
+                                     ESP_PARTITION_MMAP_DATA, &mapped,
+                                     &handle);
+  if (err != ESP_OK) {
+    printf("WARNING: mapping the 'xip' partition failed: %s\n",
+           esp_err_to_name(err));
+    return;
+  }
+  /* cramfs superblock magic, little endian. */
+  if (*(const volatile uint32_t *)mapped != 0x28cd3d45u) {
+    printf("WARNING: the 'xip' partition holds no cramfs image\n");
+    esp_partition_munmap(handle);
+    return;
+  }
+  rv32_xip_host = mapped;
+  rv32_xip_size = partition->size;
+  RV32_DIAG("xip: %" PRIu32 " KB of flash at guest 0x%08x (host %p)\n",
+            rv32_xip_size / 1024u, (unsigned int)GUEST_XIP_BASE, mapped);
+#endif
+}
+
+/* The "mtd-rom" node gets the mapped size, or a compatible that no driver
+ * matches (same length, so the DTB keeps its layout).  Linux's physmap rounds
+ * its window down to a power of two, so reg names the next power of two;
+ * cramfs reads only its image, which lies in the mapped part. */
+static bool prepare_linux_xip_property(const char *name, uint8_t *value,
+                                       uint32_t length)
+{
+  if (strcmp(name, "reg") == 0 && length == 4u * sizeof(uint32_t) &&
+      read_be32(value + sizeof(uint32_t)) == GUEST_XIP_BASE) {
+    uint32_t window = rv32_xip_size;
+
+    if (window & (window - 1u))
+      window = UINT32_C(1) << (32 - __builtin_clz(window));
+    write_be32(value + 3u * sizeof(uint32_t), window);
+    return true;
+  }
+  if (rv32_xip_size == 0u && strcmp(name, "compatible") == 0 &&
+      length == sizeof("mtd-rom") &&
+      memcmp(value, "mtd-rom", sizeof("mtd-rom")) == 0) {
+    memcpy(value, "rv32,no", sizeof("rv32,no"));
+    return true;
+  }
+  return false;
+}
+
 static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
 {
   uint32_t struct_offset;
@@ -228,6 +301,7 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
   uint32_t framebuffer_depth = 0;
   bool framebuffer_described = false;
 #endif
+  uint32_t xip_depth = 0;
 
   if (dtb_size < 40 || read_be32(dtb) != 0xd00dfeedu)
     return false;
@@ -263,6 +337,9 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
                   sizeof("framebuffer@") - 1u) == 0)
         framebuffer_depth = depth;
 #endif
+      if (xip_depth == 0u &&
+          strcmp((const char *)(dtb + cursor), "flash@40000000") == 0)
+        xip_depth = depth;
       cursor = ((const uint8_t *)terminator - dtb + 1u + 3u) & ~3u;
     } else if (token == FDT_PROP) {
       uint32_t length;
@@ -317,6 +394,8 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
           prepare_linux_framebuffer_property(name, dtb + cursor, length))
         framebuffer_described = true;
 #endif
+      if (xip_depth != 0u && depth == xip_depth)
+        prepare_linux_xip_property(name, dtb + cursor, length);
       cursor = (cursor + length + 3u) & ~3u;
     } else if (token == FDT_END_NODE) {
 #if CONFIG_RV32_USB_PORT_HID
@@ -327,6 +406,8 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
       if (depth == framebuffer_depth)
         framebuffer_depth = 0;
 #endif
+      if (depth == xip_depth)
+        xip_depth = 0;
       if (depth != 0u)
         depth--;
       continue;
@@ -357,6 +438,36 @@ static bool prepare_linux_dtb(uint8_t *dtb, size_t dtb_size)
               (unsigned int)DISPLAY_FB_WIDTH, (unsigned int)DISPLAY_FB_HEIGHT);
 #endif
   return rng_seeded;
+}
+
+/* An interrupt is serviced by the CPU that allocated it, and CPU0 belongs
+ * to the emulator: device setup that allocates one runs here on CPU1. */
+static struct {
+  int (*init)(void);
+  int result;
+} host_cpu1_call;
+static StaticSemaphore_t host_cpu1_done_storage;
+
+static void host_cpu1_call_task(void *argument) {
+  host_cpu1_call.result = host_cpu1_call.init();
+  xSemaphoreGive((SemaphoreHandle_t)argument);
+  vTaskDelete(NULL);
+}
+
+int HostRunOnCpu1(int (*init)(void)) {
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+  SemaphoreHandle_t done =
+      xSemaphoreCreateBinaryStatic(&host_cpu1_done_storage);
+
+  host_cpu1_call.init = init;
+  host_cpu1_call.result = -1;
+  if (xTaskCreatePinnedToCore(host_cpu1_call_task, "cpu1_init", 8192, done,
+                              tskIDLE_PRIORITY + 5u, NULL, 1) == pdPASS) {
+    xSemaphoreTake(done, portMAX_DELAY);
+    return host_cpu1_call.result;
+  }
+#endif
+  return init();
 }
 
 int HostInputInit(void) {
@@ -1280,6 +1391,7 @@ int load_images(int ram_size, int *kern_len) {
     remaining -= chunk;
   }
 
+  psram_map_xip_partition();
   if (!prepare_linux_dtb(psram_base + DTB_LOAD_OFFSET, dtb_size)) {
     printf("ERROR: DTB has no valid 64-byte /chosen/rng-seed property\n");
     return -1;

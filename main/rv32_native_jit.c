@@ -12,10 +12,12 @@
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #ifdef ESP_PLATFORM
+#include <stdio.h>
 #include "esp_private/esp_cache_private.h"
 #include "hal/cache_ll.h"
 #include "psram.h"
 #include "esp_cpu.h"
+#include "driver/gptimer.h"
 #endif
 
 #if defined(ESP_PLATFORM) && CONFIG_RV32_NATIVE_JIT_ASYNC_COMPILE
@@ -270,6 +272,7 @@ struct rv32_native_jit_dispatch_table {
 	struct jit_jump_entry *jump_cache;	/* 64: this privilege's */
 	struct jit_link_entry *links;		/* 68 */
 	uint8_t *link_targets;			/* 72 */
+	uint32_t *jump_misses;			/* 76 */
 };
 struct rv32_native_jit_dispatch_table rv32_native_jit_dispatch_table;
 /* Which init self-test group failed, for the firmware's diagnostic. */
@@ -403,6 +406,32 @@ struct jit_two_page_store_stub {
 	uint8_t alignment_mask;
 };
 
+/* A kernel-region load, store, group or persistent-stream guard that tried
+ * the linear map inline.  Its miss branch runs the ordinary page-cache
+ * emitter's code out of line, which then resumes after the inline access. */
+enum jit_linear_kind {
+	JIT_LINEAR_LOAD,
+	JIT_LINEAR_STORE,
+	JIT_LINEAR_LOAD_GROUP,
+	JIT_LINEAR_STORE_GROUP,
+	JIT_LINEAR_PERSISTENT,
+};
+
+struct jit_linear_slow_path {
+	uint32_t *miss;
+	uint32_t *continuation;
+	/* A group's members in the trace; otherwise the one instruction. */
+	const uint32_t *instructions;
+	uint32_t instruction;
+	uint32_t guest_pc;
+	int16_t group_min_offset;
+	int16_t group_max_end;
+	uint8_t group_count;
+	uint8_t group_alignment_mask;
+	uint8_t kind;
+	uint8_t executed_before;
+};
+
 struct jit_builder {
 	uint32_t *start;
 	uint32_t *cursor;
@@ -415,6 +444,7 @@ struct jit_builder {
 	struct jit_loop_read_cache_stub *loop_read_cache_stubs;
 	struct jit_loop_write_cache_stub *loop_write_cache_stubs;
 	struct jit_two_page_store_stub *two_page_store_stubs;
+	struct jit_linear_slow_path *linear_slow_paths;
 	uint8_t bailout_patch_count;
 	uint8_t control_exit_patch_count;
 	uint8_t hard_exit_patch_count;
@@ -423,10 +453,20 @@ struct jit_builder {
 	uint8_t loop_read_cache_stub_count;
 	uint8_t loop_write_cache_stub_count;
 	uint8_t two_page_store_stub_count;
+	uint8_t linear_slow_path_count;
 	bool instruction_counter_active;
 	bool failed;
 	/* Deferred memory stubs may retry through the RAM refill path. */
 	bool refill;
+	/* A kernel region whose loads and stores try the linear map first.  The
+	 * preamble loads the limit and host registers; the negated window start
+	 * is a third register, or RV_X0 to rebuild it from linear_offset at
+	 * each access. */
+	bool linear;
+	uint8_t linear_limit_register;
+	uint8_t linear_host_register;
+	uint8_t linear_offset_register;
+	uint32_t linear_offset;
 };
 
 struct jit_internal_branch_patch {
@@ -484,6 +524,7 @@ struct jit_compile_workspace {
 	struct jit_loop_write_cache_stub
 		loop_write_cache_stubs[JIT_MAX_LOOP_WRITE_CACHES];
 	struct jit_two_page_store_stub two_page_store_stubs[JIT_MAX_MEMORY_SITES];
+	struct jit_linear_slow_path linear_slow_paths[JIT_MAX_MEMORY_SITES];
 	uint32_t trace_return_pcs[JIT_MAX_TRACE_CALL_DEPTH];
 	uint8_t trace_link_registers[JIT_MAX_TRACE_CALL_DEPTH];
 };
@@ -501,8 +542,73 @@ static struct jit_link_entry *jit_links = jit_link_storage;
  * cleared with the last such pointer.  Evicting or moving a region that
  * nothing reached natively then skips the scan of every link. */
 static RV32_HOT_STATE_BSS uint8_t jit_link_targets[JIT_CACHE_SLOTS];
+/* How often the region ran since the arena's replacement hand last passed
+ * it: the C dispatcher counts its entries and a 1 kHz timer on the emulator
+ * core counts samples of the PC inside its code (jit_sample_pc), so native
+ * links and jumps cost nothing.  The hand clears it and spares the region
+ * once (second chance), promotes a region above the bar to the hot tier,
+ * and the directory prefers ways without it. */
+static RV32_HOT_STATE_BSS uint16_t jit_entry_entered[JIT_CACHE_SLOTS];
+/* Regions the hand moves past per install before it evicts regardless. */
+#define JIT_ARENA_SPARES 32u
+/* Hot copies the tier's hand moves past per promotion (each a directory scan). */
+#define JIT_HOT_SPARES 4u
+/* The promotion bar, in entries and samples since the hand last passed: once
+ * a second it doubles when more than JIT_PROMOTE_RATE_HIGH regions were
+ * promoted in that second and halves below JIT_PROMOTE_RATE_LOW, so the
+ * tier's few slots turn over at a steady, cheap rate. */
+#define JIT_PROMOTE_BAR_MIN 16u
+#define JIT_PROMOTE_BAR_MAX 8192u
+#define JIT_PROMOTE_RATE_HIGH 30u
+#define JIT_PROMOTE_RATE_LOW 10u
+static uint32_t jit_promote_bar = 64u;
+static uint32_t jit_promotions_this_second;
+#ifdef ESP_PLATFORM
+static uint32_t jit_promote_bar_tick_at;
+#endif
+/* Owner map of the hot tier's units (slot + 1), for the sampler. */
+static uint16_t jit_hot_unit_owner[JIT_HOT_CODE_ARENA_MAX_BYTES /
+				   JIT_CODE_ALIGNMENT];
 static RV32_HOT_STATE_BSS struct jit_jump_entry
 	jit_jump_cache[JIT_MAX_PRIVILEGE + 1u][JIT_JUMP_CACHE_ENTRIES];
+/* Exit targets the dispatch stub searched the directory for and did not
+ * find: a guest PC, UINT32_MAX when empty.  Most chains end at such a target
+ * (code not compiled yet, never compiled, or a host routine), and every exit
+ * there repeated the page and hash work and the four-way set search before
+ * returning to C; a recorded target returns after one load.  The stub checks
+ * the table once a jump-cache miss has passed the learning budget, so links
+ * are learned as before, and records a target only after a full search.
+ * Like the jump cache, entries hold under the current translations and go
+ * with the links (jit_clear_all_links: translation and executed-page
+ * flushes, fences, jit_flush).  The only way a target gains a ready region
+ * is jit_install_generated_body, which clears its entry, so an entry never
+ * hides one.  One table serves both privileges: a target is only searched
+ * on a page its privilege executes (the exiting region's page, or one the
+ * exec-page cache validated for that privilege), and U and S never execute
+ * the same page, so an entry recorded in one privilege can never stand for
+ * a region of the other; at worst it sends an exit to C, which is always
+ * safe.  Indexed by ((pc >> 8) ^ pc) & 0x7fc as a byte offset, which mixes
+ * the page into the low PC bits in three instructions. */
+#define JIT_JUMP_MISS_ENTRIES 512u
+static RV32_HOT_STATE_BSS uint32_t jit_jump_misses[JIT_JUMP_MISS_ENTRIES];
+_Static_assert(offsetof(struct rv32_native_jit_dispatch_table,
+			jump_misses) == 76u && JIT_JUMP_MISS_ENTRIES == 512u,
+	       "rv32_native_jit_dispatch hard-codes the recorded-miss table");
+
+static inline uint32_t *jit_jump_miss_slot(uint32_t guest_pc)
+{
+	return &jit_jump_misses[(((guest_pc >> 8) ^ guest_pc) >> 2) &
+				(JIT_JUMP_MISS_ENTRIES - 1u)];
+}
+
+/* guest_pc gains a ready region: the table may no longer record it. */
+static void jit_forget_jump_miss(uint32_t guest_pc)
+{
+	uint32_t *miss = jit_jump_miss_slot(guest_pc);
+
+	if (*miss == guest_pc)
+		*miss = UINT32_MAX;
+}
 static struct jit_link_candidate *jit_link_candidates;
 #ifndef ESP_PLATFORM
 static struct jit_link_candidate jit_link_candidate_storage[JIT_CACHE_SLOTS];
@@ -544,6 +650,11 @@ static _Alignas(JIT_CODE_ALIGNMENT) uint32_t
 static RV32_STATE_BSS _Alignas(JIT_CODE_ALIGNMENT) uint32_t jit_staging[JIT_CODE_WORDS];
 static uint16_t jit_loop_code_head;
 static uint16_t jit_regular_code_head;
+/* One ring for every region (JIT_ARENA_SINGLE_RING): second chance keeps
+ * the hot loops and kernel code, so fixed partitions only shrink the space
+ * each class may use. */
+#define JIT_ARENA_SINGLE_RING 1
+static uint16_t jit_code_head;
 /* With JIT_KEEP_KERNEL, kernel regions take the first half of each
  * partition and user regions the second half (the heads above). */
 static uint16_t jit_kernel_loop_code_head;
@@ -593,6 +704,35 @@ static void jit_set_exec_privilege(uint32_t privilege)
 /* S-mode fetches here use the fixed kernel linear map; fences never change it. */
 static uint32_t jit_kernel_linear_base;
 static uint32_t jit_kernel_linear_size;
+
+/*
+ * Kernel linear-map data accesses (rv32_native_jit_set_kernel_linear_data).
+ * The interpreter maps an S-mode address va with va - base < size, paging
+ * on, straight to guest RAM offset phys + (va - base), with no page walk,
+ * permission check or write-page report.  Generated kernel regions do the
+ * same before their page-cache lookup, in four host instructions:
+ *
+ *	add	t1, rs1, (-base - LOW)	register or lui
+ *	bgeu	t1, limit, slow		slow: the unchanged page-cache code
+ *	add	t1, t1, host		host = RAM + phys + LOW
+ *	lw	rd, imm(t1)
+ *
+ * The check is on the base register, so its 12-bit displacement must stay in
+ * the window too: a base offset below JIT_LINEAR_LOW_MARGIN (4 KiB >= 2048)
+ * or within JIT_LINEAR_HIGH_MARGIN (4 KiB >= 2047 + 3) of the end takes the
+ * slow path, and limit = size - LOW - HIGH.  Every fast access, misaligned
+ * or not, then lies inside the window and so inside guest RAM; one check
+ * covers a whole group of displacements off one base.  The slow path also
+ * handles the window's first and last 4 KiB, which on this guest are kernel
+ * head text and the reserved display/DTB area.
+ */
+#define JIT_LINEAR_LOW_MARGIN 4096u
+#define JIT_LINEAR_HIGH_MARGIN 4096u
+static uint32_t jit_kernel_linear_phys;
+static bool jit_kernel_linear_data;
+/* Callee-saved registers a region may give the check (two or three).  The
+ * self-test lowers it to cover the form that rebuilds the window offset. */
+static uint8_t jit_linear_register_budget = 3u;
 
 #if defined(CONFIG_RV32_NATIVE_JIT_KEEP_KERNEL) && \
 	CONFIG_RV32_NATIVE_JIT_KEEP_KERNEL
@@ -653,6 +793,7 @@ static void jit_reset_code_heads(void)
 	jit_regular_code_head = jit_loop_code_units;
 	jit_kernel_loop_code_head = 0u;
 	jit_kernel_regular_code_head = jit_loop_code_units;
+	jit_code_head = 0u;
 	jit_hot_code_head = 0u;
 	memset(jit_hot_code_occupancy, 0, sizeof(jit_hot_code_occupancy));
 }
@@ -693,6 +834,10 @@ _Static_assert(sizeof(struct rv32_native_jit_read_page) == 8u,
 	       "JIT read-page entries are indexed with a three-bit shift");
 _Static_assert(sizeof(struct rv32_native_jit_write_page) == 32u,
 	       "JIT write-page entries are indexed with a five-bit shift");
+_Static_assert(offsetof(struct rv32_native_jit_runtime, dispatch_miss_pc) == 92u,
+	       "rv32_native_jit_dispatch stores dispatch_miss_pc at 92(t6)");
+_Static_assert(offsetof(struct rv32_native_jit_runtime, linear_host) <= 2047u,
+	       "the linear-map preamble loads its words with 12-bit offsets");
 #ifdef ESP_PLATFORM
 _Static_assert(JIT_CACHE_SLOTS * sizeof(struct jit_link_candidate) <=
 	       HOST_JIT_METADATA_SIZE,
@@ -1153,6 +1298,7 @@ static void jit_clear_entry_links(uint32_t slot)
 static void jit_clear_all_links(void)
 {
 	memset(jit_jump_cache, 0xff, sizeof(jit_jump_cache));
+	memset(jit_jump_misses, 0xff, sizeof(jit_jump_misses));
 	memset(jit_link_targets, 0, sizeof(jit_link_targets));
 	for (uint32_t index = 0; index < JIT_CACHE_SLOTS; index++)
 		jit_clear_link(&jit_links[index]);
@@ -1223,6 +1369,7 @@ static void jit_forget_entry_body(uint32_t slot)
 #endif
 	jit_clear_entry_links(slot);
 	jit_forget_hot_code(slot);
+	jit_entry_entered[slot] = 0u;
 }
 
 static void jit_observe_link(uint32_t source_slot, uint32_t next_pc,
@@ -1286,11 +1433,16 @@ static __attribute__((noinline)) bool jit_promote_hot_code(
 	    units > jit_hot_code_arena_units)
 		return false;
 	if (!jit_hot_find_free_range(units, &start)) {
+		uint32_t spared = 0u;
+
 		if (!allow_eviction)
 			return false;
 		start = previous_head;
 		if (start + units > jit_hot_code_arena_units)
 			start = 0u;
+		/* The tier replaces oldest first: it must follow the regions hot
+		 * now, and a protected tier froze (clock6-clock8, 2026-10-20/22). */
+		(void)spared;
 	}
 	wrapped = start < previous_head;
 
@@ -1309,6 +1461,8 @@ static __attribute__((noinline)) bool jit_promote_hot_code(
 	destination = jit_hot_code_arena + start * JIT_CODE_UNIT_WORDS;
 	memcpy(destination, jit_entry_code(slot),
 	       units * JIT_CODE_ALIGNMENT);
+	for (uint32_t unit = start; unit < start + units; unit++)
+		jit_hot_unit_owner[unit] = (uint16_t)(slot + 1u);
 	if (!jit_sync_code(destination, units * JIT_CODE_ALIGNMENT))
 		return false;
 
@@ -1323,6 +1477,7 @@ static __attribute__((noinline)) bool jit_promote_hot_code(
 	if (wrapped)
 		jit_stats.hot_arena_wraps++;
 	jit_stats.hot_promotions++;
+	jit_promotions_this_second++;
 	return true;
 }
 
@@ -1333,6 +1488,8 @@ static inline uint32_t *jit_dispatch_code(
 	uint32_t admit_threshold;
 	uint32_t replace_threshold;
 
+	if (jit_entry_entered[slot] != UINT16_MAX)
+		jit_entry_entered[slot]++;
 	if (__builtin_expect(jit_hot_code_arena == NULL, 0))
 		return jit_entry_code(slot);
 	hot = &jit_hot_entries[slot];
@@ -1371,6 +1528,82 @@ static inline uint32_t *jit_dispatch_code(
  * whose bytes are about to be overwritten is invalidated before publication.
  * Compilation is cold, so a bounded directory scan is preferable to adding
  * allocator state to the hot lookup path. */
+#ifdef ESP_PLATFORM
+/* The emulator core's 1 kHz sampler: a PC inside a region's code, in the
+ * arena or its hot copy, counts as an entry of that region. */
+static bool IRAM_ATTR jit_sample_pc(gptimer_handle_t timer,
+				    const gptimer_alarm_event_data_t *event,
+				    void *context)
+{
+	uint32_t pc;
+	uint32_t offset;
+	uint16_t owner = 0u;
+
+	(void)timer;
+	(void)event;
+	(void)context;
+	__asm__ volatile("csrr %0, mepc" : "=r"(pc));
+	offset = pc - (uint32_t)(uintptr_t)jit_code_arena;
+	if (jit_unit_owner != NULL &&
+	    offset < (uint32_t)jit_code_arena_units * JIT_CODE_ALIGNMENT) {
+		owner = jit_unit_owner[offset / JIT_CODE_ALIGNMENT];
+	} else {
+		offset = pc - (uint32_t)(uintptr_t)jit_hot_code_arena;
+		if (jit_hot_code_arena != NULL &&
+		    offset < (uint32_t)jit_hot_code_arena_units * JIT_CODE_ALIGNMENT)
+			owner = jit_hot_unit_owner[offset / JIT_CODE_ALIGNMENT];
+	}
+	if (owner != 0u && owner <= JIT_CACHE_SLOTS &&
+	    jit_entry_entered[owner - 1u] != UINT16_MAX)
+		jit_entry_entered[owner - 1u]++;
+	return false;
+}
+
+static void jit_start_sampler(void)
+{
+	gptimer_handle_t timer = NULL;
+	const gptimer_config_t config = {
+		.clk_src = GPTIMER_CLK_SRC_DEFAULT,
+		.direction = GPTIMER_COUNT_UP,
+		.resolution_hz = 1000000u,
+	};
+	const gptimer_event_callbacks_t callbacks = {
+		.on_alarm = jit_sample_pc,
+	};
+	const gptimer_alarm_config_t alarm = {
+		.alarm_count = 1000u,
+		.reload_count = 0u,
+		.flags.auto_reload_on_alarm = true,
+	};
+
+	if (gptimer_new_timer(&config, &timer) != ESP_OK ||
+	    gptimer_register_event_callbacks(timer, &callbacks, NULL) != ESP_OK ||
+	    gptimer_enable(timer) != ESP_OK ||
+	    gptimer_set_alarm_action(timer, &alarm) != ESP_OK ||
+	    gptimer_start(timer) != ESP_OK)
+		printf("WARNING: JIT sampler timer unavailable\n");
+}
+#endif
+
+/* Once a second of host time, last second's promotion rate sets the bar. */
+static void jit_promote_bar_tick(void)
+{
+#ifdef ESP_PLATFORM
+	uint32_t now = esp_cpu_get_cycle_count();
+
+	if ((int32_t)(now - jit_promote_bar_tick_at) < 0)
+		return;
+	jit_promote_bar_tick_at = now + 360u * 1000u * 1000u;
+	if (jit_promotions_this_second > JIT_PROMOTE_RATE_HIGH &&
+	    jit_promote_bar < JIT_PROMOTE_BAR_MAX)
+		jit_promote_bar *= 2u;
+	else if (jit_promotions_this_second < JIT_PROMOTE_RATE_LOW &&
+		 jit_promote_bar > JIT_PROMOTE_BAR_MIN)
+		jit_promote_bar /= 2u;
+	jit_promotions_this_second = 0u;
+#endif
+}
+
 /* Drops a resident region whose arena space new code is taking. */
 static void jit_evict_resident(uint32_t index)
 {
@@ -1419,6 +1652,12 @@ static bool jit_install_code(uint32_t slot, const uint32_t *code,
 #else
 	(void)kernel;
 #endif
+#if JIT_ARENA_SINGLE_RING
+	partition_start = 0u;
+	partition_end = jit_code_arena_units;
+	head = &jit_code_head;
+#endif
+	jit_promote_bar_tick();
 	start = *head;
 
 	if (units == 0u || units > partition_end - partition_start)
@@ -1429,6 +1668,53 @@ static bool jit_install_code(uint32_t slot, const uint32_t *code,
 	}
 
 	if (jit_unit_owner != NULL) {
+		uint32_t spared = 0u;
+		bool moved = true;
+
+		/* Second chance: a resident region entered since the hand last
+		 * passed keeps its place once and the hand moves past it; after
+		 * JIT_ARENA_SPARES of them the next ones go regardless. */
+		while (moved && spared < JIT_ARENA_SPARES) {
+			uint32_t first = start - partition_start >=
+				JIT_MAX_REGION_UNITS - 1u ?
+				start - (JIT_MAX_REGION_UNITS - 1u) : partition_start;
+
+			moved = false;
+			for (uint32_t unit = first; unit < start + units; unit++) {
+				uint32_t owner = jit_unit_owner[unit];
+				const struct jit_cache_entry *resident;
+
+				if (owner == 0u)
+					continue;
+				resident = &jit_entries[owner - 1u];
+				if (owner - 1u == slot ||
+				    resident->state != JIT_ENTRY_READY ||
+				    resident->code_unit != unit ||
+				    jit_entry_entered[owner - 1u] == 0u ||
+				    !jit_code_ranges_overlap(start, units,
+							     resident->code_unit,
+							     resident->code_units))
+					continue;
+				/* A region this hot keeps running from PSRAM unless
+				 * the hand promotes it: link entries never reach the
+				 * dispatch counts of jit_dispatch_code. */
+				if (jit_entry_entered[owner - 1u] >= jit_promote_bar &&
+				    jit_hot_entries[owner - 1u].location == 0u &&
+				    jit_promote_hot_code(owner - 1u, resident, true))
+					jit_stats.hot_hand_promotions++;
+				jit_entry_entered[owner - 1u] = 0u;
+				jit_stats.arena_spares++;
+				spared++;
+				start = unit + resident->code_units;
+				if (start + units > partition_end) {
+					start = partition_start;
+					jit_stats.arena_wraps++;
+				}
+				moved = true;
+				break;
+			}
+		}
+		{
 		uint32_t first = start - partition_start >= JIT_MAX_REGION_UNITS - 1u ?
 			start - (JIT_MAX_REGION_UNITS - 1u) : partition_start;
 
@@ -1447,6 +1733,7 @@ static bool jit_install_code(uint32_t slot, const uint32_t *code,
 						     resident->code_units))
 				continue;
 			jit_evict_resident(owner - 1u);
+		}
 		}
 	} else {
 		for (uint32_t index = 0; index < JIT_CACHE_SLOTS; index++) {
@@ -1477,8 +1764,12 @@ static bool jit_install_code(uint32_t slot, const uint32_t *code,
 	entry->code_unit = (uint16_t)start;
 	entry->code_units = (uint8_t)units;
 	entry->memory_site_count = (uint8_t)site_count;
-	if (jit_unit_owner != NULL)
-		jit_unit_owner[start] = (uint16_t)(slot + 1u);
+	jit_entry_entered[slot] = 0u;
+	if (jit_unit_owner != NULL) {
+		/* Every unit, so the sampler maps any PC inside the region. */
+		for (uint32_t unit = start; unit < start + units; unit++)
+			jit_unit_owner[unit] = (uint16_t)(slot + 1u);
+	}
 	return true;
 }
 
@@ -1914,6 +2205,11 @@ static struct jit_persistent_memory_group jit_find_persistent_memory_group(
 					candidate.memory.count++;
 					candidate.total_bytes += width;
 					candidate.last = i;
+				} else if (i == first) {
+					/* The guard is emitted at the first member;
+					 * without one at first, later members would
+					 * use a stale a4. */
+					break;
 				}
 			}
 			if (jit_instruction_writes_register(
@@ -3717,20 +4013,267 @@ static bool jit_emit_persistent_memory_guard(
 	return !builder->failed;
 }
 
+/* The kernel linear-map check (see JIT_LINEAR_LOW_MARGIN): t1 = source -
+ * (window start + margin), then destination = host address of the guest base
+ * value in source.  The returned miss word becomes bgeu t1, limit, slow path;
+ * nothing guest-visible has changed when it is taken. */
+static uint32_t *jit_emit_linear_check(struct jit_builder *builder,
+				       uint32_t source, uint32_t destination)
+{
+	uint32_t offset = builder->linear_offset_register;
+	uint32_t *miss;
+
+	if (source == RV_T1) {
+		builder->failed = true;
+		return NULL;
+	}
+	if (offset == RV_X0) {
+		jit_emit_constant(builder, RV_T1, builder->linear_offset);
+		offset = RV_T1;
+	}
+	jit_emit(builder, rv_r(0x33u, RV_T1, 0u, source, offset, 0u));
+	miss = builder->cursor;
+	jit_emit(builder, 0u); /* bgeu t1, limit, slow path */
+	jit_emit(builder, rv_r(0x33u, destination, 0u, RV_T1,
+			       builder->linear_host_register, 0u));
+	return builder->failed ? NULL : miss;
+}
+
+/* Call after the inline access: the slow path resumes at the cursor. */
+static bool jit_defer_linear_slow_path(struct jit_builder *builder,
+	enum jit_linear_kind kind, uint32_t *miss,
+	const uint32_t *instructions, uint32_t instruction, uint32_t guest_pc,
+	uint32_t executed_before, const struct jit_memory_group *group)
+{
+	struct jit_linear_slow_path *path;
+
+	/* Each slow path takes one memory site; more sites than that split the
+	 * region, as an overfull stub table does. */
+	if (miss == NULL || builder->failed ||
+	    builder->linear_slow_path_count >= JIT_MAX_MEMORY_SITES) {
+		builder->failed = true;
+		return false;
+	}
+	path = &builder->linear_slow_paths[builder->linear_slow_path_count++];
+	*path = (struct jit_linear_slow_path) {
+		.miss = miss,
+		.continuation = builder->cursor,
+		.instructions = instructions,
+		.instruction = instruction,
+		.guest_pc = guest_pc,
+		.kind = (uint8_t)kind,
+		.executed_before = (uint8_t)executed_before,
+	};
+	if (group != NULL) {
+		path->group_min_offset = (int16_t)group->min_offset;
+		path->group_max_end = (int16_t)group->max_end;
+		path->group_count = (uint8_t)group->count;
+		path->group_alignment_mask = (uint8_t)group->alignment_mask;
+	}
+	return true;
+}
+
+static bool jit_emit_linear_load(struct jit_builder *builder,
+				 const struct jit_register_map *map,
+				 uint32_t instruction, uint32_t guest_pc,
+				 uint32_t executed_before)
+{
+	uint32_t rd = (instruction >> 7) & 0x1fu;
+	uint32_t source = jit_guest_source(builder, map,
+					   (instruction >> 15) & 0x1fu, RV_T0);
+	uint32_t destination = jit_guest_destination(map, rd, RV_T2);
+	uint32_t *miss = jit_emit_linear_check(builder, source, RV_T1);
+
+	jit_emit(builder, rv_i(0x03u, destination, (instruction >> 12) & 7u,
+			       RV_T1, jit_i_immediate(instruction)));
+	jit_commit_unmapped_destination(builder, map, rd, destination);
+	return jit_defer_linear_slow_path(builder, JIT_LINEAR_LOAD, miss,
+					  NULL, instruction, guest_pc,
+					  executed_before, NULL);
+}
+
+/* A linear-map store is ordinary RAM: it needs neither the framebuffer
+ * dirty report (the aperture is device memory, never in the window) nor
+ * rv32_native_jit_note_write_page.  The interpreter's own linear stores skip
+ * that report too; Linux rewrites kernel text only through the text-poke
+ * fixmap, outside the window, whose page-cache store still reports it. */
+static bool jit_emit_linear_store(struct jit_builder *builder,
+				  const struct jit_register_map *map,
+				  uint32_t instruction, uint32_t guest_pc,
+				  uint32_t executed_before)
+{
+	uint32_t source = jit_guest_source(builder, map,
+					   (instruction >> 15) & 0x1fu, RV_T0);
+	uint32_t *miss = jit_emit_linear_check(builder, source, RV_T1);
+	/* t0 is free once the check passed; the slow path reloads both. */
+	uint32_t value = jit_guest_source(builder, map,
+					  (instruction >> 20) & 0x1fu, RV_T0);
+
+	jit_emit(builder, rv_s(0x23u, (instruction >> 12) & 7u, RV_T1, value,
+			       jit_s_immediate(instruction)));
+	return jit_defer_linear_slow_path(builder, JIT_LINEAR_STORE, miss,
+					  NULL, instruction, guest_pc,
+					  executed_before, NULL);
+}
+
+/* One check covers the whole group: every member's displacement is a
+ * 12-bit immediate.  t0 holds the host base, as after the page-cache guard. */
+static bool jit_emit_linear_load_group(
+	struct jit_builder *builder, const struct jit_register_map *map,
+	const uint32_t *instructions, uint32_t guest_pc,
+	uint32_t executed_before, const struct jit_memory_group *group)
+{
+	uint32_t source = jit_guest_source(builder, map,
+					   (instructions[0] >> 15) & 0x1fu, RV_T0);
+	uint32_t *miss = jit_emit_linear_check(builder, source, RV_T0);
+
+	for (uint32_t i = 0; i < group->count; i++) {
+		uint32_t instruction = instructions[i];
+		uint32_t rd = (instruction >> 7) & 0x1fu;
+		uint32_t destination = jit_guest_destination(map, rd, RV_T2);
+
+		jit_emit(builder, rv_i(0x03u, destination,
+				       (instruction >> 12) & 7u, RV_T0,
+				       jit_i_immediate(instruction)));
+		jit_commit_unmapped_destination(builder, map, rd, destination);
+	}
+	return jit_defer_linear_slow_path(builder, JIT_LINEAR_LOAD_GROUP, miss,
+					  instructions, instructions[0],
+					  guest_pc, executed_before, group);
+}
+
+static bool jit_emit_linear_store_group(
+	struct jit_builder *builder, const struct jit_register_map *map,
+	const uint32_t *instructions, uint32_t guest_pc,
+	uint32_t executed_before, const struct jit_memory_group *group)
+{
+	uint32_t source = jit_guest_source(builder, map,
+					   (instructions[0] >> 15) & 0x1fu, RV_T0);
+	uint32_t *miss = jit_emit_linear_check(builder, source, RV_T0);
+
+	for (uint32_t i = 0; i < group->count; i++) {
+		uint32_t instruction = instructions[i];
+		uint32_t value = jit_guest_source(builder, map,
+						  (instruction >> 20) & 0x1fu,
+						  RV_T2);
+
+		jit_emit(builder, rv_s(0x23u, (instruction >> 12) & 7u, RV_T0,
+				       value, jit_s_immediate(instruction)));
+	}
+	return jit_defer_linear_slow_path(builder, JIT_LINEAR_STORE_GROUP, miss,
+					  instructions, instructions[0],
+					  guest_pc, executed_before, group);
+}
+
+/* a4 becomes the stream's host base.  The slow path is the page-cache guard
+ * and, for stores, its dirty report, which the page-cache form makes after
+ * the first store: nothing reads the report before the region returns, and
+ * a passed guard means every selected store can complete. */
+static bool jit_emit_linear_persistent_guard(
+	struct jit_builder *builder, const struct jit_register_map *map,
+	const struct jit_persistent_memory_group *group,
+	uint32_t instruction, uint32_t guest_pc, uint32_t executed_before)
+{
+	uint32_t source = jit_guest_source(builder, map, group->base, RV_T0);
+	uint32_t *miss = jit_emit_linear_check(builder, source, RV_A4);
+
+	return jit_defer_linear_slow_path(builder, JIT_LINEAR_PERSISTENT, miss,
+					  NULL, instruction, guest_pc,
+					  executed_before, NULL);
+}
+
+/* Out of line, after the region's exits: each linear miss runs the code the
+ * page-cache emitter would have placed inline, from the guest registers the
+ * check left untouched, then jumps back.  The emitters allocate their memory
+ * sites and stubs here, before the stub tables are emitted. */
+static bool jit_emit_linear_slow_paths(struct jit_builder *builder,
+	const struct jit_register_map *map, struct jit_cache_entry *entry,
+	struct rv32_native_jit_memory_site *memory_sites,
+	const struct jit_persistent_memory_group *persistent)
+{
+	for (uint32_t index = 0; index < builder->linear_slow_path_count;
+	     index++) {
+		const struct jit_linear_slow_path *path =
+			&builder->linear_slow_paths[index];
+		const struct jit_memory_group group = {
+			.count = path->group_count,
+			.min_offset = path->group_min_offset,
+			.max_end = path->group_max_end,
+			.alignment_mask = path->group_alignment_mask,
+		};
+		uint32_t *resume;
+		bool okay;
+
+		if (entry->memory_site_count >= JIT_MAX_MEMORY_SITES) {
+			builder->failed = true;
+			return false;
+		}
+		if (!jit_patch_branch(path->miss, builder->cursor, 7u, RV_T1,
+				      builder->linear_limit_register))
+			return false;
+		switch (path->kind) {
+		case JIT_LINEAR_LOAD:
+			okay = jit_emit_load(builder, map, entry, memory_sites,
+					     path->instruction, path->guest_pc,
+					     path->executed_before, NULL);
+			break;
+		case JIT_LINEAR_STORE:
+			okay = jit_emit_store(builder, map, entry, memory_sites,
+					      path->instruction, path->guest_pc,
+					      path->executed_before, NULL);
+			break;
+		case JIT_LINEAR_LOAD_GROUP:
+			okay = jit_emit_load_group(builder, map, entry,
+				memory_sites, path->instructions, path->guest_pc,
+				path->executed_before, &group);
+			break;
+		case JIT_LINEAR_STORE_GROUP:
+			okay = jit_emit_store_group(builder, map, entry,
+				memory_sites, path->instructions, path->guest_pc,
+				path->executed_before, &group);
+			break;
+		case JIT_LINEAR_PERSISTENT:
+			okay = jit_emit_persistent_memory_guard(builder, map,
+				entry, memory_sites, persistent, path->instruction,
+				path->guest_pc, path->executed_before) &&
+				(!persistent->store ||
+				 jit_emit_linear_dirty_page(builder,
+					persistent->memory.count,
+					persistent->total_bytes));
+			break;
+		default:
+			okay = false;
+			break;
+		}
+		if (!okay)
+			return false;
+		resume = builder->cursor;
+		jit_emit(builder, 0u); /* j back after the inline access */
+		if (builder->failed ||
+		    !jit_patch_unconditional(resume, path->continuation))
+			return false;
+	}
+	return !builder->failed;
+}
+
 static bool jit_emit_persistent_memory_access(
 	struct jit_builder *builder, const struct jit_register_map *map,
 	struct jit_cache_entry *entry,
 	struct rv32_native_jit_memory_site *memory_sites,
 	const struct jit_persistent_memory_group *group, uint32_t index,
 	uint32_t instruction, uint32_t guest_pc, uint32_t executed_before,
-	bool guard_hoisted)
+	bool guard_hoisted, bool linear)
 {
 	uint32_t funct3 = (instruction >> 12) & 7u;
 
 	if (index == group->first && !guard_hoisted &&
-	    !jit_emit_persistent_memory_guard(
+	    !(linear ?
+	      jit_emit_linear_persistent_guard(builder, map, group,
+					      instruction, guest_pc,
+					      executed_before) :
+	      jit_emit_persistent_memory_guard(
 		    builder, map, entry, memory_sites, group, instruction,
-		    guest_pc, executed_before))
+		    guest_pc, executed_before)))
 		return false;
 
 	if (!group->store) {
@@ -3748,8 +4291,9 @@ static bool jit_emit_persistent_memory_access(
 				       jit_s_immediate(instruction)));
 		/* The aggregate guard proves every selected store touches this one
 		 * translated page, so one report covers them all.  A hoisted guard
-		 * reports in the preamble, as t1 is clobbered inside the loop. */
-		if (index == group->first && !guard_hoisted &&
+		 * reports in the preamble, as t1 is clobbered inside the loop, and a
+		 * linear-map guard in its slow path. */
+		if (index == group->first && !guard_hoisted && !linear &&
 		    !jit_emit_linear_dirty_page(builder, group->memory.count,
 						group->total_bytes))
 			return false;
@@ -4062,13 +4606,22 @@ static bool jit_emit_jalr_trace(struct jit_builder *builder,
 	return true;
 }
 
+/* Unmasked directory and warm-table hash.  The directory set is the low bits
+ * of the warm index, so a probe computes it once for both tables. */
+static inline uint32_t jit_hash_key(uint32_t physical_offset,
+				    uint32_t guest_pc)
+{
+	return (physical_offset >> 2) ^ (physical_offset >> 9) ^
+		(guest_pc >> 12) ^ (guest_pc >> 20);
+}
+
+_Static_assert(JIT_WARM_SLOTS >= JIT_CACHE_SETS,
+	       "the directory set must be the low bits of the warm index");
+
 static uint32_t jit_hash(uint32_t physical_offset, uint32_t guest_pc,
 			 uint32_t mask)
 {
-	uint32_t key = (physical_offset >> 2) ^ (physical_offset >> 9) ^
-		(guest_pc >> 12) ^ (guest_pc >> 20);
-
-	return key & mask;
+	return jit_hash_key(physical_offset, guest_pc) & mask;
 }
 
 static uint32_t jit_exec_page_index(uint32_t guest_pc)
@@ -4127,19 +4680,26 @@ static void jit_cache_exec_page(uint32_t physical_offset, uint32_t guest_pc)
 	page->virtual_page = tag;
 }
 
+/* Whether the cached execute mapping of guest_pc's page is already this one. */
+static inline bool jit_exec_page_current(uint32_t physical_offset,
+					 uint32_t guest_pc)
+{
+	const struct jit_exec_page *page =
+		&jit_exec_pages[jit_exec_page_index(guest_pc)];
+
+	return page->virtual_page ==
+		((guest_pc >> 12) | jit_exec_privilege_tag) &&
+	       page->physical_page_offset ==
+		physical_offset - (guest_pc & 0xfffu);
+}
+
 /* jit_cache_exec_page, with the common already-current mapping checked
  * inline. */
 static inline void jit_note_exec_page(uint32_t physical_offset,
 				      uint32_t guest_pc)
 {
-	const struct jit_exec_page *page =
-		&jit_exec_pages[jit_exec_page_index(guest_pc)];
-
-	if (page->virtual_page == ((guest_pc >> 12) | jit_exec_privilege_tag) &&
-	    page->physical_page_offset ==
-		    physical_offset - (guest_pc & 0xfffu))
-		return;
-	jit_cache_exec_page(physical_offset, guest_pc);
+	if (!jit_exec_page_current(physical_offset, guest_pc))
+		jit_cache_exec_page(physical_offset, guest_pc);
 }
 
 static bool jit_resolve_exec_offset(uint32_t guest_pc,
@@ -4184,6 +4744,13 @@ static uint32_t jit_find_collected_pc(const uint32_t *guest_pcs,
 	return UINT32_MAX;
 }
 
+#if CONFIG_RV32_GUEST_HLE
+static bool jit_hle_callee(uint32_t guest_pc, uint32_t physical_offset,
+			   uint32_t instruction, const uint8_t *guest_ram);
+#else
+#define jit_hle_callee(guest_pc, physical_offset, instruction, guest_ram) false
+#endif
+
 static bool jit_collect_region(const uint8_t *guest_ram,
 			      uint32_t physical_offset,
 			      uint32_t guest_pc,
@@ -4202,6 +4769,7 @@ static bool jit_collect_region(const uint8_t *guest_ram,
 	uint32_t start_guest_page = guest_pc & ~0xfffu;
 	uint32_t call_depth = 0u;
 	bool page_edge = false;
+	bool following_call = false;
 	uint32_t *return_pcs = jit_compile_workspace.trace_return_pcs;
 	uint8_t *link_registers =
 		jit_compile_workspace.trace_link_registers;
@@ -4225,6 +4793,17 @@ static bool jit_collect_region(const uint8_t *guest_ram,
 		memcpy(&instruction,
 		       guest_ram + cursor_offset,
 		       sizeof(instruction));
+		/* A jump into a host routine ends the trace at the jump, so the
+		 * region's exit lands on the routine's entry and the host runs it
+		 * instead of the guest's own code inlined here.  The callee is
+		 * identified here as well: one reached only from native code is never
+		 * probed. */
+		if (following_call) {
+			following_call = false;
+			if (jit_hle_callee(cursor_pc, cursor_offset, instruction,
+					   guest_ram))
+				break;
+		}
 		kind = jit_instruction_kind(instruction);
 		if (kind == JIT_INSN_UNSUPPORTED) {
 #if CONFIG_RV32_HOST_PERF_STATS
@@ -4256,6 +4835,7 @@ static bool jit_collect_region(const uint8_t *guest_ram,
 					link_registers[call_depth] = (uint8_t)rd;
 					call_depth++;
 				}
+				following_call = true;
 				cursor_pc = target;
 				continue;
 			}
@@ -4357,6 +4937,8 @@ enum jit_slot_patch_kind {
 	JIT_SLOT_PATCH_LINK_LOWER,	/* lw rd, %lo(&jit_links[slot])+field(t0) */
 	JIT_SLOT_PATCH_PROFILE_UPPER,	/* lui t0, %hi(profile counter) */
 	JIT_SLOT_PATCH_PROFILE_LOWER,	/* addi t0, t0, %lo(profile counter) */
+	JIT_SLOT_PATCH_ENTERED_UPPER,	/* lui t0, %hi(&jit_entry_entered[slot]) */
+	JIT_SLOT_PATCH_ENTERED_STORE,	/* sb t2, %lo(&jit_entry_entered[slot])(t0) */
 };
 
 struct jit_slot_patch {
@@ -4365,7 +4947,7 @@ struct jit_slot_patch {
 	uint8_t field;
 };
 
-#define JIT_MAX_SLOT_PATCHES 8u
+#define JIT_MAX_SLOT_PATCHES 10u
 /* jit_unit_owner holds slot + 1 in 16 bits. */
 _Static_assert(JIT_CACHE_SLOTS <= 65535u,
 	       "a slot number must fit the arena owner map");
@@ -4423,6 +5005,8 @@ static void jit_patch_slot_words(struct jit_codegen *gen, uint32_t slot)
 {
 	uint32_t link = (uint32_t)(uintptr_t)&jit_links[slot];
 	int32_t link_low = (int32_t)(link << 20) >> 20;
+	uint32_t entered = (uint32_t)(uintptr_t)&jit_entry_entered[slot];
+	int32_t entered_low = (int32_t)(entered << 20) >> 20;
 #if CONFIG_RV32_GUEST_PROFILE
 	uint32_t counter = (uint32_t)(uintptr_t)&rv32_profile_region_entries[slot];
 	int32_t counter_low = (int32_t)(counter << 20) >> 20;
@@ -4450,6 +5034,16 @@ static void jit_patch_slot_words(struct jit_codegen *gen, uint32_t slot)
 			*word = (*word & 0x000fffffu) |
 				((uint32_t)(link_low + (int32_t)patch->field) << 20);
 			break;
+		case JIT_SLOT_PATCH_ENTERED_UPPER:
+			*word = (*word & 0x00000fffu) |
+				((entered - (uint32_t)entered_low) & 0xfffff000u);
+			break;
+		case JIT_SLOT_PATCH_ENTERED_STORE:
+			/* S-type immediate: bits 11:5 above rs2, bits 4:0 above the opcode. */
+			*word = (*word & 0x01fff07fu) |
+				(((uint32_t)entered_low & 0xfe0u) << 20) |
+				(((uint32_t)entered_low & 0x1fu) << 7);
+			break;
 #if CONFIG_RV32_GUEST_PROFILE
 		case JIT_SLOT_PATCH_PROFILE_UPPER:
 			*word = (*word & 0x00000fffu) |
@@ -4464,6 +5058,87 @@ static void jit_patch_slot_words(struct jit_codegen *gen, uint32_t slot)
 			break;
 		}
 	}
+}
+
+/* A region whose head is a kernel linear-map PC runs in S-mode: the same
+ * code entered in U-mode, or with paging off, finds a zero limit in its bank
+ * and takes every slow path.  Loop-cached accesses keep their loop-cache
+ * translation, which serves user memory as well.  The limit, host base and
+ * window offset live in callee-saved registers this region does not
+ * otherwise use (rv32_native_jit_enter saves them all); without two of them
+ * the region keeps the page cache alone. */
+/* Whether an access off guest register base should try the linear map
+ * first.  Entry values are a hint only: a base the region never writes that
+ * held an address outside the window (a user pointer for get_user, a
+ * vmalloc or device mapping, or x0) keeps the inline page-cache path, as it
+ * will likely miss again.  Either choice is correct for any value. */
+static bool jit_linear_expected(const struct jit_group_hint *hint,
+				uint32_t base)
+{
+	if (base == 0u)
+		return false;
+	if (hint->entry_values == NULL ||
+	    (hint->invariant_registers & (UINT32_C(1) << base)) == 0u)
+		return true;
+	return hint->entry_values[base] - jit_kernel_linear_base -
+		JIT_LINEAR_LOW_MARGIN < jit_kernel_linear_size -
+		JIT_LINEAR_LOW_MARGIN - JIT_LINEAR_HIGH_MARGIN;
+}
+
+static void jit_choose_linear_registers(struct jit_builder *builder,
+	const struct jit_register_map *map, const uint32_t *instructions,
+	const enum jit_instruction_kind *kinds, uint32_t count,
+	uint32_t guest_pc, const struct jit_group_hint *hint,
+	const struct jit_loop_read_cache *read_caches,
+	uint32_t read_cache_count, const struct jit_loop_write_cache *write_cache)
+{
+	static const uint8_t candidates[] = {
+		RV_S0, RV_S1, RV_S9, RV_S2 + 6u, RV_S2 + 5u, RV_S2 + 4u,
+		RV_S2 + 3u, RV_S2 + 2u, RV_S2 + 1u, RV_S2,
+	};
+	uint32_t used = (UINT32_C(1) << JIT_CHAIN_EXECUTED_REGISTER) |
+		(UINT32_C(1) << JIT_CHAIN_LIMIT_REGISTER);
+	uint8_t found[3];
+	uint32_t found_count = 0u;
+	bool accesses = false;
+
+	builder->linear = false;
+	if (!jit_kernel_linear_data || jit_linear_register_budget < 2u ||
+	    guest_pc - jit_kernel_linear_base >= jit_kernel_linear_size)
+		return;
+	for (uint32_t i = 0; i < count && !accesses; i++) {
+		accesses = ((kinds[i] == JIT_INSN_LOAD &&
+			     jit_loop_read_cache_for(read_caches,
+						     read_cache_count, i) == NULL) ||
+			    (kinds[i] == JIT_INSN_STORE &&
+			     jit_loop_write_cache_for(write_cache, i) == NULL)) &&
+			jit_linear_expected(hint, (instructions[i] >> 15) & 0x1fu);
+	}
+	if (!accesses)
+		return;
+	for (uint32_t i = 0; i < map->count; i++)
+		used |= UINT32_C(1) << map->host_register[i];
+	for (uint32_t i = 0; i < read_cache_count; i++) {
+		if (!read_caches[i].valid)
+			continue;
+		used |= (UINT32_C(1) << read_caches[i].tag_register) |
+			(UINT32_C(1) << read_caches[i].bias_register);
+	}
+	if (write_cache->valid)
+		used |= UINT32_C(1) << JIT_LOOP_WRITE_TAG_REGISTER;
+	for (uint32_t i = 0; i < sizeof(candidates) &&
+	     found_count < jit_linear_register_budget && found_count < 3u; i++) {
+		if ((used & (UINT32_C(1) << candidates[i])) == 0u)
+			found[found_count++] = candidates[i];
+	}
+	if (found_count < 2u)
+		return;
+	builder->linear = true;
+	builder->linear_limit_register = found[0];
+	builder->linear_host_register = found[1];
+	builder->linear_offset_register = found_count > 2u ? found[2] : RV_X0;
+	builder->linear_offset =
+		0u - jit_kernel_linear_base - JIT_LINEAR_LOW_MARGIN;
 }
 
 /* jit_collect_region's verdict for the first count instructions: a smaller
@@ -4509,6 +5184,7 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 		.loop_read_cache_stubs = workspace->loop_read_cache_stubs,
 		.loop_write_cache_stubs = workspace->loop_write_cache_stubs,
 		.two_page_store_stubs = workspace->two_page_store_stubs,
+		.linear_slow_paths = workspace->linear_slow_paths,
 		.refill = gen->refill,
 	};
 	uint32_t count;
@@ -4528,6 +5204,7 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 	bool chain_registers_clobbered = false;
 	bool dynamic_counter_active = false;
 	bool spans_pages = false;
+	bool linear_persistent = false;
 	enum jit_reject_reason rejection = JIT_REJECT_COLLECT;
 
 	entry->memory_site_count = 0;
@@ -4661,6 +5338,11 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 	}
 	jit_build_register_map(&map, instructions, kinds, count,
 			       repeated, dynamic_counter_active);
+	jit_choose_linear_registers(&builder, &map, instructions, kinds, count,
+				    guest_pc, &group_hint, loop_read_caches,
+				    loop_read_cache_count, &loop_write_cache);
+	linear_persistent = builder.linear && persistent_memory.valid &&
+		jit_linear_expected(&group_hint, persistent_memory.base);
 	memset(gen->code, 0, JIT_CODE_BYTES);
 
 	/* A normal wrapper entry supplies runtime in a0 and has had its budget
@@ -4751,6 +5433,22 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 		jit_emit(&builder, rv_i(0x13u,
 				       JIT_LOOP_WRITE_TAG_REGISTER,
 				       0u, RV_X0, -1));
+	/* Every entry reloads the bank's window: a linked predecessor may have
+	 * used these registers for its own guest values. */
+	if (builder.linear) {
+		jit_emit_load_host(&builder, builder.linear_limit_register,
+				   JIT_RUNTIME_REGISTER,
+				   offsetof(struct rv32_native_jit_runtime,
+					    linear_limit));
+		jit_emit_load_host(&builder, builder.linear_host_register,
+				   JIT_RUNTIME_REGISTER,
+				   offsetof(struct rv32_native_jit_runtime,
+					    linear_host));
+		if (builder.linear_offset_register != RV_X0)
+			jit_emit_constant(&builder,
+					  builder.linear_offset_register,
+					  builder.linear_offset);
+	}
 #if RV32_NATIVE_JIT_RUNTIME_COUNTERS
 	/* Count every generated entry, including targets reached through a native
 	 * tail link that the C dispatcher never sees. */
@@ -4770,15 +5468,22 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 	if (dynamic_counter_active)
 		jit_emit(&builder, rv_i(0x13u, JIT_EXECUTED_REGISTER,
 				       0u, RV_X0, 0));
-	if (hoist_persistent_memory &&
-	    !jit_emit_persistent_memory_guard(
-		    &builder, &map, entry, memory_sites, &persistent_memory,
-		    instructions[0], guest_pc, 0u))
-		goto rejected;
-	if (hoist_persistent_memory && persistent_memory.store &&
-	    !jit_emit_linear_dirty_page(&builder, persistent_memory.memory.count,
-					persistent_memory.total_bytes))
-		goto rejected;
+	if (hoist_persistent_memory && linear_persistent) {
+		if (!jit_emit_linear_persistent_guard(
+			    &builder, &map, &persistent_memory, instructions[0],
+			    guest_pc, 0u))
+			goto rejected;
+	} else if (hoist_persistent_memory) {
+		if (!jit_emit_persistent_memory_guard(
+			    &builder, &map, entry, memory_sites,
+			    &persistent_memory, instructions[0], guest_pc, 0u))
+			goto rejected;
+		if (persistent_memory.store &&
+		    !jit_emit_linear_dirty_page(&builder,
+						persistent_memory.memory.count,
+						persistent_memory.total_bytes))
+			goto rejected;
+	}
 	loop_start = builder.cursor;
 #if CONFIG_RV32_GUEST_PROFILE
 	/* Count region entries and loop iterations.  t0/t1 carry nothing across
@@ -4816,7 +5521,7 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 				    &builder, &map, entry, memory_sites,
 				    &persistent_memory, i, instructions[i],
 				    instruction_pc, executed_before,
-				    hoist_persistent_memory))
+				    hoist_persistent_memory, linear_persistent))
 				goto rejected;
 			continue;
 		}
@@ -4839,11 +5544,25 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 			    i <= persistent_memory.last))
 				group.count = 1u;
 			if (group.count > 1u) {
-				okay = jit_emit_load_group(
-					&builder, &map, entry, memory_sites,
-					&instructions[i], instruction_pc,
-					executed_before, &group);
+				okay = builder.linear &&
+					jit_linear_expected(&group_hint,
+						(instructions[i] >> 15) & 0x1fu) ?
+					jit_emit_linear_load_group(
+						&builder, &map, &instructions[i],
+						instruction_pc, executed_before,
+						&group) :
+					jit_emit_load_group(
+						&builder, &map, entry, memory_sites,
+						&instructions[i], instruction_pc,
+						executed_before, &group);
 				i += group.count - 1u;
+			} else if (builder.linear && loop_cache == NULL &&
+				   jit_linear_expected(&group_hint,
+					(instructions[i] >> 15) & 0x1fu)) {
+				okay = jit_emit_linear_load(&builder, &map,
+							    instructions[i],
+							    instruction_pc,
+							    executed_before);
 			} else {
 				okay = jit_emit_load(&builder, &map, entry,
 						     memory_sites, instructions[i],
@@ -4864,11 +5583,25 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 			    i <= persistent_memory.last))
 				group.count = 1u;
 			if (group.count > 1u) {
-				okay = jit_emit_store_group(
-					&builder, &map, entry, memory_sites,
-					&instructions[i], instruction_pc,
-					executed_before, &group);
+				okay = builder.linear &&
+					jit_linear_expected(&group_hint,
+						(instructions[i] >> 15) & 0x1fu) ?
+					jit_emit_linear_store_group(
+						&builder, &map, &instructions[i],
+						instruction_pc, executed_before,
+						&group) :
+					jit_emit_store_group(
+						&builder, &map, entry, memory_sites,
+						&instructions[i], instruction_pc,
+						executed_before, &group);
 				i += group.count - 1u;
+			} else if (builder.linear && loop_cache == NULL &&
+				   jit_linear_expected(&group_hint,
+					(instructions[i] >> 15) & 0x1fu)) {
+				okay = jit_emit_linear_store(&builder, &map,
+							     instructions[i],
+							     instruction_pc,
+							     executed_before);
 			} else {
 				okay = jit_emit_store(&builder, &map, entry,
 						      memory_sites, instructions[i],
@@ -5082,7 +5815,9 @@ static __attribute__((noinline)) bool jit_codegen(struct jit_codegen *gen)
 		normal_done_patch = builder.cursor;
 		jit_emit(&builder, 0u); /* j result return */
 
-		if (!jit_emit_loop_read_cache_stubs(&builder) ||
+		if (!jit_emit_linear_slow_paths(&builder, &map, entry,
+						memory_sites, &persistent_memory) ||
+		    !jit_emit_loop_read_cache_stubs(&builder) ||
 		    !jit_emit_loop_write_cache_stubs(&builder) ||
 		    !jit_emit_two_page_store_stubs(&builder, &map) ||
 		    !jit_emit_deferred_memory_stubs(&builder, &map, memory_sites) ||
@@ -5277,6 +6012,7 @@ static bool jit_install_generated_body(uint32_t slot, struct jit_codegen *gen)
 	entry->loops_to_start = gen->loops_to_start;
 	entry->spans_pages = gen->spans_pages;
 	jit_link_learning_budget[slot] = JIT_LINK_CONFIRMATIONS;
+	jit_forget_jump_miss(trace->guest_pc);
 	entry->state = JIT_ENTRY_READY;
 #if JIT_KEEP_KERNEL
 	jit_mark_kernel_code(trace, gen->count);
@@ -6110,6 +6846,125 @@ static __attribute__((noinline)) bool jit_self_test_interior_loops(void)
 	}
 #endif
 	return true;
+}
+
+/* Kernel linear-map loads and stores on the device itself: a load group, a
+ * store group and misaligned singles through both forms of the check, then
+ * a zero limit and bases just outside the window, which must leave through
+ * the page-cache path without touching memory.  Runs before binding, with a
+ * borrowed bank whose window covers a small local buffer. */
+static __attribute__((noinline)) bool jit_self_test_kernel_linear(void)
+{
+	struct rv32_native_jit_runtime *runtime = jit_rt;
+	const uint32_t window = 0xc0000000u;
+	const uint32_t base_pc = window + 0x10000u;
+	const uint32_t data_va = window + JIT_LINEAR_LOW_MARGIN;
+	const uint32_t program[] = {
+		rv_i(0x03u, 1u, 2u, 4u, 0),       /* lw x1, 0(x4) */
+		rv_i(0x03u, 2u, 4u, 4u, 5),       /* lbu x2, 5(x4) */
+		rv_i(0x03u, 3u, 1u, 4u, 6),       /* lh x3, 6(x4) */
+		rv_s(0x23u, 2u, 5u, 1u, 8),       /* sw x1, 8(x5) */
+		rv_s(0x23u, 0u, 5u, 2u, 13),      /* sb x2, 13(x5) */
+		rv_s(0x23u, 1u, 5u, 3u, 14),      /* sh x3, 14(x5) */
+		rv_i(0x03u, 6u, 2u, 7u, 1),       /* lw x6, 1(x7): misaligned */
+		rv_i(0x03u, 8u, 0u, 7u, 3),       /* lb x8, 3(x7) */
+		rv_s(0x23u, 1u, 9u, 6u, 2),       /* sh x6, 2(x9): misaligned */
+		rv_b(0u, 0u, 0u, 8),              /* beq x0, x0, +8 */
+	};
+	const uint32_t count = sizeof(program) / sizeof(program[0]);
+	struct jit_test_memory memory = { .address = 0u };
+	_Alignas(4) uint8_t data[64];
+	_Alignas(4) uint8_t expected[64];
+	uint32_t regs[32];
+	uint32_t saved_base = jit_kernel_linear_base;
+	uint32_t saved_size = jit_kernel_linear_size;
+	bool saved_data = jit_kernel_linear_data;
+	bool ok = true;
+
+	jit_kernel_linear_base = window;
+	jit_kernel_linear_size = 0x01000000u;
+	jit_kernel_linear_data = true;
+	for (uint32_t pass = 0; pass < 5u && ok; pass++) {
+		/* Passes 0-1: in the window, three then two registers; 2: zero
+		 * limit; 3: base at the limit; 4: base below the window start. */
+		uint32_t base = data_va + (pass == 3u ? 64u : 0u) -
+			(pass == 4u ? 4u : 0u);
+		uint32_t value;
+		uint32_t bailout;
+
+		jit_linear_register_budget = pass == 1u ? 2u : 3u;
+		if (!jit_compile(0u, (const uint8_t *)program, 0u, base_pc,
+				 count)) {
+			ok = false;
+			break;
+		}
+		for (uint32_t i = 0; i < sizeof(data); i++)
+			expected[i] = data[i] = (uint8_t)(i * 37u + 0x85u);
+		memset(regs, 0, sizeof(regs));
+		regs[4] = base;
+		regs[5] = base + 16u;
+		regs[7] = base + 32u;
+		regs[9] = base + 41u;
+		*runtime = (struct rv32_native_jit_runtime) {
+			.regs = regs,
+			.opaque = &memory,
+			.load = jit_test_load,
+			.store = jit_test_store,
+			.linear_limit = pass == 2u ? 0u : 64u,
+			.linear_host = (uint32_t)(uintptr_t)data,
+		};
+		for (uint32_t i = 0; i < RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES; i++) {
+			runtime->read_pages[i].virtual_page = UINT32_MAX;
+			runtime->write_pages[i].virtual_page = UINT32_MAX;
+			runtime->write_pages[i].linear_page_start = UINT32_MAX;
+		}
+		bailout = rv32_native_jit_enter(
+			(jit_block_fn)(uintptr_t)jit_entry_code(0u), runtime);
+		if (pass >= 2u) {
+			/* The first group leaves before any access or write. */
+			ok = bailout == 1u && runtime->memory_calls == 0u &&
+				runtime->memory_address == base && regs[1] == 0u;
+			for (uint32_t i = 0; i < sizeof(data); i++)
+				ok = ok && data[i] == expected[i];
+			continue;
+		}
+		memcpy(&value, &expected[0], 4u);
+		ok = bailout == 0u && runtime->result.trap == 0u &&
+			runtime->result.executed == count &&
+			runtime->result.next_pc == base_pc + count * 4u + 4u &&
+			runtime->memory_calls == 0u && regs[1] == value &&
+			regs[2] == expected[5] &&
+			regs[3] == (uint32_t)(int32_t)(int16_t)
+				(expected[6] | (expected[7] << 8));
+		memcpy(&expected[24], &value, 4u);
+		expected[29] = (uint8_t)regs[2];
+		expected[30] = (uint8_t)regs[3];
+		expected[31] = (uint8_t)(regs[3] >> 8);
+		memcpy(&value, &expected[33], 4u);
+		ok = ok && regs[6] == value &&
+			regs[8] == (uint32_t)(int32_t)(int8_t)expected[35];
+		expected[43] = (uint8_t)value;
+		expected[44] = (uint8_t)(value >> 8);
+		for (uint32_t i = 0; i < sizeof(data); i++)
+			ok = ok && data[i] == expected[i];
+		/* The page caches never learned a linear-map page. */
+		for (uint32_t i = 0; i < RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES; i++)
+			ok = ok && runtime->read_pages[i].virtual_page == UINT32_MAX &&
+				runtime->write_pages[i].virtual_page == UINT32_MAX;
+	}
+	jit_linear_register_budget = 3u;
+	jit_kernel_linear_base = saved_base;
+	jit_kernel_linear_size = saved_size;
+	jit_kernel_linear_data = saved_data;
+	jit_forget_entry(0u);
+	memset(jit_entries, 0, sizeof(jit_entries));
+	memset(jit_hot_entries, 0, sizeof(jit_hot_entries));
+	jit_reset_code_heads();
+#if JIT_KEEP_KERNEL
+	memset(jit_kernel_code_pages, 0, sizeof(jit_kernel_code_pages));
+	jit_user_slot_count = 0u;
+#endif
+	return ok;
 }
 
 static bool jit_self_test(void)
@@ -7756,7 +8611,11 @@ bool rv32_native_jit_init(void)
 		.jump_cache = jit_jump_cache[0],
 		.links = jit_links,
 		.link_targets = jit_link_targets,
+		.jump_misses = jit_jump_misses,
 	};
+#ifdef ESP_PLATFORM
+	jit_start_sampler();
+#endif
 	jit_clear_all_links();
 	memset(jit_hot_entries, 0, sizeof(jit_hot_entries));
 	jit_reset_code_heads();
@@ -7767,6 +8626,8 @@ bool rv32_native_jit_init(void)
 		rv32_native_jit_self_test_failure = 2u;
 	else if (!jit_self_test_interior_loops())
 		rv32_native_jit_self_test_failure = 3u;
+	else if (!jit_self_test_kernel_linear())
+		rv32_native_jit_self_test_failure = 5u;
 	else if (!jit_self_test())
 		rv32_native_jit_self_test_failure = 4u;
 	return rv32_native_jit_self_test_failure == 0u;
@@ -7783,7 +8644,10 @@ void rv32_native_jit_memory_cache_flush_host_range(const void *host, size_t size
 	if (!host || !size || size - 1u > UINTPTR_MAX - first)
 		return;
 	uintptr_t last = first + size - 1u;
-	/* Every bank may map the surface, the kernel ones through the linear map. */
+	/* Every bank may map the surface, the kernel ones through the linear map.
+	 * Generated linear-map accesses, like the interpreter's shortcut, treat
+	 * the whole window as RAM and never consult these entries; a revoked
+	 * linear-map page was likewise re-learned as RAM at its next access. */
 	for (uint32_t bank = 0; bank < JIT_MEMORY_BANKS; bank++) {
 		struct rv32_native_jit_runtime *runtime = &jit_runtimes[bank];
 
@@ -7807,6 +8671,7 @@ void rv32_native_jit_memory_cache_flush_host_range(const void *host, size_t size
 
 static void jit_invalidate_memory_pages(struct rv32_native_jit_runtime *runtime)
 {
+	runtime->linear_limit = 0u;
 	for (uint32_t i = 0; i < RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES; i++) {
 		runtime->read_pages[i].virtual_page = UINT32_MAX;
 		runtime->write_pages[i].virtual_page = UINT32_MAX;
@@ -7867,8 +8732,75 @@ void rv32_native_jit_set_kernel_linear_map(uint32_t virtual_base,
 {
 	/* Pages recorded under the old window may lack their history bit. */
 	jit_invalidate_translations();
+	/* Kernel regions embed the window start in their linear-map checks. */
+	if (jit_kernel_linear_data && jit_code_arena != NULL &&
+	    virtual_base != jit_kernel_linear_base)
+		rv32_native_jit_flush();
 	jit_kernel_linear_base = virtual_base;
 	jit_kernel_linear_size = size;
+}
+
+void rv32_native_jit_set_kernel_linear_data(uint32_t physical_offset)
+{
+	/* Each bank takes the window up when it is next selected. */
+	jit_invalidate_translations();
+	jit_kernel_linear_phys = physical_offset;
+	jit_kernel_linear_data = JIT_MAX_PRIVILEGE != 0u;
+}
+
+/* The interpreter's kernel_linear_limit: nonzero in S-mode with satp paging
+ * on.  Any satp change flushes every bank (MiniRV32FlushTLB reaches
+ * rv32_native_jit_memory_cache_flush), so the value read here holds until
+ * the bank is selected again; native code never writes satp.  Without a CSR
+ * layout the paging state is unknown and generated code keeps the page
+ * cache. */
+static void jit_select_linear_window(struct rv32_native_jit_runtime *runtime,
+				     uint32_t privilege)
+{
+	uint32_t satp;
+
+	runtime->linear_limit = 0u;
+	if (!jit_kernel_linear_data || privilege != 1u ||
+	    !jit_csr_layout_valid || runtime->regs == NULL ||
+	    runtime->image == NULL || jit_kernel_linear_size <=
+		JIT_LINEAR_LOW_MARGIN + JIT_LINEAR_HIGH_MARGIN)
+		return;
+	memcpy(&satp, (const uint8_t *)runtime->regs + jit_csr_layout.satp,
+	       sizeof(satp));
+	if ((satp & 0x80000000u) == 0u)
+		return;
+	runtime->linear_host = (uint32_t)(uintptr_t)runtime->image +
+		jit_kernel_linear_phys + JIT_LINEAR_LOW_MARGIN;
+	runtime->linear_limit = jit_kernel_linear_size -
+		JIT_LINEAR_LOW_MARGIN - JIT_LINEAR_HIGH_MARGIN;
+}
+
+/* The ready or rejected way of set holding this head, or NULL.  The guest
+ * PC is compared first: it differs in nearly every other way, so a miss
+ * costs one load and branch per way.  An empty way's stale tags are harmless
+ * because its state is checked once both match. */
+static inline struct jit_cache_entry *jit_lookup_set(
+	uint32_t physical_offset, uint32_t guest_pc, uint32_t set,
+	uint32_t *slot)
+{
+	struct jit_cache_entry *ways = &jit_entries[set * JIT_CACHE_WAYS];
+
+	for (uint32_t way = 0; way < JIT_CACHE_WAYS; way++) {
+		struct jit_cache_entry *entry = &ways[way];
+
+		if (entry->guest_pc != guest_pc ||
+		    entry->physical_offset != physical_offset ||
+		    entry->state == JIT_ENTRY_EMPTY)
+			continue;
+		*slot = set * JIT_CACHE_WAYS + way;
+		/* The next region replaces some other way of the set. */
+		if (jit_replace_way[set] == way)
+			jit_replace_way[set] =
+				(uint8_t)((way + 1u) & (JIT_CACHE_WAYS - 1u));
+		return entry;
+	}
+	*slot = UINT32_MAX;
+	return NULL;
 }
 
 static inline struct jit_cache_entry *jit_lookup_entry(
@@ -7876,23 +8808,7 @@ static inline struct jit_cache_entry *jit_lookup_entry(
 	uint32_t *set)
 {
 	*set = jit_hash(physical_offset, guest_pc, JIT_CACHE_SETS - 1u);
-	*slot = UINT32_MAX;
-	for (uint32_t way = 0; way < JIT_CACHE_WAYS; way++) {
-		uint32_t candidate = *set * JIT_CACHE_WAYS + way;
-		struct jit_cache_entry *entry = &jit_entries[candidate];
-
-		if (entry->state == JIT_ENTRY_EMPTY ||
-		    entry->physical_offset != physical_offset ||
-		    entry->guest_pc != guest_pc)
-			continue;
-		*slot = candidate;
-		/* The next region replaces some other way of the set. */
-		if (jit_replace_way[*set] == way)
-			jit_replace_way[*set] =
-				(uint8_t)((way + 1u) & (JIT_CACHE_WAYS - 1u));
-		return entry;
-	}
-	return NULL;
+	return jit_lookup_set(physical_offset, guest_pc, *set, slot);
 }
 
 static inline uint32_t jit_context_privilege(uint32_t memory_context)
@@ -7927,6 +8843,7 @@ static __attribute__((noinline)) void jit_select_memory_context(
 	/* Same epoch, new SUM/MXR: only this bank's data permissions change. */
 	jit_invalidate_memory_pages(runtime);
 	runtime->memory_context = memory_context;
+	jit_select_linear_window(runtime, privilege);
 }
 
 static inline void jit_adopt_memory_context(uint32_t memory_context)
@@ -7975,11 +8892,38 @@ static uint32_t jit_hle_filter;
 static rv32_native_jit_hle_fn jit_hle_run;
 static uint32_t jit_hle_ram_size;
 
+/* Routine kinds still to identify: while any remains, a kernel head's first
+ * visit reads its instruction and compares it with the routines' first words,
+ * so identification does not depend on the head's warm entry surviving to a
+ * second probe (the EROFS LZ4 partial decoder, called a few times a second,
+ * never got there and decoded in the guest). */
+static uint32_t jit_hle_unidentified;
+/* A routine the kernel never calls would keep that check on every first
+ * visit (`find` +2.4 %): it stops after this many kernel first visits
+ * without an identification, which re-arms it. */
+#define JIT_HLE_FIRST_VISIT_BUDGET (1u << 20)
+static uint32_t jit_hle_first_visit_budget;
+
+/* The first-visit check tests only the budget, so the budget stays zero
+ * without a host or once nothing is left to identify. */
 static void jit_hle_forget(void)
 {
 	for (uint32_t kind = 0u; kind < GUEST_HLE_KINDS; kind++)
 		jit_hle_pcs[kind] = UINT32_MAX;
 	jit_hle_filter = 0u;
+	jit_hle_unidentified = GUEST_HLE_KINDS - 1u;
+	jit_hle_first_visit_budget =
+		jit_hle_run != NULL ? JIT_HLE_FIRST_VISIT_BUDGET : 0u;
+}
+
+static void jit_hle_identified(uint32_t kind, uint32_t guest_pc)
+{
+	jit_hle_pcs[kind] = guest_pc;
+	jit_hle_filter |= 1u << ((guest_pc >> 2) & 31u);
+	if (jit_hle_unidentified != 0u)
+		jit_hle_unidentified--;
+	jit_hle_first_visit_budget = jit_hle_unidentified != 0u ?
+		JIT_HLE_FIRST_VISIT_BUDGET : 0u;
 }
 
 void rv32_native_jit_set_hle(rv32_native_jit_hle_fn run, uint32_t ram_size)
@@ -7998,6 +8942,27 @@ static inline uint32_t jit_hle_kind(uint32_t guest_pc)
 			return kind;
 	}
 	return GUEST_HLE_NONE;
+}
+
+/* Whether the callee a trace is about to follow is a host routine.  An
+ * unidentified callee in the kernel's linear window is identified now, as a
+ * probe at its entry would identify it. */
+static bool jit_hle_callee(uint32_t guest_pc, uint32_t physical_offset,
+			   uint32_t instruction, const uint8_t *guest_ram)
+{
+	uint32_t kind = jit_hle_kind(guest_pc);
+
+	if (kind != GUEST_HLE_NONE)
+		return true;
+	if (jit_hle_run == NULL ||
+	    guest_pc - jit_kernel_linear_base >= jit_kernel_linear_size)
+		return false;
+	kind = guest_hle_identify(guest_ram, jit_hle_ram_size, physical_offset,
+				  instruction);
+	if (kind == GUEST_HLE_NONE || jit_hle_pcs[kind] != UINT32_MAX)
+		return false;
+	jit_hle_identified(kind, guest_pc);
+	return true;
 }
 
 /* Runs the routine for the current supervisor call; on success it has
@@ -8070,7 +9035,8 @@ static bool jit_choose_slot(uint32_t set, bool candidate_loop, uint32_t *slot_ou
 				(JIT_CACHE_WAYS - 1u);
 			const struct jit_cache_entry *entry =
 				&jit_entries[base + way];
-			uint32_t rank = entry->loops_to_start ? 2u : 0u;
+			uint32_t rank = (entry->loops_to_start ? 2u : 0u) +
+				(jit_entry_entered[base + way] != 0u);
 
 			if (rank < best_rank) {
 				best_rank = rank;
@@ -8386,13 +9352,51 @@ static inline bool jit_interpreter_must_resume(
 _Static_assert(offsetof(struct rv32_native_jit_runtime, dispatch_miss_pc) == 92u,
 	       "rv32_native_jit_dispatch hard-codes dispatch_miss_pc");
 
+/* Calls generated code at block with runtime in a0 and returns its bailout
+ * word, as rv32_native_jit_enter does.  Regions may use every callee-saved
+ * register but never sp, gp or tp, and return through ra.  Naming the
+ * registers as clobbers makes jit_run's prologue save the caller's values
+ * once per try, where the wrapper saved them again around every region it
+ * entered; jit_run keeps its own few live values on its stack instead.  The
+ * caller-saved floating-point registers are listed for C callbacks the refill
+ * trampoline reaches.  A frame pointer cannot be clobbered, so such builds
+ * keep the wrapper. */
+#if defined(CONFIG_ESP_SYSTEM_USE_FRAME_POINTER) && \
+	CONFIG_ESP_SYSTEM_USE_FRAME_POINTER
+#define jit_enter_block rv32_native_jit_enter
+#else
+static inline __attribute__((always_inline)) uint32_t jit_enter_block(
+	jit_block_fn block, struct rv32_native_jit_runtime *runtime)
+{
+	register uintptr_t argument __asm__("a0") = (uintptr_t)runtime;
+	register uintptr_t target __asm__("t0") = (uintptr_t)block;
+
+	__asm__ volatile("jalr ra, 0(%1)"
+			 : "+r"(argument), "+r"(target)
+			 :
+			 : "ra", "t1", "t2", "t3", "t4", "t5", "t6",
+			   "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+			   "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+			   "s8", "s9", "s10", "s11",
+#ifdef __riscv_flen
+			   "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6",
+			   "ft7", "ft8", "ft9", "ft10", "ft11",
+			   "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6",
+			   "fa7",
+#endif
+			   "memory");
+	return (uint32_t)argument;
+}
+#endif
+
 /* Runs the native chain from the ready region in slot.  Out of line, so a
- * failed probe in jit_try saves and restores only a few registers. */
-static __attribute__((noinline)) const struct rv32_native_jit_result *
-IRAM_ATTR jit_run(struct rv32_native_jit_runtime *const runtime,
-		  struct jit_cache_entry *entry, uint32_t slot,
-		  uint32_t physical_offset, uint32_t guest_pc,
-		  uint32_t instruction_limit, uint32_t memory_context)
+ * failed probe saves no registers.  The try's arguments come first, in the
+ * registers jit_try received them in (noipa keeps that order). */
+static __attribute__((noipa)) const struct rv32_native_jit_result *
+IRAM_ATTR jit_run(uint32_t physical_offset, uint32_t guest_pc,
+		  uint32_t instruction_limit, uint32_t memory_context,
+		  struct rv32_native_jit_runtime *const runtime,
+		  struct jit_cache_entry *entry, uint32_t slot)
 {
 	uint32_t set;
 	uint32_t total_executed;
@@ -8412,7 +9416,7 @@ IRAM_ATTR jit_run(struct rv32_native_jit_runtime *const runtime,
 			runtime->write_pages[index].dirty_epoch = 0u;
 		runtime->dirty_epoch = 1u;
 	}
-	runtime->result.native_successor = 0u;
+	/* result.native_successor is set before each region below. */
 	runtime->result.linear_dirty_start = UINT32_MAX;
 	runtime->result.linear_dirty_end = 0u;
 	runtime->result.linear_store_calls = 0u;
@@ -8421,8 +9425,11 @@ IRAM_ATTR jit_run(struct rv32_native_jit_runtime *const runtime,
 	runtime->dispatch_miss_pc = UINT32_MAX;
 	runtime->chain_instruction_limit = instruction_limit;
 	runtime->chain_executed = 0u;
+#if RV32_NATIVE_JIT_RUNTIME_COUNTERS
+	/* Only generated counter code increments these. */
 	runtime->chain_blocks = 0u;
 	runtime->chain_links = 0u;
+#endif
 
 	for (;;) {
 		jit_block_fn block;
@@ -8464,7 +9471,7 @@ IRAM_ATTR jit_run(struct rv32_native_jit_runtime *const runtime,
 		uint32_t native_cycle_start = jit_profile_cycle_count();
 		uint64_t refill_cycle_start = jit_stats.ram_refill_cycles;
 	#endif
-		bailout = rv32_native_jit_enter(block, runtime);
+		bailout = jit_enter_block(block, runtime);
 	#if CONFIG_RV32_HOST_PERF_STATS
 		jit_stats.native_cycles += (uint32_t)(
 			jit_profile_cycle_count() - native_cycle_start) -
@@ -8509,15 +9516,33 @@ IRAM_ATTR jit_run(struct rv32_native_jit_runtime *const runtime,
 			break;
 		}
 		if (executed == 0u || bailout != 0u ||
-		    runtime->result.trap != 0u || JIT_HOST_WAKE_PENDING() ||
-		    jit_interpreter_must_resume(runtime, memory_context))
+		    runtime->result.trap != 0u || JIT_HOST_WAKE_PENDING())
+			break;
+		next_pc = runtime->result.next_pc;
+		/* Most chains end where the dispatcher has just searched the
+		 * directory and found no ready region.  Unless a host routine
+		 * starts there, stop before the checks below: after every
+		 * native return the interpreter delivers an interrupt that an
+		 * inline CSR write made pending and reads SUM/MXR afresh, which
+		 * is all jit_interpreter_must_resume would decide here. */
+		if (next_pc == runtime->dispatch_miss_pc
+#if CONFIG_RV32_GUEST_HLE
+		    && jit_hle_kind(next_pc) == GUEST_HLE_NONE
+#endif
+		   ) {
+			runtime->result.native_successor = 1u;
+#if CONFIG_RV32_HOST_PERF_STATS || CONFIG_RV32_EMULATOR_PERF_STATS
+			chained_lookups++;
+#endif
+			break;
+		}
+		if (jit_interpreter_must_resume(runtime, memory_context))
 			break;
 
 		runtime->result.native_successor = 1u;
 		if (instruction_limit - total_executed <
 		    JIT_MIN_GUEST_INSTRUCTIONS)
 			break;
-		next_pc = runtime->result.next_pc;
 		/* Native links may have crossed several independently compiled
 		 * regions. Continue from the authoritative final entry, not from
 		 * the region that C originally called. */
@@ -8590,45 +9615,20 @@ IRAM_ATTR jit_run(struct rv32_native_jit_runtime *const runtime,
 	return &runtime->result;
 }
 
-/* A probe that found no ready region: count the visit in the warm table and
- * queue or compile a head that became hot. */
+/* A visit to a head the warm table holds: check its first instruction once,
+ * count the visit and queue or compile the head once it is hot.  set is the
+ * head's directory set; the try's arguments stay in their registers. */
 static __attribute__((noinline)) const struct rv32_native_jit_result *
-IRAM_ATTR jit_probe_miss(struct jit_cache_entry *entry, uint32_t slot,
-			 uint32_t set, uint32_t physical_offset,
-			 uint32_t guest_pc, uint32_t instruction_limit,
-			 uint32_t memory_context, uint32_t warm_weight)
+IRAM_ATTR jit_probe_warm(uint32_t physical_offset, uint32_t guest_pc,
+			 uint32_t instruction_limit, uint32_t memory_context,
+			 uint32_t warm_weight, struct jit_warm_entry *warm,
+			 uint32_t set)
 {
 	struct rv32_native_jit_runtime *const runtime = jit_rt;
-	struct jit_warm_entry *warm;
 	uint32_t instruction;
+	uint32_t slot;
 	bool candidate_loop;
 
-	if (entry != NULL && entry->state == JIT_ENTRY_REJECTED) {
-		rv32_profile_set_reason(RV32_PROFILE_REJECTED);
-		return NULL;
-	}
-
-	/* Direct mapped: a first visit replaces whatever head shared the entry.
-	 * Set-associative tables (with refusal, aging or both) left less code
-	 * interpreted in the profile build, whose per-instruction hook makes
-	 * interpretation look dearer than it is, but on production firmware they
-	 * compiled more and were 7-9 % slower on the kernel workload (2026-10-17,
-	 * docs/jit-host-routines-2026-10-17.md). */
-	warm = &jit_warm[jit_hash(physical_offset, guest_pc,
-				  JIT_WARM_SLOTS - 1u)];
-	if (!warm->valid || warm->physical_offset != physical_offset ||
-	    warm->guest_pc != guest_pc) {
-		rv32_profile_set_reason(RV32_PROFILE_FIRST_VISIT);
-		if (warm->valid && warm->hits >= 2u)
-			rv32_profile_jit_event(RV32_PROFILE_WARM_EVICTION);
-		rv32_profile_jit_event(RV32_PROFILE_WARM_INSERT);
-		warm->physical_offset = physical_offset;
-		warm->guest_pc = guest_pc;
-		warm->hits = 1u;
-		warm->valid = 1u;
-		warm->reserved = JIT_WARM_UNCHECKED;
-		return NULL;
-	}
 	if ((warm->reserved & JIT_WARM_UNCHECKED) != 0u) {
 		/* The second visit loads the physical instruction once, so
 		 * privileged or otherwise unsupported starts and host routines are
@@ -8637,15 +9637,15 @@ IRAM_ATTR jit_probe_miss(struct jit_cache_entry *entry, uint32_t slot,
 		memcpy(&instruction, runtime->image + physical_offset,
 		       sizeof(instruction));
 #if CONFIG_RV32_GUEST_HLE
-		if (jit_hle_run != NULL &&
+		/* Once every routine is identified a match would be ignored. */
+		if (jit_hle_unidentified != 0u && jit_hle_run != NULL &&
 		    jit_context_privilege(memory_context) == 1u) {
 			uint32_t hle_kind = guest_hle_identify(runtime->image,
 				jit_hle_ram_size, physical_offset, instruction);
 
 			if (hle_kind != GUEST_HLE_NONE &&
 			    jit_hle_pcs[hle_kind] == UINT32_MAX) {
-				jit_hle_pcs[hle_kind] = guest_pc;
-				jit_hle_filter |= 1u << ((guest_pc >> 2) & 31u);
+				jit_hle_identified(hle_kind, guest_pc);
 				warm->valid = 0u;
 				return jit_try_hle(runtime, memory_context, hle_kind);
 			}
@@ -8745,38 +9745,149 @@ IRAM_ATTR jit_probe_miss(struct jit_cache_entry *entry, uint32_t slot,
 	return NULL;
 }
 
-
-static const struct rv32_native_jit_result *IRAM_ATTR jit_try(
-	uint32_t physical_offset, uint32_t guest_pc,
-	uint32_t instruction_limit, uint32_t memory_context,
-	uint32_t warm_weight)
-{
-	uint32_t set;
-	uint32_t slot = UINT32_MAX;
-	struct jit_cache_entry *entry;
-
-	/* Most tries find a ready region.  Readiness already implies the arena,
-	 * the runtime and a supported start (no negative entry), so a ready
-	 * region runs after the checks it still needs; a finished CPU1 job is
-	 * installed by the next try that misses. */
-	entry = jit_lookup_entry(physical_offset, guest_pc, &slot, &set);
-	if (__builtin_expect(entry != NULL &&
-			     entry->state == JIT_ENTRY_READY, 1) &&
-	    instruction_limit >= JIT_MIN_GUEST_INSTRUCTIONS &&
-	    jit_context_privilege(memory_context) <= JIT_MAX_PRIVILEGE
 #if CONFIG_RV32_GUEST_HLE
-	    && jit_hle_kind(guest_pc) == GUEST_HLE_NONE
+/* A first visit to a kernel head while a host routine is still unidentified
+ * and the budget lasts: identify the head by its code.  Bounded by the
+ * budget, so it stays in flash with guest_hle_identify. */
+static __attribute__((noinline)) const struct rv32_native_jit_result *
+jit_probe_identify(struct jit_warm_entry *warm, uint32_t physical_offset,
+		   uint32_t guest_pc, uint32_t memory_context)
+{
+	struct rv32_native_jit_runtime *const runtime = jit_rt;
+	uint32_t first_word;
+	uint32_t hle_kind;
+
+	jit_hle_first_visit_budget--;
+	memcpy(&first_word, runtime->image + physical_offset,
+	       sizeof(first_word));
+	hle_kind = guest_hle_identify(runtime->image, jit_hle_ram_size,
+				      physical_offset, first_word);
+	if (hle_kind == GUEST_HLE_NONE || jit_hle_pcs[hle_kind] != UINT32_MAX)
+		return NULL;
+	jit_hle_identified(hle_kind, guest_pc);
+	warm->valid = 0u;
+	return jit_try_hle(runtime, memory_context, hle_kind);
+}
 #endif
-	   ) {
-		jit_adopt_memory_context(memory_context);
-		jit_note_exec_page(physical_offset, guest_pc);
+
+/* The directory way slot (UINT32_MAX for none) holding a probed head. */
+static inline struct jit_cache_entry *jit_slot_entry(uint32_t slot)
+{
+	return slot < JIT_CACHE_SLOTS ? &jit_entries[slot] : NULL;
+}
+
+/* A try once the bank and execute page are current: run a host routine, or
+ * a ready region whose bank or page had to be switched first (or that a CPU1
+ * install just added), else count a first visit in the warm table and leave
+ * later visits to jit_probe_warm.  Every call is a tail call, and the
+ * arguments stay in jit_try's registers. */
+static __attribute__((noinline)) const struct rv32_native_jit_result *
+IRAM_ATTR jit_probe_adopted(uint32_t physical_offset, uint32_t guest_pc,
+			    uint32_t instruction_limit,
+			    uint32_t memory_context, uint32_t warm_weight,
+			    uint32_t slot, uint32_t warm_index)
+{
+	struct jit_cache_entry *entry = jit_slot_entry(slot);
+	struct jit_warm_entry *warm;
+
+#if CONFIG_RV32_GUEST_HLE
+	{
+		uint32_t hle_kind = jit_hle_kind(guest_pc);
+
+		/* Native callbacks never switch banks. */
+		if (__builtin_expect(hle_kind != GUEST_HLE_NONE, 0))
+			return jit_try_hle(jit_rt, memory_context, hle_kind);
+	}
+#endif
 #if CONFIG_RV32_HOST_PERF_STATS || CONFIG_RV32_EMULATOR_PERF_STATS
-		jit_stats.lookups++;
+	jit_stats.lookups++;
 #endif
-		return jit_run(jit_rt, entry, slot, physical_offset, guest_pc,
-			       instruction_limit, memory_context);
+	if (entry != NULL) {
+		if (entry->state == JIT_ENTRY_READY)
+			return jit_run(physical_offset, guest_pc,
+				       instruction_limit, memory_context,
+				       jit_rt, entry, slot);
+		if (entry->state == JIT_ENTRY_REJECTED) {
+			rv32_profile_set_reason(RV32_PROFILE_REJECTED);
+			return NULL;
+		}
 	}
 
+	/* Direct mapped: a first visit replaces whatever head shared the entry.
+	 * Set-associative tables (with refusal, aging or both) left less code
+	 * interpreted in the profile build, whose per-instruction hook makes
+	 * interpretation look dearer than it is, but on production firmware they
+	 * compiled more and were 7-9 % slower on the kernel workload (2026-10-17,
+	 * docs/jit-host-routines-2026-10-17.md). */
+	warm = &jit_warm[warm_index];
+	if (warm->valid && warm->physical_offset == physical_offset &&
+	    warm->guest_pc == guest_pc)
+		return jit_probe_warm(physical_offset, guest_pc,
+				      instruction_limit, memory_context,
+				      warm_weight, warm,
+				      warm_index & (JIT_CACHE_SETS - 1u));
+	rv32_profile_set_reason(RV32_PROFILE_FIRST_VISIT);
+	if (warm->valid && warm->hits >= 2u)
+		rv32_profile_jit_event(RV32_PROFILE_WARM_EVICTION);
+	rv32_profile_jit_event(RV32_PROFILE_WARM_INSERT);
+	warm->physical_offset = physical_offset;
+	warm->guest_pc = guest_pc;
+	warm->hits = 1u;
+	warm->valid = 1u;
+	warm->reserved = JIT_WARM_UNCHECKED;
+#if CONFIG_RV32_GUEST_HLE
+	/* A nonzero budget implies a host and a routine to identify. */
+	if (jit_hle_first_visit_budget != 0u &&
+	    jit_context_privilege(memory_context) == 1u &&
+	    guest_pc - jit_kernel_linear_base < jit_kernel_linear_size)
+		return jit_probe_identify(warm, physical_offset, guest_pc,
+					  memory_context);
+#endif
+	return NULL;
+}
+
+/* The detour of a try whose bank or execute page is not current, or with
+ * finished CPU1 jobs: install them, switch the bank and record the execute
+ * page before going on. */
+static __attribute__((noinline)) const struct rv32_native_jit_result *
+IRAM_ATTR jit_probe_adopting(uint32_t physical_offset, uint32_t guest_pc,
+			     uint32_t instruction_limit,
+			     uint32_t memory_context, uint32_t warm_weight,
+			     uint32_t slot, uint32_t warm_index)
+{
+#if JIT_ASYNC_COMPILE
+	const struct jit_cache_entry *entry = jit_slot_entry(slot);
+
+	/* A hint only: jit_async_install_done acquires each job's state.  An
+	 * install may add or evict this head's region, so look it up again.
+	 * A ready region about to run leaves the installs to the next miss. */
+	if ((entry == NULL || entry->state != JIT_ENTRY_READY) &&
+	    jit_async_installed !=
+	    __atomic_load_n(&jit_async_done, __ATOMIC_RELAXED)) {
+		jit_async_install_done();
+		(void)jit_lookup_set(physical_offset, guest_pc,
+				     warm_index & (JIT_CACHE_SETS - 1u), &slot);
+	}
+#endif
+	jit_adopt_memory_context(memory_context);
+	jit_note_exec_page(physical_offset, guest_pc);
+	return jit_probe_adopted(physical_offset, guest_pc, instruction_limit,
+				 memory_context, warm_weight, slot, warm_index);
+}
+
+/* A try that cannot take jit_try's fast path: no ready region for the head
+ * (slot is its way, or UINT32_MAX), a budget or privilege refusal, or a host
+ * routine.  warm_index is the head's jit_hash_key under the warm-table mask;
+ * the directory set is its low bits.  Failed probes outnumber entered
+ * regions, so the common ones (a refusal, a negative head, a first visit)
+ * save no registers: everything that calls out of line is reached by a tail
+ * call. */
+static __attribute__((noinline)) const struct rv32_native_jit_result *
+IRAM_ATTR jit_probe_miss(uint32_t physical_offset, uint32_t guest_pc,
+			 uint32_t instruction_limit, uint32_t memory_context,
+			 uint32_t warm_weight, uint32_t slot,
+			 uint32_t warm_index)
+{
 	if (jit_code_arena == NULL || jit_rt->regs == NULL ||
 	    jit_rt->image == NULL || instruction_limit <
 		JIT_MIN_GUEST_INSTRUCTIONS) {
@@ -8793,37 +9904,64 @@ static const struct rv32_native_jit_result *IRAM_ATTR jit_try(
 		rv32_profile_set_reason(RV32_PROFILE_UNSUPPORTED);
 		return NULL;
 	}
+	if (__builtin_expect(
 #if JIT_ASYNC_COMPILE
-	/* A hint only: jit_async_install_done acquires each job's state.  An
-	 * install may add or evict this head's region, so look it up again. */
-	if (__builtin_expect(jit_async_installed !=
-			     __atomic_load_n(&jit_async_done, __ATOMIC_RELAXED), 0)) {
-		jit_async_install_done();
-		entry = jit_lookup_entry(physical_offset, guest_pc, &slot,
-					 &set);
-	}
+		    jit_async_installed !=
+		    __atomic_load_n(&jit_async_done, __ATOMIC_RELAXED) ||
 #endif
-	jit_adopt_memory_context(memory_context);
-	jit_note_exec_page(physical_offset, guest_pc);
+		    jit_rt->memory_context != memory_context ||
+		    !jit_exec_page_current(physical_offset, guest_pc), 0))
+		return jit_probe_adopting(physical_offset, guest_pc,
+					  instruction_limit, memory_context,
+					  warm_weight, slot, warm_index);
+	return jit_probe_adopted(physical_offset, guest_pc, instruction_limit,
+				 memory_context, warm_weight, slot,
+				 warm_index);
+}
+
+/* Most tries find a ready region.  Readiness already implies the arena, the
+ * runtime and a supported start (no negative entry), so a ready region in the
+ * current bank and execute page runs after the checks it still needs; after
+ * a bank or page change it runs from jit_probe_adopting.  Every other case
+ * continues in jit_probe_miss, where finished CPU1 jobs are installed.  Only
+ * tail calls leave this path, so it saves no registers, and the callees take
+ * the try's arguments in the same registers. */
+static inline __attribute__((always_inline))
+const struct rv32_native_jit_result *jit_try(
+	uint32_t physical_offset, uint32_t guest_pc,
+	uint32_t instruction_limit, uint32_t memory_context,
+	uint32_t warm_weight)
+{
+	uint32_t warm_index = jit_hash_key(physical_offset, guest_pc) &
+		(JIT_WARM_SLOTS - 1u);
+	uint32_t slot;
+	struct jit_cache_entry *entry = jit_lookup_set(physical_offset,
+		guest_pc, warm_index & (JIT_CACHE_SETS - 1u), &slot);
+
+	if (__builtin_expect(entry != NULL &&
+			     entry->state == JIT_ENTRY_READY, 1) &&
+	    instruction_limit >= JIT_MIN_GUEST_INSTRUCTIONS &&
+	    jit_context_privilege(memory_context) <= JIT_MAX_PRIVILEGE
 #if CONFIG_RV32_GUEST_HLE
-	{
-		uint32_t hle_kind = jit_hle_kind(guest_pc);
-
-		/* Native callbacks never switch banks. */
-		if (__builtin_expect(hle_kind != GUEST_HLE_NONE, 0))
-			return jit_try_hle(jit_rt, memory_context, hle_kind);
-	}
+	    && jit_hle_kind(guest_pc) == GUEST_HLE_NONE
 #endif
-
+	   ) {
+		/* jit_probe_adopting switches, counts and runs it. */
+		if (__builtin_expect(jit_rt->memory_context != memory_context ||
+				     !jit_exec_page_current(physical_offset,
+							    guest_pc), 0))
+			return jit_probe_adopting(physical_offset, guest_pc,
+						  instruction_limit,
+						  memory_context, warm_weight,
+						  slot, warm_index);
 #if CONFIG_RV32_HOST_PERF_STATS || CONFIG_RV32_EMULATOR_PERF_STATS
-	jit_stats.lookups++;
+		jit_stats.lookups++;
 #endif
-	if (__builtin_expect(entry == NULL || entry->state != JIT_ENTRY_READY, 0))
-		return jit_probe_miss(entry, slot, set, physical_offset, guest_pc,
-				      instruction_limit, memory_context,
-				      warm_weight);
-	return jit_run(jit_rt, entry, slot, physical_offset, guest_pc,
-		       instruction_limit, memory_context);
+		return jit_run(physical_offset, guest_pc, instruction_limit,
+			       memory_context, jit_rt, entry, slot);
+	}
+	return jit_probe_miss(physical_offset, guest_pc, instruction_limit,
+			      memory_context, warm_weight, slot, warm_index);
 }
 
 const struct rv32_native_jit_result *IRAM_ATTR rv32_native_jit_try(
@@ -9074,7 +10212,10 @@ void rv32_native_jit_get_stats(struct rv32_native_jit_stats *stats)
 		}
 #endif
 	}
-#if JIT_KEEP_KERNEL
+#if JIT_ARENA_SINGLE_RING
+	stats->arena_head_bytes = (uint32_t)jit_code_head * JIT_CODE_ALIGNMENT;
+	stats->hot_promote_bar = jit_promote_bar;
+#elif JIT_KEEP_KERNEL
 	/* Each head's distance into its half partition. */
 	stats->arena_head_bytes =
 		((uint32_t)jit_kernel_loop_code_head +

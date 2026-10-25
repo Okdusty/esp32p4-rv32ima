@@ -84,7 +84,7 @@
 			compatible = "riscv";
 			riscv,isa = "rv32ima_zicbom_zicsr_zifencei";
 			riscv,isa-extensions = "i", "m", "a", "zicbom", "zicsr", "zifencei";
-			riscv,cbom-block-size = <64>;
+			riscv,cbom-block-size = <128>;
 			mmu-type = "riscv,sv32";
 
 			cpu_intc: interrupt-controller {
@@ -170,6 +170,16 @@
 			reg = <0x00 0x12500000 0x00 0x00000200>;
 			interrupt-parent = <&plic>;
 			interrupts = <8>;
+		};
+
+		/* Files mapped in place from the "xip" flash partition (cramfs,
+		 * mounted as mtd:xip).  The firmware writes the partition size
+		 * into reg, or renames the compatible when nothing is mapped. */
+		flash@40000000 {
+			compatible = "mtd-rom";
+			reg = <0x00 0x40000000 0x00 0x00000000>;
+			bank-width = <4>;
+			linux,mtd-name = "xip";
 		};
 
 		usb@50000000 {

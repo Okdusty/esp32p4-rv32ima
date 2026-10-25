@@ -37,6 +37,7 @@ int HostBrownoutInit(void);
 int HostConsoleWrite(const void *buffer, size_t length);
 #ifdef ESP_PLATFORM
 void HostRestart(bool download) __attribute__((noreturn));
+int HostRunOnCpu1(int (*init)(void));
 #endif
 void HostEnableGuestRamPrefetch(const void *base, size_t size);
 void HostCacheStatsReset(void);

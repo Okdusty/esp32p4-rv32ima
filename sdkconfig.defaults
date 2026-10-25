@@ -1,6 +1,9 @@
 CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+# The desktop's programs and libraries are mapped in place from the "xip"
+# partition (CONFIG_RV32_FLASH_XIP); partitions.csv is the layout without it.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-xip.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions-xip.csv"
+CONFIG_RV32_FLASH_XIP=y
 
 # Normal firmware: host diagnostics and intrusive profiling are opt-in.
 CONFIG_RV32_DIAGNOSTIC_LOGS=n
@@ -112,3 +115,12 @@ CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
 # CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+
+# I/O lanes: the emulator core (CPU0) runs only the guest.  The display reads
+# the guest framebuffer without stopping it, and esp_timer's task and
+# interrupt run on CPU1 (the microSD, Wi-Fi SDIO and USB interrupts follow
+# their drivers, which app_main starts on CPU1).
+CONFIG_RV32_DISPLAY_ASYNC_GUEST=y
+CONFIG_ESP_TIMER_SHOW_EXPERIMENTAL=y
+CONFIG_ESP_TIMER_TASK_AFFINITY_CPU1=y
+CONFIG_ESP_TIMER_ISR_AFFINITY_CPU1=y

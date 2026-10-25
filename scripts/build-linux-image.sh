@@ -67,8 +67,8 @@ else
 fi
 # The emulator pays per guest instruction and per call into the JIT's
 # region transitions, so the hot kernel paths (mm, scheduler, timekeeping,
-# locking, entry, VFS, EROFS, block, riscv mm and the tree/array libraries)
-# are built at -O2 while the rest of the kernel stays -Os to fit the 8 MiB
+# locking, entry, VFS, EROFS, block, riscv mm, the tree/array libraries,
+# networking and ttys) are built at -O2 while the rest stays -Os to fit the 8 MiB
 # kernel partition.  lib/math, lib/lz4 and arch/riscv/lib keep their flags:
 # the firmware's host routines match those functions by instruction words.
 hot_o2_patch="$repo_root/linux-rv32-hot-o2.patch"
@@ -78,6 +78,45 @@ elif git -C "$linux_dir" apply --check "$hot_o2_patch"; then
   git -C "$linux_dir" apply "$hot_o2_patch"
 else
   echo "error: Linux hot-path -O2 patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+# vm.mmap_readaround_kb: rv32-init caps the read-around of page faults in
+# mapped files (program code) at 16 KiB while read() keeps 128 KiB.  With the
+# device's default (8 MiB on virtio-blk) every miss in a desktop program read
+# megabytes ahead and evicted the rest of a 20 MB guest's page cache.
+mmap_readaround_patch="$repo_root/linux-rv32-mmap-readaround.patch"
+if git -C "$linux_dir" apply --reverse --check "$mmap_readaround_patch" >/dev/null 2>&1; then
+  :
+elif git -C "$linux_dir" apply --check "$mmap_readaround_patch"; then
+  git -C "$linux_dir" apply "$mmap_readaround_patch"
+else
+  echo "error: Linux mmap read-around patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+# DMA buffers aligned to the host's 128-byte L2 line (the device tree's
+# riscv,cbom-block-size matches): the emulator invalidates whole host lines for
+# the guest's cbo.inval and after USB IN transfers, so a 64-byte-aligned buffer
+# lost the CPU's writes to its line neighbour (dwc2 disconnect oops).
+dma_minalign_patch="$repo_root/linux-rv32-dma-minalign.patch"
+if git -C "$linux_dir" apply --reverse --check "$dma_minalign_patch" >/dev/null 2>&1; then
+  :
+elif git -C "$linux_dir" apply --check "$dma_minalign_patch"; then
+  git -C "$linux_dir" apply "$dma_minalign_patch"
+else
+  echo "error: Linux DMA alignment patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+# Files mapped in place from flash (cramfs on an "mtd-rom" MTD, firmware
+# CONFIG_RV32_FLASH_XIP): riscv's set_pte_at must not look for a struct page
+# behind an executable PTE that maps flash, and cramfs must not read the last
+# page of a page-multiple file as a hole.
+xip_patch="$repo_root/linux-rv32-xip-cramfs.patch"
+if git -C "$linux_dir" apply --reverse --check "$xip_patch" >/dev/null 2>&1; then
+  :
+elif git -C "$linux_dir" apply --check "$xip_patch"; then
+  git -C "$linux_dir" apply "$xip_patch"
+else
+  echo "error: Linux XIP cramfs patch is neither applicable nor already applied" >&2
   exit 1
 fi
 cp "$repo_root/guest/linux/rv32-pvfb.c" \
@@ -187,6 +226,28 @@ config="$linux_dir/scripts/config"
 "$config" --file "$linux_dir/.config" --enable EROFS_FS_ZIP
 "$config" --file "$linux_dir/.config" --enable EPOLL
 "$config" --file "$linux_dir/.config" --enable EVENTFD
+# Swap in compressed RAM (rv32-init sets up /dev/zram0): idle anonymous and
+# tmpfs pages are compressed, so the page cache keeps program code instead of
+# reading it from flash again and again.
+"$config" --file "$linux_dir/.config" --enable SWAP
+"$config" --file "$linux_dir/.config" --enable ZRAM
+"$config" --file "$linux_dir/.config" --enable ZRAM_BACKEND_LZ4
+"$config" --file "$linux_dir/.config" --enable ZRAM_DEF_COMP_LZ4
+# The multi-generational LRU: with swap, the classic LRU also pushed anonymous
+# pages to zram during streaming reads (cat of the desktop disk +23 %); MGLRU
+# keeps the swap for idle pages and refaults less during a desktop start.
+"$config" --file "$linux_dir/.config" --enable LRU_GEN
+"$config" --file "$linux_dir/.config" --enable LRU_GEN_ENABLED
+# Desktop programs, libraries and fonts mapped in place from the "xip" flash
+# partition: an "mtd-rom" physmap device (uc.dts) mounted as cramfs, whose
+# uncompressed page-aligned files are mapped without page cache.
+"$config" --file "$linux_dir/.config" --enable MTD
+"$config" --file "$linux_dir/.config" --enable MTD_ROM
+"$config" --file "$linux_dir/.config" --enable MTD_PHYSMAP
+"$config" --file "$linux_dir/.config" --enable MTD_PHYSMAP_OF
+"$config" --file "$linux_dir/.config" --enable CRAMFS
+"$config" --file "$linux_dir/.config" --enable CRAMFS_MTD
+"$config" --file "$linux_dir/.config" --disable CRAMFS_BLOCKDEV
 "$config" --file "$linux_dir/.config" --enable NLS_CODEPAGE_437
 "$config" --file "$linux_dir/.config" --enable NLS_ISO8859_1
 "$config" --file "$linux_dir/.config" --enable NLS_UTF8
@@ -206,6 +267,9 @@ for required in \
   CONFIG_EROFS_FS_ZIP=y \
   CONFIG_EPOLL=y \
   CONFIG_EVENTFD=y \
+  CONFIG_MTD_PHYSMAP_OF=y \
+  CONFIG_MTD_ROM=y \
+  CONFIG_CRAMFS_MTD=y \
   CONFIG_VIRTIO_INPUT=y; do
   if ! grep -qx "$required" "$linux_dir/.config"; then
     echo "error: Linux configuration did not retain $required" >&2
@@ -217,6 +281,14 @@ if ! grep -qx '# CONFIG_DRM_FBDEV_EMULATION is not set' \
   echo "error: DRM fbdev emulation must remain disabled" >&2
   exit 1
 fi
+
+# rv32-init links the initramfs's large files to the desktop disk's copy of
+# them only when the disk was built from this same rootfs: this ID, which
+# build-desktop-rofs.sh copies along.
+rm -f "$rootfs_dir/etc/rv32-base-id"
+tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
+  -C "$rootfs_dir" -cf - . | sha256sum | cut -c1-32 \
+  >"$rootfs_dir/etc/rv32-base-id"
 
 make -C "$linux_dir" -j"$jobs" ARCH=riscv CROSS_COMPILE="$cross_prefix" Image
 

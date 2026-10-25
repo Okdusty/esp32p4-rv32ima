@@ -89,7 +89,8 @@ static int test_lifetime(void)
 	};
 	rv32_native_jit_flush();
 	/* Only the standalone test shrinks these rings: force wrap/reuse quickly
-	 * while the ordinary partition keeps both incoming sources resident. */
+	 * while the incoming sources stay resident (their partition, or the
+	 * ring's second chance for regions entered since the hand passed). */
 	jit_code_arena_units = 64u;
 	jit_loop_code_units = 32u;
 	jit_reset_code_heads();
@@ -131,8 +132,13 @@ static int test_lifetime(void)
 		 * Removing the authoritative cold copy must invalidate its hot copy
 		 * and every published reference before any bytes are reused. */
 		for (uint32_t i = 0u;
-		     i <= jit_loop_code_units && jit_entries[1].state == JIT_ENTRY_READY;
+		     i <= 4u * jit_code_arena_units &&
+		     jit_entries[1].state == JIT_ENTRY_READY;
 		     i++) {
+			/* The sources keep running meanwhile: the ring spares a region
+			 * entered since its hand last passed, not the idle target. */
+			jit_entry_entered[0] = 1u;
+			jit_entry_entered[3] = 1u;
 			if (!lifetime_compile_loop(2u, LIFETIME_PC + 0x300u, 100u + i))
 				return 31;
 		}

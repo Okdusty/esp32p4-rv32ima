@@ -73,6 +73,13 @@ struct rv32_native_jit_runtime {
 	/* Set by rv32_native_jit_dispatch when the directory has no ready region
 	 * for this exit target, so C does not search for it again. */
 	uint32_t dispatch_miss_pc;
+	/* The kernel linear map for generated S-mode loads and stores: with
+	 * t = base register - (window base + JIT linear margin), t below
+	 * linear_limit means every displacement and width lies in guest RAM at
+	 * t + linear_host + displacement.  Nonzero only in the supervisor banks
+	 * while satp paging is on; see rv32_native_jit_set_kernel_linear_data. */
+	uint32_t linear_limit;
+	uint32_t linear_host;
 	struct rv32_native_jit_read_page
 		read_pages[RV32_NATIVE_JIT_PAGE_CACHE_ENTRIES];
 	struct rv32_native_jit_write_page
@@ -155,11 +162,15 @@ struct rv32_native_jit_stats {
 	uint32_t arena_evictions;
 	uint32_t tag_evictions;
 	uint32_t arena_wraps;
+	uint32_t arena_spares;		/* regions the hand moved past */
 	uint32_t translation_flushes;	/* links, jump cache, exec pages */
 	uint32_t fences;		/* guest FENCE.I */
 	uint32_t hot_promotions;
 	uint32_t hot_evictions;
 	uint32_t hot_arena_wraps;
+	uint32_t hot_spares;		/* hot copies the hand moved past */
+	uint32_t hot_hand_promotions;	/* promoted by the arena hand */
+	uint32_t hot_promote_bar;	/* entries + samples a promotion needs now */
 	uint32_t hot_early_promotions;
 	uint32_t hot_pressure_promotions;
 	uint32_t hot_admission_deferrals;
@@ -240,6 +251,14 @@ void rv32_native_jit_set_csr_layout(
 
 void rv32_native_jit_set_kernel_linear_map(uint32_t virtual_base,
 					   uint32_t size);
+/* Let generated kernel code reach that map's data directly: in S-mode with
+ * satp paging on, an address virtual_base + n (n < size) is guest RAM offset
+ * physical_offset + n, exactly as the interpreter's kernel_linear_limit
+ * shortcut, which skips the page tables and the checked callbacks.  The
+ * window must lie in ordinary guest RAM, and the CSR layout must be set
+ * (satp is read from it).  Call after the map, before execution; other
+ * addresses keep the page cache. */
+void rv32_native_jit_set_kernel_linear_data(uint32_t physical_offset);
 const struct rv32_native_jit_result *rv32_native_jit_try(
 	uint32_t physical_offset, uint32_t guest_pc,
 	uint32_t instruction_limit, uint32_t memory_context);
@@ -281,7 +300,7 @@ void rv32_native_jit_memory_cache_flush_host_range(const void *host, size_t size
 /* Region exits resolved natively by rv32_native_jit_dispatch since boot. */
 uint32_t rv32_native_jit_fast_dispatch_count(void);
 /* Nonzero after a failed rv32_native_jit_init: 1 chain results, 2 native
- * dispatch, 3 interior loops, 4 general self-test. */
+ * dispatch, 3 interior loops, 4 general self-test, 5 kernel linear map. */
 extern uint32_t rv32_native_jit_self_test_failure;
 /* Publish one whole, aligned ordinary-RAM page after the interpreter has
  * checked its bounds and the indicated access permission. MMIO/uncached

@@ -171,11 +171,12 @@ env STAGING_DIR="$openwrt_dir/staging_dir" \
 	-o "$openwrt_dir/files/usr/sbin/rv32-reboot"
 
 # PID 1. A compiled init avoids starting a shell command per setup step.
+# Static, so it keeps no initramfs library mapped (see use_flash_copies).
 env STAGING_DIR="$openwrt_dir/staging_dir" \
 	"$cross_gcc" -Os -pipe -mabi=ilp32 -march=rv32ima \
 	-fno-caller-saves -fno-plt -fhonour-copts \
 	-Wall -Wextra -Werror -fstack-protector-strong \
-	-D_FORTIFY_SOURCE=1 -Wl,-z,now -Wl,-z,relro -s \
+	-D_FORTIFY_SOURCE=1 -static -Wl,-z,now -Wl,-z,relro -s \
 	"$repo_root/guest/rv32-init.c" \
 	-o "$openwrt_dir/files/init"
 
@@ -339,10 +340,13 @@ lib/functions
 lib/functions.sh
 usr/bin/systemctl
 etc/banner.failsafe
-# curses add-on libraries; setterm needs only libncursesw
+# curses and setterm (353 KB of RAM); fbstream-listen writes the cursor
+# sequences itself.  The terminfo entries stay for /opt/vim.
 usr/lib/libform*.so*
 usr/lib/libmenu*.so*
 usr/lib/libpanel*.so*
+usr/lib/libncurses*.so*
+usr/bin/setterm
 PRUNE
 )
 rm -rf "$output_root/rootfs.previous"

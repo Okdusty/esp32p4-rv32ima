@@ -54,11 +54,14 @@ rv32_native_jit_enter:
  * otherwise, once a fresh region's first exits have gone to C (the learning
  * budget), same-page targets use the region's page, other pages the
  * validated exec-page cache, and a hit is added to the jump cache.  A target
+ * the directory search did not find is recorded (jit_jump_misses in
+ * rv32_native_jit.c) and later exits there return before the search.  A target
  * found for a region with an empty link becomes its link (never the region
  * itself, as in jit_observe_link), so links return after the translation
  * flushes that clear them.  Targets check the
  * instruction budget at their own chain entry.
- * Keeps a1, a6, a7, t5, t6, s10, s11; s9 is free between regions.  On a hit
+ * Keeps a1, a6, a7, t5, t6, s10, s11; s9 is free between regions, and a0 and
+ * a5 (the slot) are dead once the region publishes.  On a hit
  * it tail-jumps to the target's native chain entry exactly like a confirmed
  * link; on a miss it returns to the region, which then publishes its result
  * to the C dispatcher.  The lookup, wake, hot-code and promotion-counter rules mirror
@@ -106,8 +109,15 @@ rv32_native_jit_dispatch:
     j       9f
 10:
     mv      a0, a5                      /* this region's slot */
+    srli    a2, a1, 8                   /* recorded-miss index, as bytes */
+    xor     a2, a2, a1
+    andi    a2, a2, 0x7fc
+    lw      a5, 76(a3)                  /* recorded misses */
+    add     a5, a5, a2
+    lw      a2, 0(a5)
+    beq     a2, a1, 14f                 /* searched before: no region there */
     lw      a4, 0(a3)                   /* entries */
-    slli    a2, a5, 4
+    slli    a2, a0, 4
     add     a4, a4, a2                  /* this region's entry */
     lw      s9, 0(a4)                   /* physical offset */
     lw      t4, 4(a4)                   /* guest pc */
@@ -166,6 +176,8 @@ rv32_native_jit_dispatch:
 3:
     addi    a4, a4, 16
     bne     a4, t0, 1b
+    sw      a1, 0(a5)                   /* record the miss */
+14:
     sw      a1, 92(t6)                  /* runtime->dispatch_miss_pc */
     jr      t3
 2:

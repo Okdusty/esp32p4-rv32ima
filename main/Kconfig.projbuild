@@ -90,6 +90,18 @@ config RV32_NATIVE_JIT_KEEP_KERNEL
 	  came from, as when Linux patches its text for a static key, makes the
 	  next FENCE.I discard everything as before.
 
+config RV32_NATIVE_JIT_KERNEL_LINEAR
+	bool "Kernel loads and stores use the linear map directly"
+	depends on RV32_NATIVE_JIT_SUPERVISOR
+	default y
+	help
+	  Generated kernel code first checks whether an address lies in the
+	  kernel's linear map of guest RAM and, while paging is on, accesses
+	  it with a compare and an add, as the interpreter does, instead of a
+	  page-cache lookup.  Other addresses, user memory included, keep the
+	  page cache: a base register that held one when the region compiled
+	  goes there directly, others after a short check.
+
 config RV32_NATIVE_JIT_ASYNC_COMPILE
 	bool "Compile native regions on the second core"
 	depends on RV32_NATIVE_JIT && !FREERTOS_UNICORE
@@ -207,6 +219,28 @@ config RV32_CACHE_PERF_STATS
 	  is excluded from the next cache window but still affects application FPS.
 	  The hardware counters are shared diagnostic resources: do not run another
 	  cache-counter reader/resetter concurrently. Disable after profiling.
+
+config RV32_HOST_LANE_REPORT
+	bool "Report interrupt/task placement and per-task CPU shares"
+	default n
+	select FREERTOS_GENERATE_RUN_TIME_STATS
+	help
+	  Diagnostic for the isolation of the I/O lanes from the emulator core.
+	  25 s after start, print every allocated interrupt with its CPU and
+	  every task with its priority and core; then every 5 s print each
+	  task's share of the window by core ("[Lanes]" lines).  Enables
+	  FreeRTOS run-time statistics, which add a timer read to every context
+	  switch.  Diagnostic builds only.
+
+config RV32_HOST_MICROBENCH
+	bool "Print the HP core's cycles per operation at start"
+	default n
+	help
+	  Before the guest starts, time dependent and independent ALU chains,
+	  load-use pairs, stores, taken jumps, indirect jumps, calls, predictable
+	  and unpredictable branches, MUL and DIV on the emulator core with
+	  mcycle and print the cycles per operation as "[MB]" lines.  Diagnostic
+	  builds only.
 
 config RV32_HOST_PC_SAMPLER
 	bool "Sample the emulator core's PC for a host-side profile"
@@ -737,6 +771,29 @@ config RV32_FLASH_ROFS_IMAGE
 	help
 	  Built by scripts/build-desktop-rofs.sh or scripts/build-rofs.sh. If it
 	  is missing, the partition keeps whatever was flashed before.
+
+config RV32_FLASH_XIP
+	bool "Map read-only desktop files in place from the \"xip\" partition"
+	default n
+	help
+	  Map the "xip" flash partition (a cramfs image of uncompressed,
+	  page-aligned files) through the flash MMU and show it to the guest
+	  as read-only physical memory at 0x40000000 (GUEST_XIP_BASE, the
+	  "mtd-rom" node in uc.dts).  Linux mounts it with cramfs as mtd:xip
+	  and maps executables, libraries and fonts straight from flash, so
+	  their pages take no page cache.  The partition must lie below
+	  16 MiB: quad flash is cache-mapped with 24-bit addresses.  Use
+	  partitions-xip.csv and a desktop disk built with RV32_DESKTOP_XIP=1
+	  (scripts/build-desktop-rofs.sh), whose mapped files are links into
+	  /opt/xip.
+
+config RV32_FLASH_XIP_IMAGE
+	string "XIP image (absolute, or relative to the project)"
+	depends on RV32_FLASH_XIP
+	default "build/guest/xip-desktop.cramfs"
+	help
+	  Written by mkcramfs-xip.py.  If it is missing, the partition keeps
+	  whatever was flashed before.
 
 endmenu
 

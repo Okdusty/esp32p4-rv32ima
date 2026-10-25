@@ -31,6 +31,9 @@
 #endif
 
 #include "port.h"
+#ifdef ESP_PLATFORM
+#include "esp_hosted.h"
+#endif
 #include "rv32_diagnostics.h"
 #include "rv32_memory_placement.h"
 #include "reset_protocol.h"
@@ -39,6 +42,12 @@
 #endif
 #if CONFIG_RV32_HOST_PC_SAMPLER
 #include "host_pc_sampler.h"
+#endif
+#if CONFIG_RV32_HOST_MICROBENCH
+#include "host_microbench.h"
+#endif
+#if CONFIG_RV32_HOST_LANE_REPORT
+#include "host_lane_report.h"
 #endif
 #include "cache.h"
 #include "display_bridge.h"
@@ -124,15 +133,18 @@ volatile uint32_t rv32_host_wake;
 #if CONFIG_RV32_NATIVE_JIT
 /* Most probes land on heads that are still cold.  Skip RV32_JIT_PROBE_SKIP
  * visits after each failed probe and let the next one count them all, so a
- * head compiles after the same number of guest visits at a sixteenth of the
- * probe cost.  A fresh region is entered at most that many visits late. */
-#define RV32_JIT_PROBE_SKIP 15u
+ * head compiles after the same number of guest visits at a thirty-second of
+ * the probe cost; only loop heads, hot at 16 visits, compile one window later
+ * than with 15 skips.  A fresh region is entered at most that many visits
+ * late.  Measured against 15 skips: `find` −4 %, the fork loop −3 %, the
+ * desktop start within noise. */
+#define RV32_JIT_PROBE_SKIP 31u
 /* Indexed by PC bits 2-11; an entry holds the head's PC bits 12-31, a valid
  * bit and the visits still to skip.  256 entries of PC and count let kernel
  * heads evict each other before their skips ran out. */
 #define RV32_JIT_PROBE_FILTER_ENTRIES 1024u
 #define RV32_JIT_PROBE_FILTER_TAG (~(RV32_JIT_PROBE_FILTER_ENTRIES * 4u - 1u))
-#define RV32_JIT_PROBE_FILTER_VALID 16u
+#define RV32_JIT_PROBE_FILTER_VALID 32u
 #define RV32_JIT_PROBE_FILTER_COUNT (RV32_JIT_PROBE_FILTER_VALID - 1u)
 _Static_assert((RV32_JIT_PROBE_FILTER_ENTRIES &
 		(RV32_JIT_PROBE_FILTER_ENTRIES - 1u)) == 0u &&
@@ -149,27 +161,27 @@ static inline const struct rv32_native_jit_result *RV32JitTryFiltered(
 		(RV32_JIT_PROBE_FILTER_ENTRIES - 1u)];
 	uint32_t tag = (guest_pc & RV32_JIT_PROBE_FILTER_TAG) |
 		RV32_JIT_PROBE_FILTER_VALID;
-	uint32_t weight = 1u;
+	/* The tag's low bits are clear, so the entry minus the tag is this
+	 * head's skip count exactly when it is at most the count mask: one
+	 * unsigned compare tests the tag and a nonzero count. */
+	uint32_t skips = *entry - tag;
 	const struct rv32_native_jit_result *result;
 
-	if ((*entry & ~RV32_JIT_PROBE_FILTER_COUNT) == tag) {
-		if ((*entry & RV32_JIT_PROBE_FILTER_COUNT) != 0u) {
-			(*entry)--;
-			rv32_profile_set_reason(RV32_PROFILE_FILTERED);
-			return NULL;
-		}
-		weight = RV32_JIT_PROBE_SKIP + 1u;
+	if (skips - 1u < RV32_JIT_PROBE_FILTER_COUNT) {
+		*entry = tag + skips - 1u;
+		rv32_profile_set_reason(RV32_PROFILE_FILTERED);
+		return NULL;
 	}
 #if CONFIG_RV32_HOST_PERF_STATS
 	result = rv32_native_jit_try_profiled(physical_offset, guest_pc, limit,
-					      context, weight);
+		context, skips == 0u ? RV32_JIT_PROBE_SKIP + 1u : 1u);
 #else
 	result = rv32_native_jit_try_weighted(physical_offset, guest_pc, limit,
-					      context, weight);
+		context, skips == 0u ? RV32_JIT_PROBE_SKIP + 1u : 1u);
 #endif
 	if (result == NULL)
 		*entry = tag | RV32_JIT_PROBE_SKIP;
-	else if ((*entry & ~RV32_JIT_PROBE_FILTER_COUNT) == tag)
+	else if (skips == 0u)
 		*entry = 0u;
 	return result;
 }
@@ -223,6 +235,14 @@ static inline const struct rv32_native_jit_result *RV32JitTryFiltered(
 #endif
 #define MINIRV32_LINEAR_MMIO_PUBLISH(start, end, calls, bytes) \
 	display_bridge_mark_framebuffer_dirty((start), (end), (calls), (bytes))
+#endif
+#if CONFIG_RV32_FLASH_XIP
+/* The "xip" flash partition, mapped once by psram_map_xip_partition(), is
+ * read-only guest physical memory at GUEST_XIP_BASE (uc.dts "mtd-rom"). */
+#define MINIRV32_ROM_APERTURE
+#define MINIRV32_ROM_BASE GUEST_XIP_BASE
+#define MINIRV32_ROM_SIZE rv32_xip_size
+#define MINIRV32_ROM_HOST rv32_xip_host
 #endif
 /* The USB controller and the PLIC first: interrupt handlers hit them most. */
 #define MINIRV32_IS_MMIO_ADDRESS(address) \
@@ -496,6 +516,14 @@ static void emulator_watch_dump(const char *what, uint32_t loops,
 	dwc2_passthrough_dump();
 }
 
+/* The lane report's esp_intr_dump() overflowed the stall reporter's 3 KiB
+ * stack (CPU1 stack protection fault 25 s after boot). */
+#if CONFIG_RV32_HOST_LANE_REPORT
+#define EMULATOR_WATCH_STACK_SIZE 8192
+#else
+#define EMULATOR_WATCH_STACK_SIZE 3072
+#endif
+
 static void emulator_watch_task(void *argument)
 {
 	struct dwc2_passthrough_stats last, now;
@@ -507,6 +535,9 @@ static void emulator_watch_task(void *argument)
 
 	(void)argument;
 	dwc2_passthrough_stats(&last);
+#if CONFIG_RV32_HOST_LANE_REPORT
+	uint32_t seconds = 0u;
+#endif
 	for (;;) {
 		uint32_t loops;
 		uint32_t instructions;
@@ -514,6 +545,9 @@ static void emulator_watch_task(void *argument)
 		const char *what = NULL;
 
 		vTaskDelay(pdMS_TO_TICKS(1000));
+#if CONFIG_RV32_HOST_LANE_REPORT
+		HostLaneReportTick(++seconds);
+#endif
 		loops = emulator_loops;
 		instructions = core.cyclel;
 		dwc2_passthrough_stats(&now);
@@ -622,7 +656,20 @@ static bool IRAM_ATTR RV32JitRefillRam(
 		return false;
 	uint32_t physical = MiniRV32Translate(state, runtime->image, address,
 		write ? ACCESS_WRITE : ACCESS_READ, &fault, &uncached);
-	if (fault || uncached || physical < MINIRV32_RAM_IMAGE_OFFSET)
+	if (fault)
+		return false;
+#ifdef MINIRV32_ROM_APERTURE
+	uint32_t rom_offset;
+
+	/* Read-only flash: publish reads only, so a store never goes native. */
+	if (MiniRV32RomOffset(runtime->image, physical, &rom_offset)) {
+		if (write)
+			return false;
+		RV32JitCacheReadPage(runtime, address, runtime->image + rom_offset);
+		return true;
+	}
+#endif
+	if (uncached || physical < MINIRV32_RAM_IMAGE_OFFSET)
 		return false;
 	uint32_t offset = physical - MINIRV32_RAM_IMAGE_OFFSET;
 	if (ram_amt < 0x1000u || (offset & ~0xfffu) > ram_amt - 0x1000u)
@@ -658,6 +705,14 @@ static uint8_t *RV32HleMap(uint32_t virtual_address, int access,
 					      access, &fault, &uncached);
 	uint32_t offset = physical - MINIRV32_RAM_IMAGE_OFFSET;
 
+#ifdef MINIRV32_ROM_APERTURE
+	if (!fault && access == ACCESS_READ &&
+	    MiniRV32RomOffset(guest_ram, physical, &offset)) {
+		/* ROM pages are whole: the rest of this page is readable. */
+		*span = 0x1000u - (virtual_address & 0xfffu);
+		return guest_ram + offset;
+	}
+#endif
 	if (fault || uncached || physical < MINIRV32_RAM_IMAGE_OFFSET ||
 	    offset >= ram_amt)
 		return NULL;
@@ -793,6 +848,35 @@ static bool RV32HleLz4(uint32_t source, uint32_t destination,
 	return true;
 }
 
+/* LZ4_compress_fast() for zram: a page from the kernel's linear map into a
+ * buffer there.  The block is the host encoder's (any valid block decodes
+ * the same); 0 when it does not fit, as the kernel reports that. */
+static bool RV32HleLz4Compress(uint32_t source, uint32_t destination,
+			       int32_t source_size, int32_t capacity)
+{
+	const uint8_t *from;
+	uint8_t *to;
+	uint32_t size;
+
+	if (source_size <= 0 || capacity <= 0 ||
+	    (uint32_t)source_size > GUEST_LZ4_ENCODE_MAX)
+		return false;
+	from = RV32HleLinear(source, (uint32_t)source_size);
+	to = RV32HleLinear(destination, (uint32_t)capacity);
+	if (from == NULL || to == NULL ||
+	    destination - source < (uint32_t)source_size ||
+	    source - destination < (uint32_t)capacity)
+		return false;
+	for (uint32_t page = destination >> 12;
+	     page <= (destination + (uint32_t)capacity - 1u) >> 12; page++)
+		rv32_native_jit_note_write_page(
+			(uint32_t)(to - guest_ram) + (page << 12) - (destination & ~0xfffu));
+	size = guest_lz4_encode(from, (uint32_t)source_size, to, (uint32_t)capacity);
+	core.regs[10] = size;
+	rv32_profile_jit_add(RV32_PROFILE_HLE_BYTES, (uint32_t)source_size);
+	return true;
+}
+
 /* rv32_native_jit_hle_fn: a0..a4 are the call's arguments, ra its return. */
 static bool RV32HleRun(uint32_t kind)
 {
@@ -854,6 +938,8 @@ static bool RV32HleRun(uint32_t kind)
 		return RV32HleLz4(a0, a1, (int32_t)a2,
 				  target < capacity ? target : capacity, true);
 	}
+	case GUEST_HLE_LZ4_COMPRESS:
+		return RV32HleLz4Compress(a0, a1, (int32_t)a2, (int32_t)regs[13]);
 	default:
 		return false;
 	}
@@ -918,6 +1004,27 @@ static uint32_t IRAM_ATTR RV32JitMemoryLoad(
 			return 0u;
 		}
 	}
+
+#ifdef MINIRV32_ROM_APERTURE
+	/* Read-only flash: an ordinary cached load whatever the PTE's uncached
+	 * bit says, and the page joins the native read cache. */
+	if (MiniRV32RomOffset(image, physical_address, &offset) &&
+	    physical_address - MINIRV32_ROM_BASE <= MINIRV32_ROM_SIZE - width) {
+		if (width == 4u)
+			value = MiniRV32Load4(image, offset);
+		else if (width == 2u)
+			value = MiniRV32Load2(image, offset);
+		else
+			value = MiniRV32Load1(image, offset);
+		if (funct3 == 0u)
+			value = (uint32_t)(int32_t)(int8_t)value;
+		else if (funct3 == 1u)
+			value = (uint32_t)(int32_t)(int16_t)value;
+		runtime->memory_value = value;
+		RV32JitCacheReadPage(runtime, virtual_address, image + offset);
+		return 0u;
+	}
+#endif
 
 #if defined(CONFIG_RV32_DISPLAY_ACCEL) && CONFIG_RV32_DISPLAY_ACCEL
 	offset = physical_address - MINIRV32_LINEAR_MMIO_BASE;
@@ -1682,7 +1789,8 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 		printf("[JIT cache] resident=%" PRIu32 "/%" PRIu32
 		       " KiB head=%" PRIu32 "/%" PRIu32
 		       " KiB; evict arena=%" PRIu32 " tag=%" PRIu32
-		       " wrap=%" PRIu32 "; flushes tlb=%" PRIu32
+		       " wrap=%" PRIu32 " spared=%" PRIu32
+		       "; flushes tlb=%" PRIu32
 		       " fence=%" PRIu32 "\n",
 		       jit->resident_regions, jit->resident_bytes / 1024u,
 		       jit->arena_head_bytes / 1024u,
@@ -1690,6 +1798,7 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 		       jit->arena_evictions - host_perf_last_jit.arena_evictions,
 		       jit->tag_evictions - host_perf_last_jit.tag_evictions,
 		       jit->arena_wraps - host_perf_last_jit.arena_wraps,
+		       jit->arena_spares - host_perf_last_jit.arena_spares,
 		       jit->translation_flushes -
 			       host_perf_last_jit.translation_flushes,
 		       jit->fences - host_perf_last_jit.fences);
@@ -1697,7 +1806,8 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 		       " KiB head=%" PRIu32 "/%" PRIu32
 		       " KiB; promote=%" PRIu32 " (early=%" PRIu32
 		       " pressure=%" PRIu32 ") defer=%" PRIu32
-		       " evict=%" PRIu32 " wrap=%" PRIu32 "\n",
+		       " evict=%" PRIu32 " wrap=%" PRIu32 " spared=%" PRIu32
+		       " hand=%" PRIu32 " bar=%" PRIu32 "\n",
 		       jit->hot_resident_regions,
 		       jit->hot_resident_bytes / 1024u,
 		       jit->hot_arena_head_bytes / 1024u,
@@ -1711,7 +1821,11 @@ static __attribute__((noinline, noclone)) void HostPerfReport(uint64_t current_t
 			       host_perf_last_jit.hot_admission_deferrals,
 		       jit->hot_evictions - host_perf_last_jit.hot_evictions,
 		       jit->hot_arena_wraps -
-			       host_perf_last_jit.hot_arena_wraps);
+			       host_perf_last_jit.hot_arena_wraps,
+		       jit->hot_spares - host_perf_last_jit.hot_spares,
+		       jit->hot_hand_promotions -
+			       host_perf_last_jit.hot_hand_promotions,
+		       jit->hot_promote_bar);
 		{
 			uint32_t accounted_permille = native_guest ?
 				(uint32_t)((uint64_t)
@@ -1775,6 +1889,12 @@ void app_main(void)
 #endif
 	printf("\n");
 #endif
+#ifdef ESP_PLATFORM
+	/* First, as its constructor used to: ESP-Hosted's SDIO transport allocates
+	 * the SDMMC interrupt (shared with the microSD) on the CPU that starts it. */
+	if (HostRunOnCpu1(esp_hosted_init) != ESP_OK)
+		printf("WARNING: ESP-Hosted initialization failed\n");
+#endif
 	RV32_DIAG("psram init\n");
 
 	if (psram_init() < 0) {
@@ -1795,7 +1915,8 @@ void app_main(void)
 	display_bridge_set_guest_memory(guest_ram, GUEST_PHYS_BASE, ram_amt);
 	display_bridge_init();
 	linear_mmio_host = display_bridge_framebuffer_host();
-	if (HostInputInit() < 0)
+	/* The USB OTG interrupt stays off the emulator's CPU. */
+	if (HostRunOnCpu1(HostInputInit) < 0)
 		return;
 	if (virtio_net_bridge_init() < 0)
 		printf("WARNING: C6/virtio-net bridge initialization failed\n");
@@ -1803,7 +1924,8 @@ void app_main(void)
 		printf("WARNING: Asynchronous UART console unavailable\n");
 	if (HostBrownoutInit() < 0)
 		printf("WARNING: Brownout ride-through unavailable\n");
-	if (xTaskCreatePinnedToCore(emulator_watch_task, "emu_watch", 3072,
+	if (xTaskCreatePinnedToCore(emulator_watch_task, "emu_watch",
+				    EMULATOR_WATCH_STACK_SIZE,
 				    NULL, tskIDLE_PRIORITY + 3u, NULL,
 				    CONFIG_FREERTOS_NUMBER_OF_CORES > 1 ? 1 : 0) !=
 	    pdPASS)
@@ -1814,7 +1936,9 @@ void app_main(void)
 #endif
 	if (virtio_console_bridge_init() < 0)
 		printf("WARNING: virtio-console bridge initialization failed\n");
-	if (virtio_blk_bridge_init() < 0)
+	/* On CPU1: the first sdmmc_host_init() places the SDMMC interrupt, which
+	 * the microSD and the C6 Wi-Fi SDIO link share. */
+	if (HostRunOnCpu1(virtio_blk_bridge_init) < 0)
 		printf("WARNING: microSD/virtio-blk bridge unavailable\n");
 	if (virtio_flash_bridge_init() < 0)
 		printf("WARNING: read-only flash disk unavailable\n");
@@ -1901,6 +2025,10 @@ void app_main(void)
 #if CONFIG_RV32_NATIVE_JIT_SUPERVISOR
 	rv32_native_jit_set_kernel_linear_map(MINIRV32_KERNEL_LINEAR_BASE,
 		MINI_RV32_RAM_SIZE - MINIRV32_KERNEL_LINEAR_PHYS_OFFSET);
+#if CONFIG_RV32_NATIVE_JIT_KERNEL_LINEAR
+	/* After the CSR layout: the JIT reads satp from it. */
+	rv32_native_jit_set_kernel_linear_data(MINIRV32_KERNEL_LINEAR_PHYS_OFFSET);
+#endif
 #endif
 	rv32_native_jit_start_async_compiler();
 #endif
@@ -1927,6 +2055,13 @@ void app_main(void)
 #if CONFIG_RV32_HOST_PC_SAMPLER
 	HostPcSamplerStart();
 #endif
+#if CONFIG_RV32_HOST_MICROBENCH
+	HostMicrobench();
+#endif
+	/* Outrank every unpinned host task (TCP/IP, the timer service), so none
+	 * of them is ever scheduled on the emulator core; the system tasks
+	 * pinned to CPU0 (IPC, the default event loop) still outrank this. */
+	vTaskPrioritySet(NULL, configMAX_PRIORITIES - 6u);
 	printf("RV32IMA starting\n");
 	RV32_DIAG("Initial PC: 0x%08" PRIx32 "\n", core.pc);
 

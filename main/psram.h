@@ -26,6 +26,15 @@
  * and to USB DMA.
  */
 #define GUEST_DMA_BASE     (GUEST_PHYS_BASE + KERNEL_LOAD_OFFSET)
+
+/* Guest physical base of the read-only "xip" flash window (the "mtd-rom"
+ * node in uc.dts).  It lies below GUEST_PHYS_BASE and is never System RAM.
+ * psram_map_xip_partition() fills the host pointer and size; both stay
+ * NULL/0 when CONFIG_RV32_FLASH_XIP is off or the partition is absent. */
+#define GUEST_XIP_BASE     0x40000000u
+extern const uint8_t *rv32_xip_host;
+extern uint32_t rv32_xip_size;
+void psram_map_xip_partition(void);
 #define GUEST_PHYS_END     (GUEST_PHYS_BASE + GUEST_RAM_SIZE)
 
 /* The ST7703 live scanout needs a complete render surface so guest painting
