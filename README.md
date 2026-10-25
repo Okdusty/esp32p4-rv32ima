@@ -169,6 +169,12 @@ root@esp32p4-openwrt:/#
 - Do not modify the USB-C CC resistors or power wiring unless you understand the board schematic and USB-C power rules. A board with a native USB-A host port may be a better test platform.
 - If you test USB host support on another ESP32-P4 board, sharing the board model and logs would be useful.
 
+## TODO
+
+- [ ] USB high-speed mode (currently full-speed only)
+- [ ] Speaker / audio output support
+- [ ] GT911 touchscreen support (generic multitouch via virtio-input)
+
 ## Limitations
 
 There is no general package repository for this exact `riscv32_rv32ima` build. Select the packages you need before building so they are included in the root filesystem. For example:
