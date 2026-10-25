@@ -130,7 +130,7 @@ fi
 if [[ -n ${CROSS_COMPILE:-} && -x "${CROSS_COMPILE}gcc" ]]; then
   cross_prefix=$CROSS_COMPILE
 elif [[ -n "$generated_cross_prefix" &&
-        -x "${generated_cross_prefix}gcc" ]]; then
+  -x "${generated_cross_prefix}gcc" ]]; then
   if [[ -n ${CROSS_COMPILE:-} ]]; then
     echo "warning: ignoring unusable CROSS_COMPILE=${CROSS_COMPILE}" >&2
     echo "using generated OpenWrt toolchain: $generated_cross_prefix" >&2
@@ -251,8 +251,13 @@ config="$linux_dir/scripts/config"
 "$config" --file "$linux_dir/.config" --enable NLS_CODEPAGE_437
 "$config" --file "$linux_dir/.config" --enable NLS_ISO8859_1
 "$config" --file "$linux_dir/.config" --enable NLS_UTF8
+"$config" --file "$linux_dir/.config" --disable LOCALVERSION_AUTO
+kbuild_identity=(KBUILD_BUILD_USER=linus KBUILD_BUILD_HOST=esp32p4)
+if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+  kbuild_identity+=("KBUILD_BUILD_TIMESTAMP=$(date -u -d "@$SOURCE_DATE_EPOCH")")
+fi
 
-make -C "$linux_dir" ARCH=riscv CROSS_COMPILE="$cross_prefix" olddefconfig
+make -C "$linux_dir" ARCH=riscv CROSS_COMPILE="$cross_prefix" "${kbuild_identity[@]}" olddefconfig
 
 # scripts/config records requests even when a symbol's dependencies are not
 # met.  Fail here instead of producing an Image that silently lacks the
@@ -290,7 +295,7 @@ tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
   -C "$rootfs_dir" -cf - . | sha256sum | cut -c1-32 \
   >"$rootfs_dir/etc/rv32-base-id"
 
-make -C "$linux_dir" -j"$jobs" ARCH=riscv CROSS_COMPILE="$cross_prefix" Image
+make -C "$linux_dir" -j"$jobs" ARCH=riscv CROSS_COMPILE="$cross_prefix" "${kbuild_identity[@]}" Image
 
 image="$linux_dir/arch/riscv/boot/Image"
 if [[ ! -f "$image" ]]; then

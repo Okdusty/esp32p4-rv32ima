@@ -217,7 +217,7 @@ CONFIG_RV32_WIFI_HT40=y
 
 Low-latency mode uses more power. HT40 automatically falls back when the access point or channel does not support it.
 
-Configure the Wi-Fi SSID and password before building. The guest uses the static address `192.168.1.220` from `guest/rv32-init.c`; change it there for another network. Check it inside Linux with:
+Configure the Wi-Fi SSID and password before building. The guest uses the static address `192.168.1.220` from `guest/rv32-init.c`; check out that file to change the address, gateway, hostname, NTP server, or default console for another network. Check it inside Linux with:
 
 ```sh
 ip address show dev eth0
