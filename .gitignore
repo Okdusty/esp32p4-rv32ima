@@ -1,8 +1,40 @@
+# Build artifacts and caches
+.build/
+build/
+build-*/
+artifacts/
+.cache/
 .guest-work/
+
+# Python bytecode and caches
 __pycache__/
-/build/
-/build-*/
-/artifacts/
-/.cache/
-/sdkconfig
-/sdkconfig.old
+*.py[cod]
+
+# ESP-IDF configuration files (these contain Wi-Fi credentials and other local settings)
+sdkconfig
+sdkconfig.old
+sdkconfig.local
+sdkconfig.*.local
+
+# Local configuration overrides and presets (may contain network credentials)
+*.defaults.local
+display.defaults
+wifi.defaults
+*.wifi
+*.env
+.env*
+secrets.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Temporary and editor files
+*.swp
+*.swo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+codex-session-*.md
