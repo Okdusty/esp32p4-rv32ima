@@ -1,6 +1,6 @@
 # esp32p4-rv32ima
 
-> Emulated Linux runs at ~77 DMIPS (Dhrystone best-case) — roughly IBM [RS/6000 (POWER1)](https://en.wikipedia.org/wiki/POWER1)-class, ~1/7th the per-MHz of a SiFive E31.
+> Emulated Linux runs at ~77 DMIPS (Dhrystone best-case) | like IBM [RS/6000 (POWER1)](https://en.wikipedia.org/wiki/POWER1)-class, ~1/7th the per-MHz of a SiFive E31.
 
 Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on [CNLohr's mini-rv32ima](https://github.com/cnlohr/mini-rv32ima). The ESP32-P4 is currently the only tested target.
 
@@ -12,10 +12,10 @@ Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on
 <img width="400" height="300" alt="20260827_144636" src="https://github.com/user-attachments/assets/ab346992-d67d-4b86-9319-969dcc64a5f5" />
 </div>
 
-### Latest measured times (guest `/proc/uptime`, `measure-ma4-c.txt`)
+### Latest measurements
 
 | workload | guest time |
-|---|---:|
+| --- | ---: |
 | `find /opt` | 4.0s |
 | `cat` libs/bins | 14.7s |
 | `curl` https x2 | 16.0s |
@@ -28,7 +28,7 @@ Run Linux on the ESP32-P4 with a small RISC-V emulator. This project is based on
 Work is split between both ESP32-P4 CPU cores. The Linux guest is still single-core, but display, UART, and network work can run separately from the emulator.
 
 ```text
-ESP32-P4
+ESP32-P4 (dual-core default)
 
 +------------------------+       +------------------------+
 | CPU0                   |       | CPU1                   |
@@ -36,10 +36,16 @@ ESP32-P4
 | RV32IMA emulator       |       | Display updates        |
 | Linux and OpenWrt      |       | UART0 input/output     |
 | Guest memory access    |       | C6 network bridge      |
+|                        |       | JIT compilation        |
+|                        |       | USB HID host           |
+|                        |       | microSD / virtio-blk   |
 +------------------------+       +------------------------+
 
      CPU0 and CPU1 exchange work through queues and buffers.
+     On a single-core build every task falls back to CPU0.
 ```
+
+Verified against the code: the emulator loop runs in `app_main` (main task, CPU0); `rv32-net` (`virtio_net_bridge.c:962`), UART TX (`port-esp.c:741`), USB HID (`usb_hid_input.c` `USB_HID_CORE 1`), ESP-Hosted and virtio-blk init (`HostRunOnCpu1`), and the display task (`display_bridge.c:3064`, pinned to the core after `app_main`'s) all run on CPU1.
 
 ### MMU and supervisor-mode support
 
